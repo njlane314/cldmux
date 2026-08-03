@@ -72,24 +72,28 @@ int main(int argc, char* argv[]) {
             router.diagnose(spec, chosen.expected_attempt_runtime);
         cloud::client client = router.route(report.selected_plan.provider);
 
-        // Stable KEY=value records are intentionally friendly to grep, awk,
-        // sed, and shell scripts. Missing prices are printed as unavailable;
-        // pass --estimate to enable the public catalogue for an explicit route.
-        cloud_example::print_diagnostics(chosen, spec, report);
-        cloud_example::print_record(std::cout, "preflight", "planned");
+        // cloud.h owns the stable KEY=value syntax, including validation,
+        // control-character escaping, and locale-independent numbers. The
+        // returned record set is deliberately mutable: this program adds an
+        // application label, and could use set(), rename(), or erase() to adapt
+        // standard fields before choosing stdout, stderr, or a file.
+        cloud::command_output output =
+            cloud::command_output::diagnostics(chosen.provider, spec, report);
+        output.add("application", "simulation");
+        output.write(std::cout);
 
         // Planning may perform read-only catalogue requests, but it never
         // allocates compute. Nothing below runs without the explicit --submit
         // flag because uploads and jobs can consume billable cloud resources.
         if (!chosen.submit) {
-            cloud_example::print_record(std::cout, "status", "dry-run");
+            cloud::write_command_record(std::cout, "status", "dry-run");
             return 0;
         }
 
         try {
             // Flush the complete preflight report before the first mutation. This
             // makes it available even if a later upload or submission fails.
-            cloud_example::print_record(std::cout, "status", "preparing");
+            cloud::write_command_record(std::cout, "status", "preparing");
             std::cout.flush();
 
             // cloud:// is resolved by the route: GCS on GCP, S3 on AWS, and Blob
@@ -100,16 +104,16 @@ int main(int argc, char* argv[]) {
             // The returned job handle owns provider-native polling, cancellation,
             // final log draining, and cleanup. Logging is delivered one line at a
             // time; it is intentionally not presented as a live byte stream.
-            cloud_example::print_record(std::cout, "status", "submitting");
+            cloud::write_command_record(std::cout, "status", "submitting");
             const cloud::job submitted = client.run(spec);
-            cloud_example::print_record(std::cout, "job_id", submitted.id());
+            cloud::write_command_record(std::cout, "job_id", submitted.id());
             const cloud::result result = submitted.wait([](const cloud::log_entry& line) {
-                cloud_example::print_record(std::cout, "log", line.text);
+                cloud::write_command_record(std::cout, "log", line.text);
             });
-            cloud_example::print_result(result);
+            cloud::command_output::job_result(result).write(std::cout);
             if (!result.success()) {
-                cloud_example::print_record(std::cerr, "error", result.error());
-                cloud_example::print_record(std::cout, "status", "failed");
+                cloud::write_command_record(std::cerr, "error", result.error());
+                cloud::write_command_record(std::cout, "status", "failed");
                 return 1;
             }
 
@@ -117,14 +121,14 @@ int main(int argc, char* argv[]) {
             // metadata when present, and then replaces the destination. The calling
             // code remains identical for every route.
             client.storage().get_file("cloud://sim-output/result.txt", "./result.txt");
-            cloud_example::print_record(std::cout, "status", "succeeded");
+            cloud::write_command_record(std::cout, "status", "succeeded");
             return 0;
         } catch (...) {
-            cloud_example::print_record(std::cout, "status", "failed");
+            cloud::write_command_record(std::cout, "status", "failed");
             throw;
         }
     } catch (const std::exception& failure) {
-        cloud_example::print_record(std::cerr, "error", failure.what());
+        cloud::write_command_record(std::cerr, "error", failure.what());
         return 2;
     }
 }

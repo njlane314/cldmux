@@ -24,8 +24,8 @@
 #ifndef NJLANE314_CLOUD_H_INCLUDED
 #define NJLANE314_CLOUD_H_INCLUDED
 
-#define CLOUD_H_VERSION "0.3.2"
-#define CLOUD_H_VERSION_NUM 0x000302
+#define CLOUD_H_VERSION "0.3.3"
+#define CLOUD_H_VERSION_NUM 0x000303
 
 // Dependencies and compile-time contract --------------------------------------
 
@@ -51,6 +51,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <ostream>
 #include <random>
 #include <sstream>
 #include <stdexcept>
@@ -2289,6 +2290,242 @@ struct result {
     [[nodiscard]] bool success() const noexcept { return state == job_state::succeeded; }
     [[nodiscard]] const std::string& error() const noexcept { return message; }
 };
+
+// One shell-variable-shaped KEY=value record. command_output preserves record
+// order and repeated keys (notably warning=), escapes control characters, and
+// never invokes a shell. Applications can amend the standard records before
+// writing them to stdout, stderr, a file, or any other std::ostream.
+struct command_record {
+    std::string key;
+    std::string value;
+};
+
+class command_output {
+public:
+    // Preserve both the caller's requested route (for example, cheapest) and
+    // the concrete provider selected in report. spec must be the job passed to
+    // diagnose(); the formatter intentionally performs no second validation.
+    // The output remains a mutable value, so producing it has no hidden I/O.
+    [[nodiscard]] static command_output diagnostics(std::string_view requested_provider,
+                                                    const job_spec& spec,
+                                                    const run_diagnostics& report) {
+        command_output out;
+        out.add("output_version", "1");
+        out.add("requested_provider", requested_provider);
+        out.add("job_name", spec.name);
+        out.add("provider", report.selected_plan.provider);
+        out.add("region", report.selected_plan.region);
+        out.add("machine", report.selected_plan.machine_type);
+        out.add_unsigned("requested_cpus", spec.resources.cpus);
+        out.add_number("requested_memory_gb", spec.resources.memory_gb);
+        out.add("accelerator", report.selected_plan.accelerator.empty()
+                                   ? std::string("none")
+                                   : report.selected_plan.accelerator);
+        out.add_unsigned("accelerator_count", report.selected_plan.accelerator_count);
+        out.add_boolean("spot", spec.resources.spot);
+        out.add_duration_seconds("expected_attempt_runtime_seconds",
+                                 report.expected_attempt_runtime);
+        out.add_duration_seconds("controller_timeout_seconds", report.controller_timeout);
+        out.add_integer("provider_attempt_timeout_seconds",
+                        report.provider_attempt_timeout.count());
+        if (report.provider_job_timeout)
+            out.add_integer("provider_job_timeout_seconds",
+                            report.provider_job_timeout->count());
+        else
+            out.add("provider_job_timeout_seconds", "not-applicable");
+        out.add_unsigned("configured_retries", report.configured_retries);
+        out.add_unsigned("configured_attempt_limit", report.configured_attempt_limit);
+        out.add("cost_currency", "USD");
+        if (report.selected_plan.estimated_hourly_cost)
+            out.add_number("hourly_rate_estimate_usd",
+                           *report.selected_plan.estimated_hourly_cost);
+        else
+            out.add("hourly_rate_estimate_usd", "unavailable");
+        if (report.estimated_cost_for_expected_attempt_runtime)
+            out.add_number("estimated_cost_for_expected_attempt_runtime_usd",
+                           *report.estimated_cost_for_expected_attempt_runtime);
+        else
+            out.add("estimated_cost_for_expected_attempt_runtime_usd", "unavailable");
+        out.add("estimate_basis", "expected-attempt-runtime-times-hourly-rate");
+        for (const auto& warning : report.warnings)
+            out.add("warning", warning);
+        out.add("preflight", "planned");
+        return out;
+    }
+
+    // result.message is deliberately absent: the application decides whether
+    // an error belongs on stdout, stderr, or somewhere else.
+    [[nodiscard]] static command_output job_result(const cloud::result& value) {
+        command_output out;
+        out.add("job_state", state_name(value.state));
+        if (value.exit_code)
+            out.add_integer("exit_code", *value.exit_code);
+        for (const auto& warning : value.warnings)
+            out.add("warning", warning);
+        return out;
+    }
+
+    // add() preserves duplicates. set() replaces the first matching record and
+    // removes later duplicates, appending a new record when the key is absent.
+    command_output& add(std::string_view key, std::string_view value) {
+        validate_key(key);
+        command_record record{std::string(key), std::string(value)};
+        records_.push_back(std::move(record));
+        return *this;
+    }
+
+    command_output& add_number(std::string_view key, double value) {
+        return add(key, number(value));
+    }
+
+    command_output& add_integer(std::string_view key, std::int64_t value) {
+        return add(key, std::to_string(value));
+    }
+
+    command_output& add_unsigned(std::string_view key, std::uint64_t value) {
+        return add(key, std::to_string(value));
+    }
+
+    command_output& add_boolean(std::string_view key, bool value) {
+        return add(key, value ? "true" : "false");
+    }
+
+    command_output& add_duration_seconds(std::string_view key,
+                                         std::chrono::milliseconds value) {
+        return add_number(key, std::chrono::duration<double>(value).count());
+    }
+
+    command_output& set(std::string_view key, std::string_view value) {
+        validate_key(key);
+        const std::string key_copy(key);
+        const std::string replacement(value);
+        const auto first = std::find_if(records_.begin(), records_.end(), [&](const auto& item) {
+            return item.key == key_copy;
+        });
+        if (first == records_.end())
+            return add(key_copy, replacement);
+        first->value = replacement;
+        records_.erase(std::remove_if(std::next(first), records_.end(), [&](const auto& item) {
+                           return item.key == key_copy;
+                       }),
+                       records_.end());
+        return *this;
+    }
+
+    command_output& erase(std::string_view key) {
+        const std::string key_copy(key);
+        records_.erase(std::remove_if(records_.begin(), records_.end(), [&](const auto& item) {
+                           return item.key == key_copy;
+                       }),
+                       records_.end());
+        return *this;
+    }
+
+    command_output& rename(std::string_view key, std::string_view replacement) {
+        validate_key(replacement);
+        const std::string key_copy(key);
+        const std::string replacement_copy(replacement);
+        for (auto& item : records_)
+            if (item.key == key_copy)
+                item.key = replacement_copy;
+        return *this;
+    }
+
+    // Expose inspection without allowing callers to bypass key validation.
+    [[nodiscard]] const std::vector<command_record>& records() const noexcept {
+        return records_;
+    }
+
+    // Values stay unescaped in records_ and are escaped exactly once here.
+    std::ostream& write(std::ostream& output) const {
+        static constexpr char hex[] = "0123456789abcdef";
+        for (const auto& item : records_) {
+            std::string line = item.key;
+            line.push_back('=');
+            for (const char raw : item.value) {
+                const auto c = static_cast<unsigned char>(raw);
+                if (c == '\\')
+                    line += "\\\\";
+                else if (c == '\n')
+                    line += "\\n";
+                else if (c == '\r')
+                    line += "\\r";
+                else if (c == '\t')
+                    line += "\\t";
+                else if (c < 0x20 || c == 0x7f) {
+                    line += "\\x";
+                    line.push_back(hex[c >> 4]);
+                    line.push_back(hex[c & 0x0f]);
+                } else
+                    line.push_back(raw);
+            }
+            line.push_back('\n');
+            output.write(line.data(), static_cast<std::streamsize>(line.size()));
+        }
+        return output;
+    }
+
+    friend std::ostream& operator<<(std::ostream& output, const command_output& value) {
+        return value.write(output);
+    }
+
+private:
+    static void validate_key(std::string_view key) {
+        const auto letter = [](char value) {
+            return (value >= 'a' && value <= 'z') || (value >= 'A' && value <= 'Z');
+        };
+        if (key.empty() || (!letter(key.front()) && key.front() != '_'))
+            throw error("Command output keys must be shell variable names");
+        for (const char value : key)
+            if (!letter(value) && (value < '0' || value > '9') && value != '_')
+                throw error("Command output keys must be shell variable names");
+    }
+
+    static std::string number(double value) {
+        if (!std::isfinite(value))
+            throw error("Command output numbers must be finite");
+        std::ostringstream formatted;
+        formatted.imbue(std::locale::classic());
+        formatted << std::setprecision(12) << value;
+        return formatted.str();
+    }
+
+    static std::string state_name(job_state state) {
+        switch (state) {
+        case job_state::queued:
+            return "queued";
+        case job_state::scheduled:
+            return "scheduled";
+        case job_state::running:
+            return "running";
+        case job_state::succeeded:
+            return "succeeded";
+        case job_state::failed:
+            return "failed";
+        case job_state::cancelling:
+            return "cancelling";
+        case job_state::cancelled:
+            return "cancelled";
+        case job_state::deleting:
+            return "deleting";
+        case job_state::unknown:
+            return "unknown";
+        }
+        return "unknown";
+    }
+
+    std::vector<command_record> records_;
+};
+
+// Live lifecycle and log records should be written as they occur rather than
+// accumulated in a command_output. This one-record path applies exactly the
+// same validation and escaping while leaving flushing to the application.
+inline std::ostream& write_command_record(std::ostream& output, std::string_view key,
+                                          std::string_view value) {
+    command_output record;
+    record.add(key, value);
+    return record.write(output);
+}
 
 struct price_request {
     // Exact native plan sent to a trusted caller callback. Returning nullopt

@@ -87,9 +87,11 @@ template <class... Tests> int run(Tests&&... tests) {
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <iomanip>
 #include <initializer_list>
 #include <iostream>
 #include <limits>
+#include <locale>
 #include <map>
 #include <netinet/in.h>
 #include <optional>
@@ -102,6 +104,26 @@ template <class... Tests> int run(Tests&&... tests) {
 #include <utility>
 
 namespace {
+
+class comma_decimal_point : public std::numpunct<char> {
+protected:
+    char do_decimal_point() const override { return ','; }
+};
+
+class global_locale_guard {
+public:
+    explicit global_locale_guard(std::locale replacement) : previous_(std::locale()) {
+        std::locale::global(replacement);
+    }
+
+    global_locale_guard(const global_locale_guard&) = delete;
+    global_locale_guard& operator=(const global_locale_guard&) = delete;
+
+    ~global_locale_guard() { std::locale::global(previous_); }
+
+private:
+    std::locale previous_;
+};
 
 // C++20 added starts_with() and ends_with() to string_view. Keeping these
 // compatibility helpers local to the tests avoids changing their intent.
@@ -2725,10 +2747,12 @@ void environment_factory_tests() {
 
 void planning_tests() {
     static_assert(cloud::gcp::version == CLOUD_H_VERSION);
-    static_assert(CLOUD_H_VERSION_NUM == 0x000302);
+    static_assert(CLOUD_H_VERSION_NUM == 0x000303);
     static_assert(std::is_aggregate_v<cloud::resources>);
     static_assert(std::is_aggregate_v<cloud::job_spec>);
     static_assert(std::is_aggregate_v<cloud::run_diagnostics>);
+    static_assert(std::is_aggregate_v<cloud::command_record>);
+    static_assert(!std::is_aggregate_v<cloud::command_output>);
 
     cloud::config config;
     config.project = "test-project";
@@ -2958,6 +2982,187 @@ void planning_tests() {
     tst::throws<cloud::error>([&] { (void)unsafe_region.plan(spec); }, "region validation");
 }
 
+void command_output_tests() {
+    std::string controls = "line\nwith\\control\r\t";
+    controls.push_back('\0');
+    controls.push_back('\x1f');
+    controls.push_back('\x7f');
+
+    std::string rendered_text;
+    {
+        global_locale_guard locale_scope(
+            std::locale(std::locale::classic(), new comma_decimal_point));
+        cloud::command_output basic;
+        basic.add_number("hourly_rate_estimate_usd", 0.24)
+            .add_duration_seconds("runtime_seconds", std::chrono::milliseconds(1'500))
+            .add_boolean("spot", true)
+            .add("warning", controls)
+            .add("warning", "second");
+        std::ostringstream rendered;
+        rendered << basic;
+        rendered_text = rendered.str();
+    }
+    tst::check(rendered_text ==
+                   "hourly_rate_estimate_usd=0.24\n"
+                   "runtime_seconds=1.5\n"
+                   "spot=true\n"
+                   "warning=line\\nwith\\\\control\\r\\t\\x00\\x1f\\x7f\n"
+                   "warning=second\n",
+               "command output is ordered, locale-stable, and escaped");
+
+    cloud::command_output modified;
+    modified.add("provider", "gcp")
+        .add("warning", "one")
+        .add("provider", "aws")
+        .add("warning", "two")
+        .set("provider", "azure");
+    const std::string_view stored_key = modified.records()[1].key;
+    modified.rename(stored_key, "notice")
+        .erase("notice")
+        .set("status", "ready");
+    tst::check(modified.records().size() == 2 && modified.records()[0].key == "provider" &&
+                   modified.records()[0].value == "azure" &&
+                   modified.records()[1].key == "status" &&
+                   modified.records()[1].value == "ready",
+               "command records can be replaced, renamed, erased, and inspected");
+
+    std::ostringstream one_record;
+    cloud::write_command_record(one_record, "UPPER_2", "a=b c\n");
+    tst::check(one_record.str() == "UPPER_2=a=b c\\n\n",
+               "one live command record uses the same syntax");
+
+    std::ostringstream pending_width;
+    pending_width << std::setfill('.') << std::setw(20);
+    cloud::write_command_record(pending_width, "key", "value");
+    tst::check(pending_width.str() == "key=value\n",
+               "stream formatting cannot pad a command record");
+
+    for (const std::string_view invalid : {"", "1bad", "bad-key", "space key"})
+        tst::throws<cloud::error>(
+            [=] {
+                cloud::command_output value;
+                value.add(invalid, "value");
+            },
+            "command output rejects malformed keys");
+    tst::throws<cloud::error>(
+        [] {
+            cloud::command_output value;
+            value.add("valid", "value").rename("valid", "not.valid");
+        },
+        "command output rejects a malformed replacement key");
+    tst::throws<cloud::error>(
+        [] {
+            cloud::command_output value;
+            value.add_number("value", std::numeric_limits<double>::infinity());
+        },
+        "command output rejects non-finite numbers");
+
+    cloud::job_spec job;
+    job.name = "job\n42";
+    job.resources.cpus = 4;
+    job.resources.memory_gb = 16.5;
+    job.resources.gpu = "a10";
+    job.resources.gpu_count = 1;
+    job.resources.spot = true;
+
+    cloud::run_diagnostics report;
+    report.selected_plan.provider = "aws";
+    report.selected_plan.region = "eu-west-1";
+    report.selected_plan.machine_type = "g5.xlarge";
+    report.selected_plan.accelerator = "a10";
+    report.selected_plan.accelerator_count = 1;
+    report.selected_plan.estimated_hourly_cost = 0.24;
+    report.expected_attempt_runtime = std::chrono::seconds(90);
+    report.controller_timeout = std::chrono::milliseconds(1'500);
+    report.provider_attempt_timeout = std::chrono::seconds(2);
+    report.configured_retries = 2;
+    report.configured_attempt_limit = 3;
+    report.estimated_cost_for_expected_attempt_runtime = 0.006;
+    report.warnings = {"first", "second\nline"};
+
+    cloud::command_output diagnostics =
+        cloud::command_output::diagnostics("cheapest", job, report);
+    diagnostics.add("program", "test");
+    std::ostringstream diagnostic_text;
+    diagnostics.write(diagnostic_text);
+    tst::check(diagnostic_text.str() ==
+                   "output_version=1\n"
+                   "requested_provider=cheapest\n"
+                   "job_name=job\\n42\n"
+                   "provider=aws\n"
+                   "region=eu-west-1\n"
+                   "machine=g5.xlarge\n"
+                   "requested_cpus=4\n"
+                   "requested_memory_gb=16.5\n"
+                   "accelerator=a10\n"
+                   "accelerator_count=1\n"
+                   "spot=true\n"
+                   "expected_attempt_runtime_seconds=90\n"
+                   "controller_timeout_seconds=1.5\n"
+                   "provider_attempt_timeout_seconds=2\n"
+                   "provider_job_timeout_seconds=not-applicable\n"
+                   "configured_retries=2\n"
+                   "configured_attempt_limit=3\n"
+                   "cost_currency=USD\n"
+                   "hourly_rate_estimate_usd=0.24\n"
+                   "estimated_cost_for_expected_attempt_runtime_usd=0.006\n"
+                   "estimate_basis=expected-attempt-runtime-times-hourly-rate\n"
+                   "warning=first\n"
+                   "warning=second\\nline\n"
+                   "preflight=planned\n"
+                   "program=test\n",
+               "standard diagnostics are complete and customisable");
+
+    report.provider_job_timeout = std::chrono::seconds(123);
+    report.selected_plan.estimated_hourly_cost.reset();
+    report.estimated_cost_for_expected_attempt_runtime.reset();
+    std::ostringstream unavailable;
+    cloud::command_output::diagnostics("azure", job, report).write(unavailable);
+    tst::check(unavailable.str().find("provider_job_timeout_seconds=123\n") !=
+                       std::string::npos &&
+                   unavailable.str().find("hourly_rate_estimate_usd=unavailable\n") !=
+                       std::string::npos &&
+                   unavailable.str().find(
+                       "estimated_cost_for_expected_attempt_runtime_usd=unavailable\n") !=
+                       std::string::npos,
+               "diagnostics distinguish watchdogs and unavailable prices");
+
+    const std::array<std::pair<cloud::job_state, std::string_view>, 10> states{{
+        {cloud::job_state::queued, "queued"},
+        {cloud::job_state::scheduled, "scheduled"},
+        {cloud::job_state::running, "running"},
+        {cloud::job_state::succeeded, "succeeded"},
+        {cloud::job_state::failed, "failed"},
+        {cloud::job_state::cancelling, "cancelling"},
+        {cloud::job_state::cancelled, "cancelled"},
+        {cloud::job_state::deleting, "deleting"},
+        {cloud::job_state::unknown, "unknown"},
+        {static_cast<cloud::job_state>(999), "unknown"},
+    }};
+    for (const auto& state : states) {
+        cloud::result value;
+        value.state = state.first;
+        std::ostringstream state_text;
+        cloud::command_output::job_result(value).write(state_text);
+        tst::check(state_text.str() == "job_state=" + std::string(state.second) + "\n",
+                   "command result normalises every job state");
+    }
+
+    cloud::result failed;
+    failed.state = cloud::job_state::failed;
+    failed.exit_code = 17;
+    failed.message = "kept for stderr";
+    failed.warnings = {"one", "two"};
+    std::ostringstream result_text;
+    cloud::command_output::job_result(failed).write(result_text);
+    tst::check(result_text.str() ==
+                   "job_state=failed\n"
+                   "exit_code=17\n"
+                   "warning=one\n"
+                   "warning=two\n",
+               "command result preserves warnings and leaves errors to the caller");
+}
+
 void example_support_tests() {
     tst::check(cloud_example::parse_runtime("30s") == std::chrono::seconds(30) &&
                    cloud_example::parse_runtime("20m") == std::chrono::minutes(20) &&
@@ -2968,20 +3173,6 @@ void example_support_tests() {
         tst::throws<std::invalid_argument>(
             [=] { (void)cloud_example::parse_runtime(invalid); },
             "example runtime parser rejects malformed or overflowing input");
-
-    std::ostringstream output;
-    cloud_example::print_number(output, "hourly_rate_estimate_usd", 0.24);
-    cloud_example::print_duration_seconds(output, "runtime_seconds",
-                                          std::chrono::milliseconds(1'500));
-    cloud_example::print_record(output, "warning", "line\nwith\\control\t");
-    tst::check(output.str() ==
-                   "hourly_rate_estimate_usd=0.24\n"
-                   "runtime_seconds=1.5\n"
-                   "warning=line\\nwith\\\\control\\t\n",
-               "example output is concise, locale-stable, and escaped");
-    tst::check(cloud_example::job_state_name(cloud::job_state::succeeded) == "succeeded" &&
-                   cloud_example::job_state_name(cloud::job_state::unknown) == "unknown",
-               "example job-state output");
 }
 
 } // namespace
@@ -3002,5 +3193,6 @@ int main() {
         TST_CASE("runs AWS Batch and recovery", aws_lifecycle_tests()),
         TST_CASE("runs Azure Batch and log recovery", azure_lifecycle_tests()),
         TST_CASE("looks up prices and selects providers", pricing_tests()),
-        TST_CASE("formats example diagnostics", example_support_tests()));
+        TST_CASE("formats custom command output", command_output_tests()),
+        TST_CASE("parses example command options", example_support_tests()));
 }

@@ -34,36 +34,41 @@ int main(int argc, char* argv[]) {
         const cloud::run_diagnostics report =
             router.diagnose(job, chosen.expected_attempt_runtime);
         cloud::client routed = router.route(report.selected_plan.provider);
-        cloud_example::print_diagnostics(chosen, job, report);
-        cloud_example::print_record(std::cout, "preflight", "planned");
+
+        // The library supplies the standard command records. This executable
+        // adds its own record before choosing where to write the result.
+        cloud::command_output output =
+            cloud::command_output::diagnostics(chosen.provider, job, report);
+        output.add("program", "cloud-run");
+        output.write(std::cout);
         if (!chosen.submit) {
-            cloud_example::print_record(std::cout, "status", "dry-run");
+            cloud::write_command_record(std::cout, "status", "dry-run");
             return 0;
         }
 
         try {
-            cloud_example::print_record(std::cout, "status", "submitting");
+            cloud::write_command_record(std::cout, "status", "submitting");
             std::cout.flush();
             const cloud::job submitted = routed.run(job);
-            cloud_example::print_record(std::cout, "job_id", submitted.id());
+            cloud::write_command_record(std::cout, "job_id", submitted.id());
             const cloud::result result = submitted.wait(
                 [](const cloud::log_entry& line) {
-                    cloud_example::print_record(std::cout, "log", line.text);
+                    cloud::write_command_record(std::cout, "log", line.text);
                 });
-            cloud_example::print_result(result);
+            cloud::command_output::job_result(result).write(std::cout);
             if (!result.success()) {
-                cloud_example::print_record(std::cerr, "error", result.error());
-                cloud_example::print_record(std::cout, "status", "failed");
+                cloud::write_command_record(std::cerr, "error", result.error());
+                cloud::write_command_record(std::cout, "status", "failed");
                 return 1;
             }
-            cloud_example::print_record(std::cout, "status", "succeeded");
+            cloud::write_command_record(std::cout, "status", "succeeded");
             return 0;
         } catch (...) {
-            cloud_example::print_record(std::cout, "status", "failed");
+            cloud::write_command_record(std::cout, "status", "failed");
             throw;
         }
     } catch (const std::exception& failure) {
-        cloud_example::print_record(std::cerr, "error", failure.what());
+        cloud::write_command_record(std::cerr, "error", failure.what());
         return 2;
     }
 }

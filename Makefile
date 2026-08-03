@@ -32,8 +32,14 @@ check: example examples
 		printf '%s\n' "$$output" | \
 			grep -q '^estimated_cost_for_expected_attempt_runtime_usd=unavailable$$'; \
 		printf '%s\n' "$$output" | grep -q '^preflight=planned$$'; \
+		printf '%s\n' "$$output" | grep -q '^program=cloud-run$$'; \
 		printf '%s\n' "$$output" | grep -q '^status=dry-run$$'; \
 		! printf '%s\n' "$$output" | grep -Ev '^[a-z_]+=.*$$'
+	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
+		CLOUD_GCP_REGION=europe-west4 $(EXAMPLE) gcp)"; \
+		printf '%s\n' "$$output" | grep -q '^application=simulation$$'; \
+		printf '%s\n' "$$output" | grep -q '^preflight=planned$$'; \
+		printf '%s\n' "$$output" | grep -q '^status=dry-run$$'
 	@output="$$(env -i PATH="$(PATH)" CLOUD_AWS_JOB_QUEUE=test-queue \
 		CLOUD_AWS_REGION=eu-west-1 $(RUN_EXAMPLE) aws)"; \
 		printf '%s\n' "$$output" | grep -q '^provider=aws$$'; \

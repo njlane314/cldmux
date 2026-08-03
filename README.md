@@ -16,6 +16,8 @@ Version 0.3.1 makes example output line-oriented `KEY=value`, limits in-memory
 responses to 16 MiB, and bounds the private provider-response parser.
 Version 0.3.2 adds structured pre-submission runtime and compute-cost
 diagnostics without turning an estimate into a quote or wall-clock guarantee.
+Version 0.3.3 moves the escaped command output into `cloud.h` and makes its
+ordered records customisable by each application.
 
 ```text
 local data → plan → upload → run → poll logs → collect output → delete
@@ -51,16 +53,9 @@ int main() {
     job.timeout = std::chrono::minutes(15);
 
     const auto report = client.diagnose(job, std::chrono::minutes(5));
-    std::cout << "provider=" << report.selected_plan.provider << '\n'
-              << "region=" << report.selected_plan.region << '\n'
-              << "machine=" << report.selected_plan.machine_type << '\n'
-              << "expected_attempt_runtime_seconds="
-              << std::chrono::duration_cast<std::chrono::seconds>(
-                     report.expected_attempt_runtime).count()
-              << '\n';
-    if (report.estimated_cost_for_expected_attempt_runtime)
-        std::cout << "estimated_cost_for_expected_attempt_runtime_usd="
-                  << *report.estimated_cost_for_expected_attempt_runtime << '\n';
+    auto output = cloud::command_output::diagnostics("cheapest", job, report);
+    output.add("program", "example");
+    std::cout << output;
 }
 ```
 
@@ -89,7 +84,7 @@ cloud-run azure --expected-attempt-runtime=20m --estimate --submit
 ```
 
 The dry run is also the pre-submission diagnostic. Output is one stable record
-per line:
+per line; this excerpt omits some standard fields and warning records:
 
 ```text
 output_version=1
@@ -108,6 +103,7 @@ hourly_rate_estimate_usd=0.192
 estimated_cost_for_expected_attempt_runtime_usd=0.016
 estimate_basis=expected-attempt-runtime-times-hourly-rate
 preflight=planned
+program=cloud-run
 status=dry-run
 ```
 
@@ -232,11 +228,50 @@ measured from job creation. A live caller inside `job::wait()` starts
 cancellation at the local controller deadline; there is no autonomous timer,
 and final logs and cleanup can finish later.
 
-The examples turn this object into escaped `KEY=value` records through
-[`examples/support.h`](examples/support.h). That formatter is example code,
-not a required output or configuration dependency.
-After `--submit`, it also emits `status=submitting`, `job_id`, terminal
-`job_state`, optional `exit_code`, result warnings, and a final
+## COMMAND OUTPUT
+
+`cloud::command_output` provides UNIX-command-style diagnostics and terminal
+results as ordered, escaped `KEY=value` records without coupling `diagnose()`
+or `run()` to a stream. The returned value belongs to the application, so its
+`main` can amend the standard records before writing them:
+
+```cpp
+auto output = cloud::command_output::diagnostics("cheapest", job, report);
+output.set("job_name", "nightly-simulation")
+      .add("application", "simulation")
+      .rename("machine", "selected_machine");
+std::cout << output;
+```
+
+`add()` appends, including repeated `warning` records. `set()` replaces the
+first matching record and removes later duplicates; `rename()` changes every
+matching key in place; `erase()` removes every match. `records()` provides a
+read-only view when an application needs to inspect the final order. The
+`diagnostics()` factory includes the stable preflight schema and
+`job_result()` supplies terminal state, optional exit code, and warnings. The
+first `diagnostics()` argument retains a requested label such as `cheapest`
+separately from the selected `provider`. Pass the same `job_spec` used for
+`diagnose()`; formatting deliberately does not repeat planning or validation.
+
+For live lifecycle or log events, write one record when it occurs:
+
+```cpp
+cloud::write_command_record(std::cout, "status", "submitting");
+cloud::write_command_record(std::cout, "log", line.text);
+```
+
+Keys are case-sensitive portable shell-variable names,
+`[A-Za-z_][A-Za-z0-9_]*`; built-in keys are lower-case. Values retain spaces
+and `=`, while backslashes and ASCII control bytes use visible escapes only
+when the records are written. Consumers split on the first `=`. This is a
+grep-friendly display protocol, not shell source: do not pass it to `eval`.
+Numbers use the classic locale. Writing does
+not explicitly flush and provides no record-level thread synchronisation or
+atomicity; the caller owns the stream and timing. A stream configured with
+`unitbuf`, including `std::cerr` by default, can still flush itself.
+
+After `--submit`, the examples also emit `status=submitting`, `job_id`,
+terminal `job_state`, optional `exit_code`, result warnings, and a final
 `status=succeeded` or `status=failed` record.
 
 One exact AWS GPU target can be supplied without adding provider logic to the
@@ -495,9 +530,10 @@ flows.
 The library never invokes `gcloud`, `aws`, or `az`, and never logs credentials.
 Callers author typed C++ and `KEY=value` environment configuration only. The
 private transport codec serialises the provider-required REST wire format; it
-is not a public configuration format. The examples escape control bytes and
-backslashes in their `KEY=value` output. Advanced callers can deliberately
-inspect a provider's raw diagnostic body through `cloud::error::response()`.
+is not a public configuration format. `cloud::command_output` escapes control
+bytes and backslashes in its `KEY=value` records. Advanced callers can
+deliberately inspect a provider's raw diagnostic body through
+`cloud::error::response()`.
 
 API endpoints require TLS unless insecure HTTP is explicitly enabled for a
 test. GCP mutations carry request IDs; AWS Batch uses unique randomised names
