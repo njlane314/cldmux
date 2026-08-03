@@ -1,6 +1,6 @@
-#include <cloud/job.hpp>
+#include <cldmux/job.hpp>
 
 int main() {
-    cloud::result result;
-    return result.state == cloud::job_state::unknown ? 0 : 1;
+    cldmux::result result;
+    return result.state == cldmux::job_state::unknown ? 0 : 1;
 }

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/detail/provider.hpp"
+#include "cldmux/detail/provider.hpp"
 
-namespace cloud {
+namespace cldmux {
 namespace detail {
 
 // AWS EC2 raw-instance control ------------------------------------------------
@@ -219,4 +219,4 @@ inline void wait_aws_instance(const client_state& client, std::string id, std::s
 }
 
 } // namespace detail
-} // namespace cloud
+} // namespace cldmux

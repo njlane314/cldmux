@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/detail/http.hpp"
+#include "cldmux/detail/http.hpp"
 
-namespace cloud::gcp {
+namespace cldmux::gcp {
 namespace detail {
 
 // GCP application default credentials -----------------------------------------
@@ -672,8 +672,8 @@ public:
     [[nodiscard]] std::string zone() const { return core_->zone(); }
 
 private:
-    friend struct ::cloud::detail::client_state;
+    friend struct ::cldmux::detail::client_state;
     std::shared_ptr<detail::Core> core_;
 };
 
-} // namespace cloud::gcp
+} // namespace cldmux::gcp

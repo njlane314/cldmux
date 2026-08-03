@@ -3,8 +3,8 @@
 // Common dependencies, version macros, and low-level configuration shared by
 // every private source fragment.
 
-#define CLOUD_H_VERSION "0.4.0"
-#define CLOUD_H_VERSION_NUM 0x000400
+#define CLDMUX_VERSION "0.5.0"
+#define CLDMUX_VERSION_NUM 0x000500
 
 // Dependencies and compile-time contract --------------------------------------
 
@@ -44,14 +44,14 @@
 #include <vector>
 
 
-namespace cloud {
+namespace cldmux {
 namespace detail {
 struct client_state;
 }
-} // namespace cloud
-namespace cloud::gcp {
+} // namespace cldmux
+namespace cldmux::gcp {
 
-inline constexpr std::string_view version = CLOUD_H_VERSION;
+inline constexpr std::string_view version = CLDMUX_VERSION;
 
 // Low-level GCP configuration and public values -------------------------------
 
@@ -150,7 +150,7 @@ private:
     std::shared_ptr<State> state_;
 };
 
-// Configuration for the low-level cloud::gcp API. The portable cloud::config
+// Configuration for the low-level cldmux::gcp API. The portable cldmux::config
 // below is normally preferable for jobs spanning more than one provider.
 struct Config {
     // Empty values are discovered from GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_ZONE,
@@ -226,4 +226,4 @@ class Bucket;
 class Vm;
 class Operation;
 
-} // namespace cloud::gcp
+} // namespace cldmux::gcp

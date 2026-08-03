@@ -1,23 +1,23 @@
-#include <cloud>
+#include <cldmux>
 
 int main() {
-    cloud::job_spec job;
+    cldmux::job_spec job;
     job.name = "compile-probe";
-    cloud::command_output output;
+    cldmux::command_output output;
     output.add("job_name", job.name);
 
-    cloud::config config;
-    config.auth = cloud::auth::from(cloud::token_provider([] {
-        return cloud::access_token{
+    cldmux::config config;
+    config.auth = cldmux::auth::from(cldmux::token_provider([] {
+        return cldmux::access_token{
             "compile-token", std::chrono::system_clock::time_point::max(), {}};
     }));
-    config.lookup_hourly_cost = [](const cloud::price_request&) {
+    config.lookup_hourly_cost = [](const cldmux::price_request&) {
         return std::optional<double>{1.0};
     };
     config.aws.credentials = [] {
-        return cloud::aws_credentials{"key", "secret", "session"};
+        return cldmux::aws_credentials{"key", "secret", "session"};
     };
-    cloud::client client(std::move(config));
-    (void)client;
+    cldmux::router router(std::move(config));
+    (void)router;
     return output.records().size() == 1 ? 0 : 1;
 }

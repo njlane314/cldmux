@@ -33,7 +33,7 @@ public:
         std::random_device random;
         const auto root = std::filesystem::temp_directory_path();
         for (unsigned attempt = 0; attempt < 64; ++attempt) {
-            path_ = root / ("cloud-dispatch-test-" + std::to_string(random()) + '-' +
+            path_ = root / ("cldmux-dispatch-test-" + std::to_string(random()) + '-' +
                             std::to_string(attempt));
             std::error_code failure;
             if (std::filesystem::create_directory(path_, failure))

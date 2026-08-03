@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/detail/provider.hpp"
+#include "cldmux/detail/provider.hpp"
 
-namespace cloud {
+namespace cldmux {
 namespace detail {
 
 // GCP transport and public catalogue pricing ---------------------------------
@@ -106,7 +106,7 @@ inline std::optional<double> gcp_sku_unit_price(const gcp::detail::Json& sku) {
     return whole + fractional;
 }
 
-inline std::pair<double, double> gcp_machine_resources(const cloud::plan& chosen) {
+inline std::pair<double, double> gcp_machine_resources(const cldmux::plan& chosen) {
     const auto suffix = [&](std::string_view marker) -> std::optional<unsigned> {
         if (!gcp::detail::starts_with(chosen.machine_type, marker))
             return std::nullopt;
@@ -130,7 +130,7 @@ inline std::pair<double, double> gcp_machine_resources(const cloud::plan& chosen
 }
 
 inline std::optional<double> gcp_catalogue_price(const client_state& client,
-                                                const cloud::plan& chosen, bool spot) {
+                                                const cldmux::plan& chosen, bool spot) {
     // Compose hourly CPU, RAM, and optional GPU component SKUs. Filters reject
     // custom/sole-tenant/commitment variants and conflicting component matches.
     // A2 Ultra and A3 High shapes also carry mandatory billed Local SSD. Until
@@ -237,7 +237,7 @@ inline std::optional<double> gcp_catalogue_price(const client_state& client,
 }
 
 inline std::optional<double> aws_fargate_catalogue_price(const client_state& client,
-                                                         const cloud::plan& chosen, unsigned cpus,
+                                                         const cldmux::plan& chosen, unsigned cpus,
                                                          std::uint64_t memory_mib) {
     // Fargate has no instance SKU: its Linux/x86 price is the sum of separate
     // vCPU-hour and GiB-hour products. A region/shared query also returns ARM
@@ -343,7 +343,7 @@ inline std::optional<double> aws_fargate_catalogue_price(const client_state& cli
 }
 
 inline std::optional<double> aws_catalogue_price(const client_state& client,
-                                                 const cloud::plan& chosen, bool spot,
+                                                 const cldmux::plan& chosen, bool spot,
                                                  unsigned fargate_cpus,
                                                  std::uint64_t fargate_memory_mib) {
     // Spot is the newest Linux/UNIX observation for one exact Availability Zone.
@@ -453,7 +453,7 @@ inline std::optional<double> aws_catalogue_price(const client_state& client,
 }
 
 inline std::optional<double> azure_catalogue_price(const client_state& client,
-                                                  const cloud::plan& chosen, bool spot) {
+                                                  const cldmux::plan& chosen, bool spot) {
     // Select the latest effective primary-region USD consumption row. Windows,
     // low-priority, wrong-market, and conflicting same-date rows are rejected.
     const std::string endpoint = gcp::detail::base_url(client.config.azure.pricing_endpoint);
@@ -511,7 +511,7 @@ inline std::optional<double> azure_catalogue_price(const client_state& client,
     return found;
 }
 
-inline std::optional<double> catalogue_price(const client_state& client, const cloud::plan& chosen,
+inline std::optional<double> catalogue_price(const client_state& client, const cldmux::plan& chosen,
                                              bool spot, unsigned fargate_cpus = 0,
                                              std::uint64_t fargate_memory_mib = 0) {
     // Cache keys include provider, region, zone, native shape, accelerator, and
@@ -546,7 +546,7 @@ inline std::optional<double> catalogue_price(const client_state& client, const c
     return price;
 }
 
-inline cloud::plan priced_plan(const client_state& client, const job_spec& spec,
+inline cldmux::plan priced_plan(const client_state& client, const job_spec& spec,
                                std::string provider) {
     // Enforce a single pricing source and fail closed for a configured ceiling.
     // The compatibility callback cannot price accelerators because its signature
@@ -606,7 +606,7 @@ inline cloud::plan priced_plan(const client_state& client, const job_spec& spec,
     return out;
 }
 
-inline cloud::plan make_plan(const client_state& client, const job_spec& spec) {
+inline cldmux::plan make_plan(const client_state& client, const job_spec& spec) {
     // ordered tolerates an unrunnable provider and records why it was skipped.
     // lowest_cost instead requires comparable successful quotes before choosing;
     // stable provider order breaks equal-price ties.
@@ -615,7 +615,7 @@ inline cloud::plan make_plan(const client_state& client, const job_spec& spec) {
                                               : client.config.providers;
     if (choices.empty())
         throw error("No cloud provider configured");
-    std::vector<cloud::plan> candidates;
+    std::vector<cldmux::plan> candidates;
     std::vector<std::string> skipped;
     for (const auto& provider : choices) {
         if (!implemented(provider)) {
@@ -650,4 +650,4 @@ inline cloud::plan make_plan(const client_state& client, const job_spec& spec) {
 }
 
 } // namespace detail
-} // namespace cloud
+} // namespace cldmux

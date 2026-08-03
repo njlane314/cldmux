@@ -1,7 +1,7 @@
-#include <cloud/detail/providers/aws.hpp>
+#include <cldmux/detail/providers/aws.hpp>
 
 int main() {
-    const auto function = &cloud::detail::aws_compute_create;
+    const auto function = &cldmux::detail::aws_compute_create;
     (void)function;
     return 0;
 }

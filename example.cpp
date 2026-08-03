@@ -1,4 +1,4 @@
-#include <cloud>
+#include <cldmux>
 
 #include <charconv>
 #include <chrono>
@@ -44,11 +44,11 @@ void print_help(std::ostream& stream, std::string_view program) {
            << "  --help                         show these choices and exit\n"
            << "\n"
            << "The default is a read-only cheapest-provider diagnostic. Provider credentials,\n"
-           << "locations, queues, endpoints, and native storage resources use CLOUD_* and\n"
-           << "provider credential variables, or an explicit cloud::config in this source.\n";
+           << "locations, queues, endpoints, and native storage resources use CLDMUX_* and\n"
+           << "provider credential variables, or an explicit cldmux::config in this source.\n";
 }
 
-// This parser is application policy rather than cloud API. Keeping it here
+// This parser is application policy rather than cldmux API. Keeping it here
 // makes the example genuinely single-file and keeps the public library free of
 // opinions about a programme's command-line interface.
 std::chrono::milliseconds parse_runtime(std::string_view text) {
@@ -119,22 +119,22 @@ options parse_options(int argc, char* argv[]) {
             provider_seen = true;
         } else {
             throw std::invalid_argument(
-                "usage: cloud-run [cheapest|gcp|aws|azure] "
+                "usage: cldmux-run [cheapest|gcp|aws|azure] "
                 "[--expected-attempt-runtime=5m] [--estimate] [--submit] [--help]");
         }
     }
     return out;
 }
 
-cloud::client make_client(const options& chosen) {
+cldmux::router make_router(const options& chosen) {
     // "cheapest" automatically enables public-catalogue prices and requires at
     // least two configured providers. For an explicit provider, --estimate is
     // the opt-in to read-only catalogue network requests; without it, planning
     // stays local and the diagnostic reports an unavailable price.
     if (chosen.estimate)
-        return cloud::client::from_environment(chosen.provider,
-                                               cloud::price_source::public_catalogue);
-    return cloud::client::from_environment(chosen.provider);
+        return cldmux::router::from_environment(chosen.provider,
+                                               cldmux::price_source::public_catalogue);
+    return cldmux::router::from_environment(chosen.provider);
 }
 
 } // namespace
@@ -143,31 +143,31 @@ int main(int argc, char* argv[]) {
     try {
         const options chosen = parse_options(argc, argv);
         if (chosen.help) {
-            print_help(std::cout, "cloud-run");
+            print_help(std::cout, "cldmux-run");
             return 0;
         }
 
         // CONFIGURATION CHOICE
         //
         // from_environment() keeps deploy-time values outside the programme in
-        // grep-friendly KEY=value variables. Use an explicit cloud::config
+        // grep-friendly KEY=value variables. Use an explicit cldmux::config
         // instead when the programme must provide several provider-specific
         // regions, AWS GPU queues, storage mappings, logical VM templates,
         // private endpoints, credential callbacks, price callbacks, or custom
         // polling and timeout values. Explicit configuration also offers
         // selection::ordered as an alternative to selection::lowest_cost. Both
-        // configuration forms produce the same client API. supports() can check
+        // configuration forms produce the same router API. supports() can check
         // implemented features, while plan() validates one concrete job against
         // the selected configuration, account, and provider restrictions.
-        cloud::client router = make_client(chosen);
+        cldmux::router router = make_router(chosen);
 
         // WORKLOAD CHOICE
         //
         // job_spec is the provider-neutral description passed to plan(),
         // diagnose(), route(), and run(). Member assignment keeps this example
         // valid in C++17; C++20 and newer callers may use designated initialisers.
-        cloud::job_spec job;
-        job.name = "hello-cloud";
+        cldmux::job_spec job;
+        job.name = "hello-cldmux";
         job.image = "ubuntu:24.04";
 
         // Commands are shell-free tokens. GCP treats the first token as the
@@ -229,25 +229,25 @@ int main(int argc, char* argv[]) {
         // submission cannot switch. apps/empirical.cpp demonstrates a separate
         // policy which combines routing-time quote snapshots with observed
         // workload runtimes.
-        const cloud::run_diagnostics report =
+        const cldmux::run_diagnostics report =
             router.diagnose(job, chosen.expected_attempt_runtime);
-        cloud::client client = router.route(report.selected_plan.provider);
+        cldmux::client client = router.route(report.selected_plan.provider);
 
         // OUTPUT CHOICE
         //
         // The library provides ordered, escaped KEY=value diagnostics. An
         // application can add records, set or erase standard keys, rename them,
         // inspect records(), and choose stdout, stderr, or a file destination.
-        cloud::command_output output =
-            cloud::command_output::diagnostics(chosen.provider, job, report);
-        output.add("program", "cloud-run");
+        cldmux::command_output output =
+            cldmux::command_output::diagnostics(chosen.provider, job, report);
+        output.add("program", "cldmux-run");
         output.write(std::cout);
 
         // This is the safety boundary. Planning and catalogue lookup are
         // read-only; object writes, raw-compute controls, and run() belong below
         // the explicit --submit decision because they may incur charges.
         if (!chosen.submit) {
-            cloud::write_command_record(std::cout, "status", "dry-run");
+            cldmux::write_command_record(std::cout, "status", "dry-run");
             return 0;
         }
 
@@ -267,35 +267,35 @@ int main(int argc, char* argv[]) {
             // client.compute().create("worker", "logical-template").wait();
             // instances(), start(), stop(), and destroy() remain route-bound.
 
-            cloud::write_command_record(std::cout, "status", "submitting");
+            cldmux::write_command_record(std::cout, "status", "submitting");
             std::cout.flush();
-            const cloud::job submitted = client.run(job);
-            cloud::write_command_record(std::cout, "job_id", submitted.id());
+            const cldmux::job submitted = client.run(job);
+            cldmux::write_command_record(std::cout, "job_id", submitted.id());
 
             // wait() owns polling, line-oriented native logs, cancellation at the
             // controller deadline, final log draining, and configured cleanup.
             // status(), logs(), and cancel() support a custom controller. Copies
             // of one job share state, so serialise lifecycle method calls.
-            const cloud::result result = submitted.wait([](const cloud::log_entry& line) {
-                cloud::write_command_record(std::cout, "log", line.text);
+            const cldmux::result result = submitted.wait([](const cldmux::log_entry& line) {
+                cldmux::write_command_record(std::cout, "log", line.text);
             });
-            cloud::command_output::job_result(result).write(std::cout);
+            cldmux::command_output::job_result(result).write(std::cout);
             if (!result.success()) {
-                cloud::write_command_record(std::cerr, "error", result.error());
-                cloud::write_command_record(std::cout, "status", "failed");
+                cldmux::write_command_record(std::cerr, "error", result.error());
+                cldmux::write_command_record(std::cout, "status", "failed");
                 return 1;
             }
 
-            cloud::write_command_record(std::cout, "status", "succeeded");
+            cldmux::write_command_record(std::cout, "status", "succeeded");
             return 0;
         } catch (...) {
-            cloud::write_command_record(std::cout, "status", "failed");
+            cldmux::write_command_record(std::cout, "status", "failed");
             throw;
         }
     } catch (const std::exception& failure) {
         // Even errors use the library's one-record escaping, so hostile values
         // cannot inject extra diagnostic lines.
-        cloud::write_command_record(std::cerr, "error", failure.what());
+        cldmux::write_command_record(std::cerr, "error", failure.what());
         return 2;
     }
 }

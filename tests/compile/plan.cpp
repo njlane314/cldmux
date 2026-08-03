@@ -1,6 +1,6 @@
-#include <cloud/plan.hpp>
+#include <cldmux/plan.hpp>
 
 int main() {
-    cloud::plan plan;
+    cldmux::plan plan;
     return plan.provider == "gcp" ? 0 : 1;
 }

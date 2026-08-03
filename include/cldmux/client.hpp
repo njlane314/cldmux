@@ -1,11 +1,11 @@
 #pragma once
 
-#include "cloud/detail/providers/aws.hpp"
-#include "cloud/detail/providers/azure.hpp"
-#include "cloud/detail/storage.hpp"
-#include "cloud/detail/submission.hpp"
+#include "cldmux/detail/providers/aws.hpp"
+#include "cldmux/detail/providers/azure.hpp"
+#include "cldmux/detail/storage.hpp"
+#include "cldmux/detail/submission.hpp"
 
-namespace cloud {
+namespace cldmux {
 
 // Public storage, compute, job, and client handles -----------------------------
 
@@ -89,14 +89,10 @@ public:
 
 private:
     friend class client;
-    explicit storage(std::shared_ptr<detail::client_state> state,
-                     std::optional<cloud::provider> provider)
+    explicit storage(std::shared_ptr<detail::client_state> state, cldmux::provider provider)
         : state_(std::move(state)), provider_(std::move(provider)) {}
-    [[nodiscard]] const cloud::provider& provider() const {
-        if (!provider_)
-            throw error("Object storage on a multi-provider client requires route(job) or "
-                        "route(provider) first");
-        return *provider_;
+    [[nodiscard]] const cldmux::provider& provider() const {
+        return provider_;
     }
     [[nodiscard]] gcp::Cloud& raw() const {
         if (provider() != "gcp")
@@ -104,7 +100,7 @@ private:
         return state_->raw;
     }
     std::shared_ptr<detail::client_state> state_;
-    std::optional<cloud::provider> provider_;
+    cldmux::provider provider_;
 };
 
 // Route-bound raw-instance escape hatch. Batch jobs do not use this path.
@@ -205,14 +201,10 @@ public:
 
 private:
     friend class client;
-    explicit compute(std::shared_ptr<detail::client_state> state,
-                     std::optional<cloud::provider> provider)
+    explicit compute(std::shared_ptr<detail::client_state> state, cldmux::provider provider)
         : state_(std::move(state)), provider_(std::move(provider)) {}
-    [[nodiscard]] const cloud::provider& provider() const {
-        if (!provider_)
-            throw error("Raw compute on a multi-provider client requires route(job) or "
-                        "route(provider) first");
-        return *provider_;
+    [[nodiscard]] const cldmux::provider& provider() const {
+        return provider_;
     }
     [[nodiscard]] gcp::Cloud& raw() const {
         if (provider() != "gcp")
@@ -227,7 +219,7 @@ private:
         });
     }
     std::shared_ptr<detail::client_state> state_;
-    std::optional<cloud::provider> provider_;
+    cldmux::provider provider_;
 };
 
 class job {
@@ -289,7 +281,7 @@ public:
                                 const auto json = detail::cancel_job(*data_);
                                 result out = detail::make_result(*data_, json);
                                 data_->cached = out;
-                                detail::delete_job(*data_, "cloud log callback failure");
+                                detail::delete_job(*data_, "cldmux log callback failure");
                             } catch (...) {
                             }
                         }
@@ -310,7 +302,7 @@ public:
                         out.message = "Cloud job exceeded its controller timeout";
                     if (!log_warning.empty())
                         out.warnings.push_back(log_warning);
-                    cleanup(out, "cloud timeout");
+                    cleanup(out, "cldmux timeout");
                     return out;
                 }
                 (void)emit(deadline);
@@ -330,7 +322,7 @@ public:
                     result out = detail::make_result(*data_, json);
                     if (!log_warning.empty())
                         out.warnings.push_back(log_warning);
-                    cleanup(out, "cloud automatic cleanup");
+                    cleanup(out, "cldmux automatic cleanup");
                     return out;
                 }
                 detail::pause(*data_->client, deadline);
@@ -341,7 +333,7 @@ public:
                 try {
                     const auto json = detail::cancel_job(*data_);
                     result out = detail::make_result(*data_, json);
-                    cleanup(out, "cloud control failure");
+                    cleanup(out, "cldmux control failure");
                 } catch (...) {
                 }
             }
@@ -368,7 +360,7 @@ public:
             data_->cached->warnings.push_back(std::move(warning));
         if (data_->spec.auto_delete || data_->chosen.provider == "azure") {
             try {
-                detail::delete_job(*data_, "cloud cancellation");
+                detail::delete_job(*data_, "cldmux cancellation");
             } catch (const std::exception& failure) {
                 data_->cached->warnings.push_back(std::string("automatic cleanup failed: ") +
                                                   failure.what());
@@ -382,53 +374,42 @@ private:
     std::shared_ptr<detail::job_data> data_;
 };
 
-// Cheap-copy handles originate from one client_state. Constructing a client
-// validates local timing configuration but performs no cloud mutation.
+class router;
+
+// A client is always pinned to one provider. Cheap-copy handles originate from
+// one shared client_state, so routing preserves credentials and price caches.
 class client {
 public:
-    explicit client(cloud::config value = {})
-        : state_(std::make_shared<detail::client_state>(std::move(value))),
-          bound_provider_(detail::implicit_route(state_->config)),
-          storage_(state_, bound_provider_), compute_(state_, bound_provider_) {}
-
-    // Construct one provider-neutral client from the documented CLOUD_*
-    // environment contract. "cheapest" compares every configured provider;
-    // an explicit provider name is the override and keeps planning local.
-    [[nodiscard]] static client from_environment(std::string_view provider_name) {
-        return client(detail::config_from_environment(provider_name));
-    }
-
-    // Explicitly opt an environment-built client into or out of public catalogue
-    // pricing. This is useful for a single-provider diagnostic plan, whose default
-    // remains local and unpriced in the one-argument overload. "cheapest" cannot
-    // opt out because its selection contract requires comparable prices.
-    [[nodiscard]] static client from_environment(std::string_view provider_name,
-                                                 cloud::price_source prices) {
-        if (provider_name == "cheapest" && prices == cloud::price_source::none)
-            throw error("cheapest environment routing requires public catalogue pricing");
-        auto value = detail::config_from_environment(provider_name);
-        value.prices = prices;
-        return client(std::move(value));
-    }
-
-    [[nodiscard]] cloud::plan plan(const job_spec& spec) const {
+    [[nodiscard]] cldmux::plan plan(const job_spec& spec) const {
         // Does not mutate provider resources; it may invoke a caller pricing
         // callback or query a read-only public catalogue API.
-        if (bound_provider_)
-            return detail::priced_plan(*state_, spec, *bound_provider_);
-        return detail::make_plan(*state_, spec);
+        return detail::priced_plan(*state_, spec, bound_provider_);
     }
 
-    [[nodiscard]] cloud::run_diagnostics
+    [[nodiscard]] cldmux::run_diagnostics
     diagnose(const job_spec& spec, std::chrono::milliseconds expected_attempt_runtime) const {
+        validate_diagnostic_request(spec, expected_attempt_runtime);
+        return diagnose_with_plan(spec, expected_attempt_runtime, plan(spec));
+    }
+
+private:
+    static void validate_diagnostic_request(
+        const job_spec& spec, std::chrono::milliseconds expected_attempt_runtime) {
+        // Reject caller input before planning: pricing may invoke a callback or
+        // a catalogue request even though diagnostics never allocate resources.
         if (expected_attempt_runtime <= std::chrono::milliseconds::zero())
             throw error("Expected attempt runtime must be positive");
         if (spec.timeout > std::chrono::milliseconds::zero() &&
             expected_attempt_runtime > spec.timeout)
             throw error("Expected attempt runtime must not exceed the controller timeout");
+    }
 
-        cloud::run_diagnostics out;
-        out.selected_plan = plan(spec);
+    [[nodiscard]] cldmux::run_diagnostics
+    diagnose_with_plan(const job_spec& spec,
+                       std::chrono::milliseconds expected_attempt_runtime,
+                       cldmux::plan selected_plan) const {
+        cldmux::run_diagnostics out;
+        out.selected_plan = std::move(selected_plan);
         out.expected_attempt_runtime = expected_attempt_runtime;
         out.controller_timeout = spec.timeout;
         out.configured_retries = spec.retries;
@@ -512,37 +493,21 @@ public:
         return out;
     }
 
-    // Plan once to choose a provider, then pin every subsequent operation to
-    // that backend. run() still revalidates/reprices, but cannot switch clouds.
-    [[nodiscard]] client route(const job_spec& spec) const {
-        return client(state_, plan(spec).provider);
+public:
+    [[nodiscard]] const cldmux::provider& selected_provider() const {
+        return bound_provider_;
     }
 
-    // Explicit routing is the local override for an already configured router.
-    [[nodiscard]] client route(cloud::provider value) const {
-        if (!detail::implemented(value))
-            throw error(value + " backend is not implemented");
-        if (!detail::configured_provider(state_->config, value))
-            throw error(value + " is not configured on this client");
-        return client(state_, std::move(value));
-    }
-
-    [[nodiscard]] const cloud::provider& selected_provider() const {
-        if (!bound_provider_)
-            throw error("Multi-provider client is not routed");
-        return *bound_provider_;
-    }
-
-    [[nodiscard]] cloud::job run(const job_spec& spec) const {
+    [[nodiscard]] cldmux::job run(const job_spec& spec) const {
         // Replan immediately before submission so validation and price ceilings
         // are current. GCP uses one randomised audit name plus requestId and, after
         // an ambiguous create response, recovers with GET-by-name instead of replaying.
-        const cloud::plan chosen = plan(spec);
+        const cldmux::plan chosen = plan(spec);
         const std::string id = detail::job_id(spec.name);
         if (chosen.provider == "aws")
-            return cloud::job(detail::submit_aws(state_, spec, chosen, id));
+            return cldmux::job(detail::submit_aws(state_, spec, chosen, id));
         if (chosen.provider == "azure")
-            return cloud::job(detail::submit_azure(state_, spec, chosen, id));
+            return cldmux::job(detail::submit_azure(state_, spec, chosen, id));
         const std::string project = state_->core()->project();
         detail::validate_project(project);
         const std::string parent = "projects/" + project + "/locations/" + chosen.region + "/jobs";
@@ -593,40 +558,31 @@ public:
         if (data->name.empty())
             data->name = name;
         data->uid = gcp::detail::field(created, "uid");
-        return cloud::job(std::move(data));
-    }
-
-    [[nodiscard]] bool supports(std::string_view value, feature requested) const {
-        // Capability reports implemented behaviour, not a live account, quota,
-        // queue, regional SKU, or credential probe.
-        return detail::supports(value, requested);
+        return cldmux::job(std::move(data));
     }
 
     [[nodiscard]] bool supports(feature requested) const {
-        if (bound_provider_)
-            return supports(*bound_provider_, requested);
-        if (state_->config.providers.empty())
-            return false;
-        return std::all_of(state_->config.providers.begin(), state_->config.providers.end(),
-                           [&](const auto& value) { return supports(value, requested); });
+        // Capability reports implemented behaviour, not a live account, quota,
+        // queue, regional SKU, or credential probe.
+        return detail::supports(bound_provider_, requested);
     }
 
-    [[nodiscard]] cloud::storage& storage() noexcept { return storage_; }
-    [[nodiscard]] const cloud::storage& storage() const noexcept { return storage_; }
-    [[nodiscard]] cloud::compute& compute() noexcept { return compute_; }
-    [[nodiscard]] const cloud::compute& compute() const noexcept { return compute_; }
-    [[nodiscard]] gcp::Cloud& gcp() noexcept { return state_->raw; }
-    [[nodiscard]] const gcp::Cloud& gcp() const noexcept { return state_->raw; }
+    [[nodiscard]] cldmux::storage& storage() noexcept { return storage_; }
+    [[nodiscard]] const cldmux::storage& storage() const noexcept { return storage_; }
+    [[nodiscard]] cldmux::compute& compute() noexcept { return compute_; }
+    [[nodiscard]] const cldmux::compute& compute() const noexcept { return compute_; }
 
 private:
-    client(std::shared_ptr<detail::client_state> state, cloud::provider selected_provider)
+    friend class router;
+
+    client(std::shared_ptr<detail::client_state> state, cldmux::provider selected_provider)
         : state_(std::move(state)), bound_provider_(std::move(selected_provider)),
           storage_(state_, bound_provider_), compute_(state_, bound_provider_) {}
 
     std::shared_ptr<detail::client_state> state_;
-    std::optional<cloud::provider> bound_provider_;
-    cloud::storage storage_;
-    cloud::compute compute_;
+    cldmux::provider bound_provider_;
+    cldmux::storage storage_;
+    cldmux::compute compute_;
 };
 
-} // namespace cloud
+} // namespace cldmux

@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/detail/config.hpp"
+#include "cldmux/detail/config.hpp"
 
-namespace cloud::gcp {
+namespace cldmux::gcp {
 
 // Internal encoding and JSON ---------------------------------------------------
 
@@ -592,4 +592,4 @@ inline std::string random_uuid() {
 }
 
 } // namespace detail
-} // namespace cloud::gcp
+} // namespace cldmux::gcp

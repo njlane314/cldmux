@@ -1,5 +1,5 @@
-#include <cloud/detail/provider.hpp>
+#include <cldmux/detail/provider.hpp>
 
 int main() {
-    return cloud::detail::retryable(503) ? 0 : 1;
+    return cldmux::detail::retryable(503) ? 0 : 1;
 }

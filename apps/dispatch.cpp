@@ -1,6 +1,6 @@
 #include "dispatch.hpp"
 
-#include <cloud>
+#include <cldmux>
 
 #include <algorithm>
 #include <array>
@@ -168,30 +168,30 @@ std::string join_uri(std::string_view root, std::string_view key) {
     return std::string(root) + '/' + std::string(key);
 }
 
-quote public_quote(const cloud::plan& value) {
+quote public_quote(const cldmux::plan& value) {
     return {value.provider, value.region, value.machine_type, value.estimated_hourly_cost,
             value.warnings};
 }
 
-std::string cloud_state(cloud::job_state value) {
+std::string job_state_name(cldmux::job_state value) {
     switch (value) {
-    case cloud::job_state::queued:
+    case cldmux::job_state::queued:
         return "queued";
-    case cloud::job_state::scheduled:
+    case cldmux::job_state::scheduled:
         return "scheduled";
-    case cloud::job_state::running:
+    case cldmux::job_state::running:
         return "running";
-    case cloud::job_state::succeeded:
+    case cldmux::job_state::succeeded:
         return "succeeded";
-    case cloud::job_state::failed:
+    case cldmux::job_state::failed:
         return "failed";
-    case cloud::job_state::cancelling:
+    case cldmux::job_state::cancelling:
         return "cancelling";
-    case cloud::job_state::cancelled:
+    case cldmux::job_state::cancelled:
         return "cancelled";
-    case cloud::job_state::deleting:
+    case cldmux::job_state::deleting:
         return "deleting";
-    case cloud::job_state::unknown:
+    case cldmux::job_state::unknown:
         return "unknown";
     }
     return "unknown";
@@ -418,8 +418,8 @@ std::string execution_token() {
     return output.str();
 }
 
-cloud::command_output receipt_records(const receipt& value, std::string_view status) {
-    cloud::command_output output;
+cldmux::command_output receipt_records(const receipt& value, std::string_view status) {
+    cldmux::command_output output;
     output.add("receipt_version", receipt_version);
     output.add("receipt_status", status);
     output.add("request_id", value.request_id);
@@ -575,18 +575,18 @@ void persist_final(const receipt& value, std::string_view status) {
     publish_no_clobber(temporary.path(), value.receipt_file, "receipt");
 }
 
-bool object_exists(const cloud::storage& storage, std::string_view uri) {
+bool object_exists(const cldmux::storage& storage, std::string_view uri) {
     try {
         (void)storage.stat(uri);
         return true;
-    } catch (const cloud::error& failure) {
+    } catch (const cldmux::error& failure) {
         if (failure.http_status() == 404)
             return false;
         throw;
     }
 }
 
-bool same_object(const cloud::object& first, const cloud::object& second) {
+bool same_object(const cldmux::object& first, const cldmux::object& second) {
     return !first.generation.empty() && first.generation == second.generation &&
            first.size == second.size && first.crc32c == second.crc32c;
 }
@@ -594,8 +594,8 @@ bool same_object(const cloud::object& first, const cloud::object& second) {
 } // namespace
 
 struct prepared_run::implementation {
-    implementation(request requested_value, cloud::job_spec job_value,
-                   cloud::client bound_value, cloud::plan selected_value,
+    implementation(request requested_value, cldmux::job_spec job_value,
+                   cldmux::client bound_value, cldmux::plan selected_value,
                    quote quoted_value, std::string input_value, std::string output_value,
                    std::filesystem::path pending_value)
         : requested(std::move(requested_value)), job(std::move(job_value)),
@@ -604,9 +604,9 @@ struct prepared_run::implementation {
           output_uri(std::move(output_value)), pending_file(std::move(pending_value)) {}
 
     request requested;
-    cloud::job_spec job;
-    cloud::client bound;
-    cloud::plan selected;
+    cldmux::job_spec job;
+    cldmux::client bound;
+    cldmux::plan selected;
     quote quoted;
     std::string input_uri;
     std::string output_uri;
@@ -639,7 +639,7 @@ prepared_run core::prepare(request value) const {
     const roots artefact_roots = configured_roots();
     const std::string run_key = "runs/" + value.id;
 
-    cloud::job_spec job;
+    cldmux::job_spec job;
     job.name = "dispatch-" + value.id;
     job.image = value.image;
     job.command = value.command;
@@ -655,12 +655,13 @@ prepared_run core::prepare(request value) const {
     job.timeout = value.timeout;
     job.auto_delete = true;
 
-    cloud::client router =
+    cldmux::router router =
         value.catalogue_pricing
-            ? cloud::client::from_environment(value.policy, cloud::price_source::public_catalogue)
-            : cloud::client::from_environment(value.policy);
-    cloud::plan selected = router.plan(job);
-    cloud::client bound = router.route(selected.provider);
+            ? cldmux::router::from_environment(value.policy,
+                                               cldmux::price_source::public_catalogue)
+            : cldmux::router::from_environment(value.policy);
+    cldmux::plan selected = router.plan(job);
+    cldmux::client bound = router.route(selected.provider);
     quote quoted = public_quote(selected);
     quoted.warnings.push_back(
         "quote is an advisory planning snapshot; execute replans before mutation and run() "
@@ -710,7 +711,7 @@ receipt core::execute(prepared_run prepared, progress on_progress) const {
     value.transaction_phase = "validating";
 
     std::optional<std::chrono::steady_clock::time_point> started;
-    std::optional<cloud::job> submitted;
+    std::optional<cldmux::job> submitted;
     bool terminal_result = false;
     std::string progress_failure;
     const auto report_progress = [&](std::string_view text) {
@@ -734,10 +735,10 @@ receipt core::execute(prepared_run prepared, progress on_progress) const {
         value.recovery_file == state->requested.receipt_file)
         throw std::invalid_argument("recovery state path collides with a transaction path");
     // Refresh against the approved quote ceiling before any remote mutation.
-    const cloud::plan refreshed = state->bound.plan(state->job);
+    const cldmux::plan refreshed = state->bound.plan(state->job);
     if (refreshed.provider != state->selected.provider)
         throw std::runtime_error("provider-bound refresh changed provider");
-    const cloud::storage storage = state->bound.storage();
+    const cldmux::storage storage = state->bound.storage();
     if (object_exists(storage, state->output_uri))
         throw std::runtime_error("remote output artefact already exists");
 
@@ -759,9 +760,9 @@ receipt core::execute(prepared_run prepared, progress on_progress) const {
 
         value.transaction_phase = "uploading-input";
         report_progress("stage=uploading-input");
-        cloud::put_options create_only;
+        cldmux::put_options create_only;
         create_only.if_generation_match = "0";
-        const cloud::object uploaded =
+        const cldmux::object uploaded =
             storage.put_file(state->input_uri, snapshot.path(), create_only);
         if (uploaded.size != input.size || uploaded.generation.empty() || uploaded.crc32c.empty())
             throw std::runtime_error(
@@ -800,12 +801,12 @@ receipt core::execute(prepared_run prepared, progress on_progress) const {
 
         value.transaction_phase = "waiting";
         report_progress("stage=waiting");
-        const cloud::result result =
-            submitted->wait([&](const cloud::log_entry& entry) { report_progress(entry.text); });
+        const cldmux::result result =
+            submitted->wait([&](const cldmux::log_entry& entry) { report_progress(entry.text); });
         value.elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - *started);
         terminal_result = true;
-        value.job_state = cloud_state(result.state);
+        value.job_state = job_state_name(result.state);
         value.job_succeeded = result.success();
         value.exit_code = result.exit_code;
         value.message = result.message;
@@ -814,7 +815,7 @@ receipt core::execute(prepared_run prepared, progress on_progress) const {
         lease.update(value, "terminal");
 
         try {
-            const cloud::object current_input = storage.stat(state->input_uri);
+            const cldmux::object current_input = storage.stat(state->input_uri);
             if (!same_object(uploaded, current_input))
                 throw std::runtime_error("remote input artefact changed during execution");
         } catch (const std::exception& failure) {
@@ -827,10 +828,10 @@ receipt core::execute(prepared_run prepared, progress on_progress) const {
         if (value.job_succeeded) {
             value.transaction_phase = "retrieving-output";
             report_progress("stage=retrieving-output");
-            const cloud::object before = storage.stat(state->output_uri);
+            const cldmux::object before = storage.stat(state->output_uri);
             temporary_file downloaded(state->requested.output_bundle, "output");
             storage.get_file(state->output_uri, downloaded.path());
-            const cloud::object after = storage.stat(state->output_uri);
+            const cldmux::object after = storage.stat(state->output_uri);
             if (!same_object(before, after))
                 throw std::runtime_error("remote output artefact changed during retrieval");
             const fingerprint output = fingerprint_file(downloaded.path());

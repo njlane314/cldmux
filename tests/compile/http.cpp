@@ -1,6 +1,6 @@
-#include <cloud/detail/http.hpp>
+#include <cldmux/detail/http.hpp>
 
 int main() {
-    cloud::gcp::detail::HttpRequest request;
+    cldmux::gcp::detail::HttpRequest request;
     return request.method == "GET" ? 0 : 1;
 }

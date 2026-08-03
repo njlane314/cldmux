@@ -1,9 +1,9 @@
-# CLOUD
+# CLDMUX
 
-[![Build](https://github.com/njlane314/cloud/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/njlane314/cloud/actions/workflows/ci.yml)
+[![Build](https://github.com/njlane314/cldmux/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/njlane314/cldmux/actions/workflows/ci.yml)
 ![C++17 to C++23](https://img.shields.io/badge/C%2B%2B-17%20to%2023-00599C)
 
-`cloud` is a header-only C++17 library for running provider-neutral container
+`cldmux` is a header-only C++17 library for running provider-neutral container
 jobs on GCP, AWS, or Azure. It can compare public-catalogue compute prices,
 route a job to the cheapest configured provider, or honour an explicit provider
 override.
@@ -19,15 +19,15 @@ local data → plan → upload → run → poll logs → collect output → dele
 ## EXAMPLE
 
 ```cpp
-#include <cloud>
+#include <cldmux>
 
 #include <chrono>
 #include <iostream>
 
 int main() {
-    auto client = cloud::client::from_environment("cheapest");
-    cloud::job_spec job;
-    job.name = "hello-cloud";
+    auto router = cldmux::router::from_environment("cheapest");
+    cldmux::job_spec job;
+    job.name = "hello-cldmux";
     job.image = "ubuntu:24.04";
     job.command = {"/bin/echo", "hello"};
     job.resources.cpus = 4;
@@ -35,8 +35,8 @@ int main() {
     job.retries = 1;
     job.timeout = std::chrono::minutes(15);
 
-    const auto report = client.diagnose(job, std::chrono::minutes(5));
-    auto output = cloud::command_output::diagnostics("cheapest", job, report);
+    const auto report = router.diagnose(job, std::chrono::minutes(5));
+    auto output = cldmux::command_output::diagnostics("cheapest", job, report);
     output.add("program", "example");
     std::cout << output;
 }
@@ -45,7 +45,7 @@ int main() {
 Build with:
 
 ```sh
-c++ -std=c++17 -I. example.cpp -lcurl -pthread -o cloud-run
+c++ -std=c++17 -I. example.cpp -lcurl -pthread -o cldmux-run
 ```
 
 The repository has one heavily commented [`example.cpp`](example.cpp). It is a
@@ -59,13 +59,13 @@ work.
 Choose a policy at run time without changing the job:
 
 ```sh
-cloud-run                                  # choose the cheapest provider
-cloud-run gcp                              # explicit override
-cloud-run aws --estimate                   # price one explicit provider
-cloud-run azure --expected-attempt-runtime=20m --estimate --submit
+cldmux-run                                  # choose the cheapest provider
+cldmux-run gcp                              # explicit override
+cldmux-run aws --estimate                   # price one explicit provider
+cldmux-run azure --expected-attempt-runtime=20m --estimate --submit
 ```
 
-`client::from_environment("cheapest")` requires at least two configured
+`router::from_environment("cheapest")` requires at least two configured
 providers. It plans and prices the same job on every configured provider, then
 selects the lowest comparable USD compute estimate in stable GCP, AWS, Azure
 order. A failed plan or missing quote aborts the comparison; the router never
@@ -75,15 +75,15 @@ Passing `gcp`, `aws`, or `azure` overrides the router. Public-catalogue lookup
 then remains disabled unless the application explicitly selects it:
 
 ```cpp
-auto client = cloud::client::from_environment(
-    "aws", cloud::price_source::public_catalogue);
+auto router = cldmux::router::from_environment(
+    "aws", cldmux::price_source::public_catalogue);
 ```
 
 Provider-owned operations require a bound client:
 
 ```cpp
-auto routed = client.route(job);       // Plan once and bind the winner.
-auto azure = client.route("azure");    // Bind an explicit override.
+auto routed = router.route(job);       // Plan once and bind the winner.
+auto aws = router.route("aws");        // Bind an explicit override.
 
 routed.storage().put("cloud://inputs/data.txt", "payload");
 routed.compute().create("worker", "general-worker").wait();
@@ -99,23 +99,23 @@ cloud.
 
 `from_environment()` recognises these provider foundations:
 
-- GCP requires `CLOUD_GCP_PROJECT`; region and zone may be supplied through
-  `CLOUD_GCP_REGION` and `CLOUD_GCP_ZONE`.
+- GCP requires `CLDMUX_GCP_PROJECT`; region and zone may be supplied through
+  `CLDMUX_GCP_REGION` and `CLDMUX_GCP_ZONE`.
 
-- AWS on-demand jobs require `CLOUD_AWS_JOB_QUEUE` and
-  `CLOUD_AWS_MACHINE_TYPE`; Spot adds `CLOUD_AWS_SPOT_JOB_QUEUE`,
-  `CLOUD_AWS_SPOT_MACHINE_TYPE`, and `CLOUD_AWS_ZONE`. Mounted jobs instead
-  require `CLOUD_AWS_FARGATE_JOB_QUEUE` (or `CLOUD_AWS_FARGATE_SPOT_JOB_QUEUE`), role variables,
-  and a
-  `CLOUD_AWS_S3_FILES_*` mapping. Two mounts use the corresponding
-  `CLOUD_AWS_S3_FILES_INPUT_*` and `CLOUD_AWS_S3_FILES_OUTPUT_*` mappings.
+- AWS on-demand jobs require `CLDMUX_AWS_JOB_QUEUE` and
+  `CLDMUX_AWS_MACHINE_TYPE`; Spot adds `CLDMUX_AWS_SPOT_JOB_QUEUE`,
+  `CLDMUX_AWS_SPOT_MACHINE_TYPE`, and `CLDMUX_AWS_ZONE`. Mounted jobs instead
+  require `CLDMUX_AWS_FARGATE_JOB_QUEUE` (or
+  `CLDMUX_AWS_FARGATE_SPOT_JOB_QUEUE`), role variables, and a
+  `CLDMUX_AWS_S3_FILES_*` mapping. Two mounts use the corresponding
+  `CLDMUX_AWS_S3_FILES_INPUT_*` and `CLDMUX_AWS_S3_FILES_OUTPUT_*` mappings.
   GPU queues are configured separately.
 
-- Azure requires `CLOUD_AZURE_BATCH_ENDPOINT`. Its submission token is read
-  from `CLOUD_AZURE_BATCH_TOKEN` only if Azure is selected and `run()` is
+- Azure requires `CLDMUX_AZURE_BATCH_ENDPOINT`. Its submission token is read
+  from `CLDMUX_AZURE_BATCH_TOKEN` only if Azure is selected and `run()` is
   called.
 
-`CLOUD_REGION` and `CLOUD_ZONE` are shared fallbacks. Explicit `cloud::config`
+`CLDMUX_REGION` and `CLDMUX_ZONE` are shared fallbacks. Explicit `cldmux::config`
 supports provider-specific regions, several GPU targets, logical compute
 templates, credential callbacks, and larger storage-mount maps.
 
@@ -149,11 +149,11 @@ actual cost. Missing prices remain unavailable, never zero.
 not probe credentials, remote queues, images, objects, mounts, quota, capacity,
 API reachability, or submission.
 
-`cloud::command_output` renders stable, ordered `KEY=value` records and lets an
+`cldmux::command_output` renders stable, ordered `KEY=value` records and lets an
 application amend them before writing:
 
 ```cpp
-auto output = cloud::command_output::diagnostics("cheapest", job, report);
+auto output = cldmux::command_output::diagnostics("cheapest", job, report);
 output.set("job_name", "nightly-simulation")
       .add("application", "simulation")
       .rename("machine", "selected_machine");
@@ -210,7 +210,7 @@ Logs are delayed, best-effort provider records rather than a live byte stream.
 
 With `auto_delete`, GCP and Azure remove completed Batch jobs. AWS deregisters
 the temporary job definition but retains its terminal job record under AWS
-policy. Copies of one `cloud::job` share controller state; serialise calls to
+policy. Copies of one `cldmux::job` share controller state; serialise calls to
 `status()`, `logs()`, `wait()`, and `cancel()`.
 
 ## PRICING
@@ -219,7 +219,7 @@ Public-catalogue lookup is opt-in because planning then performs network
 requests:
 
 ```cpp
-config.prices = cloud::price_source::public_catalogue;
+config.prices = cldmux::price_source::public_catalogue;
 ```
 
 The built-in lookup uses GCP Cloud Billing, the signed AWS Price List or EC2
@@ -236,7 +236,7 @@ prevent an honest compute-only value.
 Applications may override lookup with a current internal price source:
 
 ```cpp
-config.lookup_hourly_cost = [](const cloud::price_request& request)
+config.lookup_hourly_cost = [](const cldmux::price_request& request)
         -> std::optional<double> {
     return lookup_in_your_current_price_table(request);
 };
@@ -256,7 +256,7 @@ move-only result to `execute()` is the caller's approval.
 make dispatch
 export DISPATCH_INPUT_ROOT=cloud://dispatch-input
 export DISPATCH_OUTPUT_ROOT=cloud://dispatch-output
-/tmp/cloud-dispatch --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
+/tmp/cldmux-dispatch --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
     --input=case.tar.zst --output=result.tar.zst -- /app/solve
 # Review the KEY=value quote, then repeat with --submit to approve it.
 ```
@@ -287,10 +287,10 @@ cost proxy = routing quote snapshot × routing runtime / 3600 + known data cost
 ```
 
 ```sh
-c++ -std=c++17 -I. apps/empirical.cpp -lcurl -pthread -o cloud-empirical
-cloud-empirical render-v2 --candidates=gcp,aws,azure \
+c++ -std=c++17 -I. apps/empirical.cpp -lcurl -pthread -o cldmux-empirical
+cldmux-empirical render-v2 --candidates=gcp,aws,azure \
     --data-cost=gcp:0.01 --data-cost=aws:0.02 --data-cost=azure:0
-cloud-empirical render-v2 --provider=aws --data-cost=aws:0.02 --submit
+cldmux-empirical render-v2 --provider=aws --data-cost=aws:0.02 --submit
 ```
 
 The mean is used only when every candidate reaches the sample threshold;
@@ -340,10 +340,10 @@ client.compute().destroy("worker").wait();
 
 The second `create()` argument is a logical template name. Configuration maps
 it to a GCE instance template, EC2 launch template, or Azure image, subnet, and
-VM size. `from_environment()` loads one mapping through
-`CLOUD_COMPUTE_TEMPLATE` and the corresponding provider variables; explicit
-`cloud::config` supports larger maps. Google-specific primitives remain under
-`cloud::gcp`.
+VM size. `router::from_environment()` loads one mapping through
+`CLDMUX_COMPUTE_TEMPLATE` and the corresponding provider variables; explicit
+`cldmux::config` supports larger maps. Google-specific primitives remain under
+`cldmux::gcp`.
 
 ## AUTHENTICATION AND SAFETY
 
@@ -372,9 +372,9 @@ the returned instance ID when independent controllers may race.
 ## CAPABILITIES AND LIMITS
 
 ```cpp
-client.supports("gcp", cloud::feature::spot_instances); // true
-client.supports("aws", cloud::feature::containers);     // true
-client.supports(cloud::feature::accelerators);          // true
+router.supports("gcp", cldmux::feature::spot_instances); // true
+router.supports("aws", cldmux::feature::containers);     // true
+client.supports(cldmux::feature::accelerators);           // bound provider
 ```
 
 `supports()` reports implemented library behaviour, not account permissions,
@@ -390,27 +390,27 @@ latency or carbon optimisers. Provider-native regions may be supplied directly.
 
 ## SOURCE LAYOUT
 
-`cloud` is the only public header. Place it on the compiler's include path and
+`cldmux` is the only public header. Place it on the compiler's include path and
 include it like a standard-library header:
 
 ```cpp
-#include <cloud>
+#include <cldmux>
 ```
 
 ```text
 apps/dispatch.hpp            provider-neutral dispatch API
-apps/dispatch.cpp            sole cloud-backed dispatch adapter
+apps/dispatch.cpp            sole cldmux-backed dispatch adapter
 apps/dispatch_main.cpp       quote-and-approve UNIX command
 apps/empirical.cpp           observed-runtime routing application
-cloud                        generated public header
-include/cloud/               private generator fragments
-include/cloud/detail/        private transport, pricing, and submission fragments
-include/cloud/detail/providers/
+cldmux                       generated public header
+include/cldmux/               private generator fragments
+include/cldmux/detail/        private transport, pricing, and submission fragments
+include/cldmux/detail/providers/
 tools/amalgamate.cpp         standalone C++17 generator
 tests/compile/               first-include and ODR probes
 ```
 
-Never edit the generated `cloud` header. Change the private fragments and run:
+Never edit the generated `cldmux` header. Change the private fragments and run:
 
 ```sh
 make amalgamate

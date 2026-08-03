@@ -17,8 +17,8 @@ run() {
     env -i PATH="$PATH" \
         DISPATCH_INPUT_ROOT=cloud://dispatch-input \
         DISPATCH_OUTPUT_ROOT=cloud://dispatch-output \
-        CLOUD_GCP_PROJECT=test-project \
-        CLOUD_GCP_REGION=europe-west4 \
+        CLDMUX_GCP_PROJECT=test-project \
+        CLDMUX_GCP_REGION=europe-west4 \
         "$binary" "$@"
 }
 
@@ -190,8 +190,8 @@ test "$error" = 'error=cheapest policy requires catalogue pricing'
 
 status=0
 error=$(env -i PATH="$PATH" \
-    CLOUD_GCP_PROJECT=test-project \
-    CLOUD_GCP_REGION=europe-west4 \
+    CLDMUX_GCP_PROJECT=test-project \
+    CLDMUX_GCP_REGION=europe-west4 \
     "$binary" \
     --id=missing-roots \
     --policy=gcp \
@@ -208,8 +208,8 @@ status=0
 error=$(env -i PATH="$PATH" \
     DISPATCH_INPUT_ROOT=cloud://same-root \
     DISPATCH_OUTPUT_ROOT=cloud://same-root \
-    CLOUD_GCP_PROJECT=test-project \
-    CLOUD_GCP_REGION=europe-west4 \
+    CLDMUX_GCP_PROJECT=test-project \
+    CLDMUX_GCP_REGION=europe-west4 \
     "$binary" \
     --id=same-roots \
     --policy=gcp \

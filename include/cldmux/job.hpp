@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/detail/pricing.hpp"
+#include "cldmux/detail/pricing.hpp"
 
-namespace cloud {
+namespace cldmux {
 namespace detail {
 
 // Job state, logs, cancellation, and cleanup ----------------------------------
@@ -20,7 +20,7 @@ struct job_data {
     // is the AWS definition ARN or Azure task ID (unused by GCP).
     std::shared_ptr<client_state> client;
     job_spec spec;
-    cloud::plan chosen;
+    cldmux::plan chosen;
     std::string id;
     std::string name;
     std::string auxiliary;
@@ -143,7 +143,7 @@ inline job_state update(const job_data& job, const gcp::detail::Json& json) {
             return job_state::succeeded;
         if (state == "FAILED") {
             const std::string reason = gcp::detail::field(json, "statusReason");
-            return contains(reason, "cloud cancellation") ? job_state::cancelled
+            return contains(reason, "cldmux cancellation") ? job_state::cancelled
                                                             : job_state::failed;
         }
         return job_state::unknown;
@@ -773,7 +773,7 @@ inline gcp::detail::Json cancel_job(const job_data& job) {
                                              "/v1/" + std::string(operation))
                                    .with_headers({"Content-Type: application/json"})
                                    .with_body("{\"jobId\":" + gcp::detail::json_quote(job.id) +
-                                              ",\"reason\":\"cloud cancellation\"}"),
+                                              ",\"reason\":\"cldmux cancellation\"}"),
                                job.chosen.region, "batch", false, deadline);
                 mutation_uncertain = false;
             } catch (const error& failure) {
@@ -878,4 +878,4 @@ inline result make_result(const job_data& job, const gcp::detail::Json& json) {
 }
 
 } // namespace detail
-} // namespace cloud
+} // namespace cldmux

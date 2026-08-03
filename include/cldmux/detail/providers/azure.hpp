@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/detail/provider.hpp"
+#include "cldmux/detail/provider.hpp"
 
-namespace cloud {
+namespace cldmux {
 namespace detail {
 
 // Azure Resource Manager raw-instance control --------------------------------
@@ -252,4 +252,4 @@ inline void wait_azure_compute(const client_state& client, azure_compute_operati
 }
 
 } // namespace detail
-} // namespace cloud
+} // namespace cldmux

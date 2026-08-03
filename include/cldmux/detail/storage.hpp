@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/detail/provider.hpp"
+#include "cldmux/detail/provider.hpp"
 
-namespace cloud {
+namespace cldmux {
 namespace detail {
 
 // AWS and Azure object storage ------------------------------------------------
@@ -375,4 +375,4 @@ inline object_list azure_storage_list(const client_state& client, const uri& loc
 }
 
 } // namespace detail
-} // namespace cloud
+} // namespace cldmux

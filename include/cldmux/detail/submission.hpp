@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/job.hpp"
+#include "cldmux/job.hpp"
 
-namespace cloud {
+namespace cldmux {
 namespace detail {
 
 // AWS and Azure submission -----------------------------------------------------
@@ -96,7 +96,7 @@ inline std::optional<std::string> find_aws_job(const client_state& client,
 }
 
 inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client,
-                                            const job_spec& spec, const cloud::plan& chosen,
+                                            const job_spec& spec, const cldmux::plan& chosen,
                                             const std::string& name) {
     // Register a uniquely named temporary definition, then submit a uniquely
     // named job. A lost registration response is reconciled by exact-name lookup;
@@ -130,7 +130,7 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
             const auto& item = spec.mounts[i];
             const uri source = parse_uri(item.source);
             const auto& mapping = client->config.aws.s3_files.at(source.bucket);
-            const std::string volume = "cloud-" + std::to_string(i);
+            const std::string volume = "cldmux-" + std::to_string(i);
             if (!volumes.empty()) {
                 volumes += ',';
                 mount_points += ',';
@@ -157,7 +157,7 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
                  "\"awslogs-group\":" +
                  gcp::detail::json_quote(client->config.aws.log_group) +
                  ",\"awslogs-region\":" + gcp::detail::json_quote(chosen.region) +
-                 ",\"awslogs-stream-prefix\":\"cloud\"}}}";
+                 ",\"awslogs-stream-prefix\":\"cldmux\"}}}";
     const std::string definition_body =
         "{\"jobDefinitionName\":" + gcp::detail::json_quote(name) +
         ",\"type\":\"container\",\"platformCapabilities\":[\"" +
@@ -315,7 +315,7 @@ inline std::string azure_command(const std::vector<std::string>& command) {
 }
 
 inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> client,
-                                              const job_spec& spec, const cloud::plan& chosen,
+                                              const job_spec& spec, const cldmux::plan& chosen,
                                               const std::string& id) {
     // Create fixed-ID job and task resources around a one-node, job-lifetime
     // auto-pool. After conflicts or transport ambiguity, inspect the fixed resource
@@ -349,7 +349,7 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
                       gcp::detail::json_quote(azure.storage_account) +
                       ",\"containerName\":" + gcp::detail::json_quote(source.bucket) +
                       ",\"relativeMountPath\":" +
-                      gcp::detail::json_quote("cloud-" + std::to_string(i)) +
+                      gcp::detail::json_quote("cldmux-" + std::to_string(i)) +
                       ",\"sasKey\":" + gcp::detail::json_quote(azure.storage_sas);
             if (item.read_only)
                 mounts += ",\"blobfuseOptions\":\"-o ro\"";
@@ -362,7 +362,7 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
         "{\"id\":" + gcp::detail::json_quote(id) +
         ",\"onAllTasksComplete\":\"noaction\",\"constraints\":{\"maxWallClockTime\":" +
         gcp::detail::json_quote("PT" + std::to_string(watchdog_seconds) + "S") +
-        "},\"poolInfo\":{\"autoPoolSpecification\":{\"autoPoolIdPrefix\":\"cloud\","
+        "},\"poolInfo\":{\"autoPoolSpecification\":{\"autoPoolIdPrefix\":\"cldmux\","
         "\"poolLifetimeOption\":\"job\",\"keepAlive\":false,\"pool\":" +
         pool + "}}}";
     const auto create_fixed = [&](std::string collection_url, std::string resource_url,
@@ -410,7 +410,7 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
         run_options += " --workdir=" + spec.workdir;
     for (std::size_t i = 0; i < spec.mounts.size(); ++i) {
         const auto& item = spec.mounts[i];
-        run_options += " --volume=/mnt/batch/tasks/fsmounts/cloud-" + std::to_string(i) + ':' +
+        run_options += " --volume=/mnt/batch/tasks/fsmounts/cldmux-" + std::to_string(i) + ':' +
                        item.target + (item.read_only ? ":ro" : "");
     }
     const std::string mount_identity =
@@ -454,4 +454,4 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
 }
 
 } // namespace detail
-} // namespace cloud
+} // namespace cldmux

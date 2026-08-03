@@ -180,7 +180,7 @@ void print_help(std::ostream& output) {
            << "\n"
            << "Set distinct DISPATCH_INPUT_ROOT and DISPATCH_OUTPUT_ROOT cloud:// bucket/container\n"
            << "roots. Provider infrastructure and\n"
-           << "credentials remain in CLOUD_* configuration. AWS native mounts are CPU-only.\n";
+           << "credentials remain in CLDMUX_* configuration. AWS native mounts are CPU-only.\n";
 }
 
 options parse_options(int argc, char* argv[]) {

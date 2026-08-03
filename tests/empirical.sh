@@ -8,18 +8,18 @@ trap 'rm -rf "$temporary"' EXIT HUP INT TERM
 
 run() {
     env -i PATH="$PATH" \
-        CLOUD_GCP_PROJECT=test-project \
-        CLOUD_GCP_REGION=europe-west4 \
-        CLOUD_AWS_JOB_QUEUE=test-queue \
-        CLOUD_AWS_MACHINE_TYPE=m6i.xlarge \
-        CLOUD_AWS_REGION=eu-west-1 \
-        CLOUD_AZURE_BATCH_ENDPOINT=https://test.westeurope.batch.azure.com \
-        CLOUD_AZURE_REGION=westeurope \
+        CLDMUX_GCP_PROJECT=test-project \
+        CLDMUX_GCP_REGION=europe-west4 \
+        CLDMUX_AWS_JOB_QUEUE=test-queue \
+        CLDMUX_AWS_MACHINE_TYPE=m6i.xlarge \
+        CLDMUX_AWS_REGION=eu-west-1 \
+        CLDMUX_AZURE_BATCH_ENDPOINT=https://test.westeurope.batch.azure.com \
+        CLDMUX_AZURE_REGION=westeurope \
         "$binary" "$@"
 }
 
 output=$(run --help)
-printf '%s\n' "$output" | grep -q '^Usage: cloud-empirical '
+printf '%s\n' "$output" | grep -q '^Usage: cldmux-empirical '
 printf '%s\n' "$output" | grep -q '^  --provider=aws '
 
 missing_history=$temporary/missing.history
@@ -182,9 +182,9 @@ test "$output" = 'error=known data cost missing for candidate aws'
 bad_machine=$(printf 'm6i.xlarge\ninjected=true')
 status=0
 output=$(env -i PATH="$PATH" \
-    CLOUD_AWS_JOB_QUEUE=test-queue \
-    CLOUD_AWS_MACHINE_TYPE="$bad_machine" \
-    CLOUD_AWS_REGION=eu-west-1 \
+    CLDMUX_AWS_JOB_QUEUE=test-queue \
+    CLDMUX_AWS_MACHINE_TYPE="$bad_machine" \
+    CLDMUX_AWS_REGION=eu-west-1 \
     "$binary" unsafe-plan-v1 \
     --provider=aws \
     --history="$missing_history" \

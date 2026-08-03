@@ -1,4 +1,4 @@
-#include <cloud>
+#include <cldmux>
 
 #if __cplusplus >= 202002L
 #include <tst.hpp>
@@ -382,9 +382,9 @@ private:
 
     static std::string gcp_sku(std::string_view description, std::string_view usage,
                                unsigned nanos) {
-        return "{\"description\":" + cloud::gcp::detail::json_quote(description) +
+        return "{\"description\":" + cldmux::gcp::detail::json_quote(description) +
                ",\"serviceRegions\":[\"europe-west4\"],\"category\":{\"usageType\":" +
-               cloud::gcp::detail::json_quote(usage) +
+               cldmux::gcp::detail::json_quote(usage) +
                "},\"pricingInfo\":[{\"pricingExpression\":{\"tieredRates\":[{\"unitPrice\":{"
                "\"currencyCode\":\"USD\",\"units\":\"0\",\"nanos\":" +
                std::to_string(nanos) + "}}]}}]}";
@@ -398,14 +398,14 @@ private:
             "{\"product\":{\"productFamily\":\"Compute\",\"attributes\":{"
             "\"servicecode\":\"AmazonECS\",\"regionCode\":\"eu-west-1\","
             "\"tenancy\":\"Shared\",\"operation\":\"\",\"usagetype\":" +
-            cloud::gcp::detail::json_quote(usage_type) + "," +
-            cloud::gcp::detail::json_quote(resource_name) + ':' +
-            cloud::gcp::detail::json_quote(resource_value) + std::string(extra_attributes) +
+            cldmux::gcp::detail::json_quote(usage_type) + "," +
+            cldmux::gcp::detail::json_quote(resource_name) + ':' +
+            cldmux::gcp::detail::json_quote(resource_value) + std::string(extra_attributes) +
             "}},\"serviceCode\":\"AmazonECS\",\"terms\":{\"OnDemand\":{\"term\":{"
             "\"priceDimensions\":{\"dimension\":{\"unit\":\"hours\","
             "\"beginRange\":\"0\",\"endRange\":\"Inf\",\"pricePerUnit\":{\"USD\":" +
-            cloud::gcp::detail::json_quote(price) + "}}}}}}}";
-        return cloud::gcp::detail::json_quote(offer);
+            cldmux::gcp::detail::json_quote(price) + "}}}}}}}";
+        return cldmux::gcp::detail::json_quote(offer);
     }
 
     static std::string aws_instance_xml(std::string_view id, std::string_view name,
@@ -432,11 +432,11 @@ private:
     static std::string azure_vm_json(std::string_view name, std::string_view state) {
         return "{\"id\":\"/subscriptions/subscription/resourceGroups/workers/providers/"
                "Microsoft.Compute/virtualMachines/" +
-               std::string(name) + "\",\"name\":" + cloud::gcp::detail::json_quote(name) +
+               std::string(name) + "\",\"name\":" + cldmux::gcp::detail::json_quote(name) +
                ",\"location\":\"westeurope\",\"properties\":{\"hardwareProfile\":{"
                "\"vmSize\":\"Standard_D4s_v5\"},\"timeCreated\":"
                "\"2026-08-03T10:00:00Z\",\"provisioningState\":" +
-               cloud::gcp::detail::json_quote(state) + "}}";
+               cldmux::gcp::detail::json_quote(state) + "}}";
     }
 
     reply route(std::string_view method, std::string_view target, std::string_view headers,
@@ -604,7 +604,7 @@ private:
                                              : url() + "/arm/pages/vms-2?api-version=2025-04-01";
                 return {200, "{\"value\":[" + azure_vm_json("azure-list-a", "Succeeded") +
                                  "],\"nextLink\":" +
-                                 cloud::gcp::detail::json_quote(next) + "}"};
+                                 cldmux::gcp::detail::json_quote(next) + "}"};
             }
             if (method == "GET" && starts_with(target, "/arm/pages/vms-2?")) {
                 ++azure_compute_lists;
@@ -623,8 +623,8 @@ private:
                 target.find("/azure-") != std::string_view::npos) {
                 ++azure_compute_creates;
                 try {
-                    (void)cloud::gcp::detail::parse_json(body);
-                } catch (const cloud::error&) {
+                    (void)cldmux::gcp::detail::parse_json(body);
+                } catch (const cldmux::error&) {
                     azure_compute_valid = false;
                 }
                 if (!has_header(headers, "if-none-match", "*") ||
@@ -683,8 +683,8 @@ private:
             const bool fargate =
                 body.find("\"platformCapabilities\":[\"FARGATE\"]") != std::string_view::npos;
             try {
-                (void)cloud::gcp::detail::parse_json(body);
-            } catch (const cloud::error&) {
+                (void)cldmux::gcp::detail::parse_json(body);
+            } catch (const cldmux::error&) {
                 if (fargate)
                     aws_mount_body_valid = false;
                 else
@@ -726,9 +726,9 @@ private:
             ++aws_definition_reads;
             std::string name;
             try {
-                const auto json = cloud::gcp::detail::parse_json(body);
-                name = cloud::gcp::detail::field(json, "jobDefinitionName");
-            } catch (const cloud::error&) {
+                const auto json = cldmux::gcp::detail::parse_json(body);
+                name = cldmux::gcp::detail::field(json, "jobDefinitionName");
+            } catch (const cldmux::error&) {
                 aws_body_valid = false;
             }
             if (name.empty() || body.find("\"status\":\"ACTIVE\"") == std::string_view::npos)
@@ -736,7 +736,7 @@ private:
             return {
                 200,
                 "{\"jobDefinitions\":[{\"jobDefinitionName\":" +
-                    cloud::gcp::detail::json_quote(name) +
+                    cldmux::gcp::detail::json_quote(name) +
                     ",\"jobDefinitionArn\":\"arn:aws:batch:eu-west-1:1:job-definition/cloud:1\","
                     "\"status\":\"ACTIVE\"}]}"};
         }
@@ -744,8 +744,8 @@ private:
             ++aws_submits;
             const bool fargate = aws_fargate_registers.load() > aws_fargate_submits.load();
             try {
-                (void)cloud::gcp::detail::parse_json(body);
-            } catch (const cloud::error&) {
+                (void)cldmux::gcp::detail::parse_json(body);
+            } catch (const cldmux::error&) {
                 if (fargate)
                     aws_mount_body_valid = false;
                 else
@@ -769,16 +769,16 @@ private:
             if (aws_cancel_accepted)
                 return {200,
                         "{\"jobs\":[{\"jobId\":\"aws-job-id\",\"status\":\"FAILED\","
-                        "\"statusReason\":\"cloud cancellation\","
-                        "\"container\":{\"exitCode\":1,\"logStreamName\":\"cloud/stream\"}}]}"};
+                        "\"statusReason\":\"cldmux cancellation\","
+                        "\"container\":{\"exitCode\":1,\"logStreamName\":\"cldmux/stream\"}}]}"};
             const std::string state = aws_cancel_mode == 1 ? "RUNNABLE" : "STARTING";
             return {200, "{\"jobs\":[{\"jobId\":\"aws-job-id\",\"status\":" +
-                             cloud::gcp::detail::json_quote(state) +
-                             ",\"container\":{\"logStreamName\":\"cloud/stream\"}}]}"};
+                             cldmux::gcp::detail::json_quote(state) +
+                             ",\"container\":{\"logStreamName\":\"cldmux/stream\"}}]}"};
         }
         if (method == "POST" && target == "/v1/describejobs")
             return {200, "{\"jobs\":[{\"jobId\":\"aws-job-id\",\"status\":\"SUCCEEDED\","
-                         "\"container\":{\"exitCode\":0,\"logStreamName\":\"cloud/stream\"}}]}"};
+                         "\"container\":{\"exitCode\":0,\"logStreamName\":\"cldmux/stream\"}}]}"};
         if (method == "POST" && ((target == "/v1/canceljob" && aws_cancel_mode == 1) ||
                                  (target == "/v1/terminatejob" && aws_cancel_mode == 2))) {
             const int request = ++aws_cancel_requests;
@@ -902,7 +902,7 @@ private:
                 "\"meterName\":\"D4s v5 Low Priority\",\"skuName\":\"D4s v5 Low Priority\","
                 "\"effectiveStartDate\":\"2024-01-01T00:00:00Z\","
                 "\"retailPrice\":0.05}],\"NextPageLink\":" +
-                    cloud::gcp::detail::json_quote(
+                    cldmux::gcp::detail::json_quote(
                         azure_cross_origin_price ? "https://evil.example/prices?page=2" : "") +
                     "}"};
         }
@@ -911,8 +911,8 @@ private:
             const int writes = ++azure_jobs;
             const bool mounted = body.find("\"mountConfiguration\"") != std::string_view::npos;
             try {
-                (void)cloud::gcp::detail::parse_json(body);
-            } catch (const cloud::error&) {
+                (void)cldmux::gcp::detail::parse_json(body);
+            } catch (const cldmux::error&) {
                 if (mounted)
                     azure_mount_body_valid = false;
                 else
@@ -924,7 +924,7 @@ private:
                         std::string_view::npos ||
                     body.find("\"containerName\":\"input-container\"") ==
                         std::string_view::npos ||
-                    body.find("\"relativeMountPath\":\"cloud-0\"") ==
+                    body.find("\"relativeMountPath\":\"cldmux-0\"") ==
                         std::string_view::npos ||
                     body.find("\"sasKey\":\"sv=test&sig=secret\"") ==
                         std::string_view::npos ||
@@ -942,10 +942,10 @@ private:
         if (method == "POST" && target.find("/tasks?api-version=") != std::string_view::npos) {
             const int writes = ++azure_tasks;
             const bool mounted =
-                body.find("/mnt/batch/tasks/fsmounts/cloud-0") != std::string_view::npos;
+                body.find("/mnt/batch/tasks/fsmounts/cldmux-0") != std::string_view::npos;
             try {
-                (void)cloud::gcp::detail::parse_json(body);
-            } catch (const cloud::error&) {
+                (void)cldmux::gcp::detail::parse_json(body);
+            } catch (const cldmux::error&) {
                 if (mounted)
                     azure_mount_body_valid = false;
                 else
@@ -953,7 +953,7 @@ private:
             }
             if (mounted) {
                 ++azure_mount_tasks;
-                if (body.find("--volume=/mnt/batch/tasks/fsmounts/cloud-0:/inputs:ro") ==
+                if (body.find("--volume=/mnt/batch/tasks/fsmounts/cldmux-0:/inputs:ro") ==
                         std::string_view::npos ||
                     body.find("\"userIdentity\":{\"autoUser\":{\"scope\":\"task\","
                               "\"elevationLevel\":\"admin\"}}") == std::string_view::npos)
@@ -1060,7 +1060,7 @@ private:
             if (key.empty())
                 return {400, "missing S3 object key"};
             if (method == "PUT") {
-                const std::string checksum = cloud::gcp::detail::crc32c(body);
+                const std::string checksum = cldmux::gcp::detail::crc32c(body);
                 const bool file = key == "file";
                 if (file)
                     ++aws_storage_file_puts;
@@ -1078,7 +1078,7 @@ private:
             const auto found = aws_objects_.find(key);
             if (found == aws_objects_.end())
                 return {404, "missing S3 object"};
-            const std::string checksum = cloud::gcp::detail::crc32c(found->second);
+            const std::string checksum = cldmux::gcp::detail::crc32c(found->second);
             if (method == "HEAD") {
                 return {200,
                         "",
@@ -1143,7 +1143,7 @@ private:
             if (key.empty())
                 return {400, "missing Azure Blob key"};
             if (method == "PUT") {
-                const std::string checksum = cloud::gcp::detail::crc32c(body);
+                const std::string checksum = cldmux::gcp::detail::crc32c(body);
                 const bool file = key == "file";
                 if (file)
                     ++azure_storage_file_puts;
@@ -1161,7 +1161,7 @@ private:
             const auto found = azure_objects_.find(key);
             if (found == azure_objects_.end())
                 return {404, "missing Azure Blob"};
-            const std::string checksum = cloud::gcp::detail::crc32c(found->second);
+            const std::string checksum = cldmux::gcp::detail::crc32c(found->second);
             if (method == "HEAD")
                 return {200,
                         "",
@@ -1191,7 +1191,7 @@ private:
             return {200, "{\"name\":\"object\",\"generation\":\"7\","
                          "\"size\":\"" +
                              std::to_string(body.size()) + "\",\"crc32c\":\"" +
-                             cloud::gcp::detail::crc32c(body) + "\"}"};
+                             cldmux::gcp::detail::crc32c(body) + "\"}"};
         }
         if (method == "GET" && starts_with(target, download_path)) {
             if (query(target, "generation") != "7")
@@ -1201,7 +1201,7 @@ private:
         if (method == "GET" && starts_with(target, object_path)) {
             return {200, "{\"name\":\"object\",\"generation\":\"7\","
                          "\"size\":\"7\",\"crc32c\":\"" +
-                             cloud::gcp::detail::crc32c("payload") + "\"}"};
+                             cldmux::gcp::detail::crc32c("payload") + "\"}"};
         }
         if (method == "GET" && starts_with(target, "/storage/v1/b/test-bucket/o?")) {
             ++storage_lists;
@@ -1222,10 +1222,10 @@ private:
                 query(target, "requestId").empty())
                 gcp_compute_valid = false;
             try {
-                const auto json = cloud::gcp::detail::parse_json(body);
-                if (cloud::gcp::detail::field(json, "name") != "gcp-created")
+                const auto json = cldmux::gcp::detail::parse_json(body);
+                if (cldmux::gcp::detail::field(json, "name") != "gcp-created")
                     gcp_compute_valid = false;
-            } catch (const cloud::error&) {
+            } catch (const cldmux::error&) {
                 gcp_compute_valid = false;
             }
             return {200, "{\"name\":\"insert-gcp-created\",\"status\":\"PENDING\"}"};
@@ -1458,7 +1458,7 @@ void transport_limit_tests() {
         bool caught = false;
         try {
             action();
-        } catch (const cloud::error& failure) {
+        } catch (const cldmux::error& failure) {
             caught = true;
             tst::check(std::string_view(failure.what()).find(
                            "HTTP response body exceeded the private byte limit") !=
@@ -1469,58 +1469,58 @@ void transport_limit_tests() {
         tst::check(caught, label);
     };
 
-    const auto exact = cloud::gcp::detail::http(
-        cloud::gcp::detail::HttpRequest{}
+    const auto exact = cldmux::gcp::detail::http(
+        cldmux::gcp::detail::HttpRequest{}
             .with_url(server.url() + "/transport-body?bytes=32")
             .with_max_response_bytes(32));
     tst::check(exact.body == std::string(32, 'x'), "exact in-memory response limit");
 
     expect_body_limit(
         [&] {
-            (void)cloud::gcp::detail::http(
-                cloud::gcp::detail::HttpRequest{}
+            (void)cldmux::gcp::detail::http(
+                cldmux::gcp::detail::HttpRequest{}
                     .with_url(server.url() + "/transport-body?bytes=33")
                     .with_max_response_bytes(32));
         },
         200, "oversized in-memory response rejected explicitly");
 
     const auto destination = std::filesystem::temp_directory_path() /
-                             ("cloud-h-stream-limit-" + cloud::gcp::detail::random_uuid());
-    cloud::gcp::detail::TemporaryPathGuard destination_guard(destination);
-    cloud::gcp::detail::HttpRequest download;
+                             ("cldmux-h-stream-limit-" + cldmux::gcp::detail::random_uuid());
+    cldmux::gcp::detail::TemporaryPathGuard destination_guard(destination);
+    cldmux::gcp::detail::HttpRequest download;
     download.url = server.url() + "/transport-body?bytes=64";
     download.download_file = destination;
     download.max_response_bytes = 32;
-    (void)cloud::gcp::detail::http(std::move(download));
-    tst::check(cloud::gcp::detail::read_small_file(destination) == std::string(64, 'x'),
+    (void)cldmux::gcp::detail::http(std::move(download));
+    tst::check(cldmux::gcp::detail::read_small_file(destination) == std::string(64, 'x'),
                "successful file response streams beyond memory limit");
 
     expect_body_limit(
         [&] {
-            (void)cloud::gcp::detail::http(
-                cloud::gcp::detail::HttpRequest{}.with_url(
+            (void)cldmux::gcp::detail::http(
+                cldmux::gcp::detail::HttpRequest{}.with_url(
                     server.url() + "/transport-body?bytes=65537&status=500"));
         },
         500, "oversized HTTP error response rejected explicitly");
 
     const auto error_destination = std::filesystem::temp_directory_path() /
-                                   ("cloud-h-error-limit-" +
-                                    cloud::gcp::detail::random_uuid());
-    cloud::gcp::detail::TemporaryPathGuard error_destination_guard(error_destination);
+                                   ("cldmux-h-error-limit-" +
+                                    cldmux::gcp::detail::random_uuid());
+    cldmux::gcp::detail::TemporaryPathGuard error_destination_guard(error_destination);
     {
         std::ofstream existing(error_destination, std::ios::binary);
         existing << "sentinel";
     }
-    const std::string part_prefix = error_destination.filename().string() + ".cloud-part-";
+    const std::string part_prefix = error_destination.filename().string() + ".cldmux-part-";
     expect_body_limit(
         [&] {
-            cloud::gcp::detail::HttpRequest failed_download;
+            cldmux::gcp::detail::HttpRequest failed_download;
             failed_download.url = server.url() + "/transport-body?bytes=65537&status=500";
             failed_download.download_file = error_destination;
-            (void)cloud::gcp::detail::http(std::move(failed_download));
+            (void)cldmux::gcp::detail::http(std::move(failed_download));
         },
         500, "oversized streamed error response rejected explicitly");
-    tst::check(cloud::gcp::detail::read_small_file(error_destination) == "sentinel",
+    tst::check(cldmux::gcp::detail::read_small_file(error_destination) == "sentinel",
                "streamed error preserves existing destination");
     for (const auto& entry : std::filesystem::directory_iterator(error_destination.parent_path()))
         tst::check(!starts_with(entry.path().filename().string(), part_prefix),
@@ -1528,9 +1528,9 @@ void transport_limit_tests() {
 
     bool header_limit = false;
     try {
-        (void)cloud::gcp::detail::http(
-            cloud::gcp::detail::HttpRequest{}.with_url(server.url() + "/transport-headers"));
-    } catch (const cloud::error& failure) {
+        (void)cldmux::gcp::detail::http(
+            cldmux::gcp::detail::HttpRequest{}.with_url(server.url() + "/transport-headers"));
+    } catch (const cldmux::error& failure) {
         header_limit = true;
         tst::check(std::string_view(failure.what()).find(
                        "HTTP response headers exceeded the private byte limit") !=
@@ -1541,26 +1541,38 @@ void transport_limit_tests() {
     tst::check(header_limit, "oversized HTTP headers rejected explicitly");
 
     const auto credential_path = std::filesystem::temp_directory_path() /
-                                 ("cloud-h-credential-limit-" +
-                                  cloud::gcp::detail::random_uuid());
-    cloud::gcp::detail::TemporaryPathGuard credential_guard(credential_path);
+                                 ("cldmux-h-credential-limit-" +
+                                  cldmux::gcp::detail::random_uuid());
+    cldmux::gcp::detail::TemporaryPathGuard credential_guard(credential_path);
     {
         std::ofstream credential(credential_path, std::ios::binary);
         credential << "{\"x\":1}";
     }
-    (void)cloud::gcp::detail::read_json_file(credential_path, 7);
-    tst::throws<cloud::error>(
-        [&] { (void)cloud::gcp::detail::read_json_file(credential_path, 6); },
+    (void)cldmux::gcp::detail::read_json_file(credential_path, 7);
+    tst::throws<cldmux::error>(
+        [&] { (void)cldmux::gcp::detail::read_json_file(credential_path, 6); },
         "credential file byte limit");
+}
+
+cldmux::client bind(cldmux::config config) {
+    cldmux::provider provider;
+    if (config.provider)
+        provider = *config.provider;
+    else if (config.providers.size() == 1)
+        provider = config.providers.front();
+    else
+        throw std::logic_error("test bind requires exactly one provider");
+    cldmux::router router(std::move(config));
+    return router.route(std::move(provider));
 }
 
 void gcp_lifecycle_tests() {
     fake_server server;
-    cloud::config config;
+    cldmux::config config;
     config.project = "test-project";
     config.region = "europe-west4";
     config.zone = "europe-west4-a";
-    config.auth = cloud::auth::bearer("test");
+    config.auth = cldmux::auth::bearer("test");
     config.allow_insecure_http = true;
     config.storage_endpoint = server.url();
     config.compute_endpoint = server.url();
@@ -1572,9 +1584,9 @@ void gcp_lifecycle_tests() {
     config.final_log_delay = std::chrono::milliseconds(50);
     config.final_log_timeout = std::chrono::milliseconds(200);
     config.cleanup_timeout = std::chrono::seconds(2);
-    cloud::client client(std::move(config));
+    auto client = bind(std::move(config));
 
-    cloud::job_spec spec;
+    cldmux::job_spec spec;
     spec.name = "retry-success";
     spec.image = "image";
     spec.command = {"run"};
@@ -1594,7 +1606,7 @@ void gcp_lifecycle_tests() {
     spec.name = "cancel-job";
     auto cancelled = client.run(spec);
     cancelled.cancel();
-    tst::check(cancelled.wait().state == cloud::job_state::cancelled, "observed cancellation");
+    tst::check(cancelled.wait().state == cldmux::job_state::cancelled, "observed cancellation");
     tst::check(cancelled.logs().size() == 1 && cancelled.logs().front().text == "cancelled",
                "cancellation drains delayed final logs");
     tst::check(server.cancel_operations > 0, "cancel operation polled");
@@ -1602,7 +1614,7 @@ void gcp_lifecycle_tests() {
     spec.name = "ambiguous-cancel";
     auto ambiguous = client.run(spec);
     ambiguous.cancel();
-    tst::check(ambiguous.wait().state == cloud::job_state::cancelled &&
+    tst::check(ambiguous.wait().state == cldmux::job_state::cancelled &&
                    server.ambiguous_cancel_attempts == 4,
                "accepted cancellation survives a lost response");
 
@@ -1611,7 +1623,7 @@ void gcp_lifecycle_tests() {
     auto timed_out = client.run(spec);
     std::this_thread::sleep_for(std::chrono::milliseconds(2));
     const auto timeout = timed_out.wait();
-    tst::check(timeout.state == cloud::job_state::cancelled &&
+    tst::check(timeout.state == cldmux::job_state::cancelled &&
                    timeout.error().find("timeout") != std::string::npos,
                "controller timeout cancellation");
 
@@ -1628,7 +1640,7 @@ void gcp_lifecycle_tests() {
     const auto started = std::chrono::steady_clock::now();
     const auto failed = client.run(spec).wait();
     const auto elapsed = std::chrono::steady_clock::now() - started;
-    tst::check(failed.state == cloud::job_state::failed && !failed.exit_code &&
+    tst::check(failed.state == cldmux::job_state::failed && !failed.exit_code &&
                    elapsed < std::chrono::milliseconds(500),
                "failed-task exit lookup respects its deadline");
 
@@ -1656,7 +1668,7 @@ void gcp_lifecycle_tests() {
                    objects.prefixes == std::vector<std::string>{"dir/"} &&
                    server.storage_lists == lists_before + 2,
                "storage pagination");
-    cloud::list_options limited;
+    cldmux::list_options limited;
     limited.limit = 1;
     const int limited_before = server.storage_lists;
     tst::check(client.storage().list("cloud://test-bucket", limited).objects.size() == 1 &&
@@ -1664,24 +1676,24 @@ void gcp_lifecycle_tests() {
                "storage pagination limit");
 
     const auto destination = std::filesystem::temp_directory_path() /
-                             ("cloud-h-test-" + cloud::gcp::detail::random_uuid());
-    cloud::gcp::detail::TemporaryPathGuard file_guard(destination);
+                             ("cldmux-h-test-" + cldmux::gcp::detail::random_uuid());
+    cldmux::gcp::detail::TemporaryPathGuard file_guard(destination);
     client.storage().get_file("cloud://test-bucket/object", destination);
-    tst::check(cloud::gcp::detail::read_small_file(destination) == "payload",
+    tst::check(cldmux::gcp::detail::read_small_file(destination) == "payload",
                "verified file download");
     {
         std::ofstream file_output(destination, std::ios::binary | std::ios::trunc);
         file_output << "preserved";
     }
     server.corrupt_download = true;
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { client.storage().get_file("cloud://test-bucket/object", destination); },
         "file download rejects a corrupt checksum");
     server.corrupt_download = false;
-    tst::check(cloud::gcp::detail::read_small_file(destination) == "preserved",
+    tst::check(cldmux::gcp::detail::read_small_file(destination) == "preserved",
                "corrupt file download preserves destination");
     client.storage().remove("cloud://test-bucket/object");
-    tst::throws<cloud::error>([&] { (void)client.storage().get("cloud://test-bucket"); },
+    tst::throws<cldmux::error>([&] { (void)client.storage().get("cloud://test-bucket"); },
                               "storage object path validation");
 
     const auto instances = client.compute().instances();
@@ -1694,12 +1706,12 @@ void gcp_lifecycle_tests() {
     created.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
     tst::check(server.gcp_compute_creates == 1 && server.gcp_compute_valid,
                "GCP raw compute resolves the configured native template");
-    tst::throws<cloud::error>([&] { (void)client.compute().create("vm", "missing"); },
+    tst::throws<cldmux::error>([&] { (void)client.compute().create("vm", "missing"); },
                               "GCP raw compute rejects an unknown logical template");
 }
 
-cloud::config aws_storage_config(const fake_server& server) {
-    cloud::config config;
+cldmux::config aws_storage_config(const fake_server& server) {
+    cldmux::config config;
     config.provider = "aws";
     config.region = "eu-west-1";
     config.allow_insecure_http = true;
@@ -1711,13 +1723,13 @@ cloud::config aws_storage_config(const fake_server& server) {
     return config;
 }
 
-cloud::config azure_storage_config(const fake_server& server) {
-    cloud::config config;
+cldmux::config azure_storage_config(const fake_server& server) {
+    cldmux::config config;
     config.provider = "azure";
     config.region = "westeurope";
     config.allow_insecure_http = true;
     config.azure.storage_endpoint = server.url() + "/blob";
-    config.azure.storage_auth = cloud::auth::bearer("azure-storage-token");
+    config.azure.storage_auth = cldmux::auth::bearer("azure-storage-token");
     config.request_timeout = std::chrono::seconds(2);
     config.transfer_timeout = std::chrono::seconds(2);
     return config;
@@ -1725,17 +1737,17 @@ cloud::config azure_storage_config(const fake_server& server) {
 
 void aws_storage_tests() {
     fake_server server;
-    cloud::client client(aws_storage_config(server));
+    auto client = bind(aws_storage_config(server));
 
-    cloud::put_options create_only;
+    cldmux::put_options create_only;
     create_only.content_type = "text/plain";
     create_only.if_generation_match = "0";
     const auto stored = client.storage().put("cloud://test-bucket/object", "payload", create_only);
     tst::check(stored.name == "object" && stored.generation == "\"aws-version\"" &&
-                   stored.size == 7 && stored.crc32c == cloud::gcp::detail::crc32c("payload"),
+                   stored.size == 7 && stored.crc32c == cldmux::gcp::detail::crc32c("payload"),
                "AWS S3 put returns portable metadata");
     const auto empty = client.storage().put("cloud://test-bucket/empty", "", create_only);
-    tst::check(empty.size == 0 && empty.crc32c == cloud::gcp::detail::crc32c(""),
+    tst::check(empty.size == 0 && empty.crc32c == cldmux::gcp::detail::crc32c(""),
                "AWS S3 put transmits an explicit empty object");
     tst::check(client.storage().get("cloud://test-bucket/object") == "payload",
                "AWS S3 get verifies the stored checksum");
@@ -1743,7 +1755,7 @@ void aws_storage_tests() {
     tst::check(metadata.etag == "\"aws-version\"" && metadata.size == 7,
                "AWS S3 stat maps ETag and size");
 
-    cloud::list_options listing;
+    cldmux::list_options listing;
     listing.delimiter = "/";
     const auto objects = client.storage().list("cloud://test-bucket/dir/", listing);
     tst::check(objects.objects.size() == 2 && objects.objects[0].name == "dir/first file" &&
@@ -1753,38 +1765,38 @@ void aws_storage_tests() {
                "AWS S3 list decodes keys and follows continuation tokens");
 
     const auto source = std::filesystem::temp_directory_path() /
-                        ("cloud-h-aws-source-" + cloud::gcp::detail::random_uuid());
+                        ("cldmux-h-aws-source-" + cldmux::gcp::detail::random_uuid());
     const auto destination = std::filesystem::temp_directory_path() /
-                             ("cloud-h-aws-destination-" + cloud::gcp::detail::random_uuid());
-    cloud::gcp::detail::TemporaryPathGuard source_guard(source);
-    cloud::gcp::detail::TemporaryPathGuard destination_guard(destination);
+                             ("cldmux-h-aws-destination-" + cldmux::gcp::detail::random_uuid());
+    cldmux::gcp::detail::TemporaryPathGuard source_guard(source);
+    cldmux::gcp::detail::TemporaryPathGuard destination_guard(destination);
     {
         std::ofstream output(source, std::ios::binary | std::ios::trunc);
         output << "file-payload";
     }
-    cloud::put_options replace;
+    cldmux::put_options replace;
     replace.if_generation_match = "\"aws-version\"";
     const auto file = client.storage().put_file("cloud://test-bucket/file", source, replace);
     tst::check(file.size == 12 && server.aws_storage_file_puts == 1,
                "AWS streamed file upload uses PUT");
     client.storage().get_file("cloud://test-bucket/file", destination);
-    tst::check(cloud::gcp::detail::read_small_file(destination) == "file-payload",
+    tst::check(cldmux::gcp::detail::read_small_file(destination) == "file-payload",
                "AWS S3 get_file streams a verified file");
     {
         std::ofstream output(destination, std::ios::binary | std::ios::trunc);
         output << "preserved";
     }
     server.corrupt_download = true;
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { client.storage().get_file("cloud://test-bucket/file", destination); },
         "AWS S3 get_file rejects a corrupt checksum");
     server.corrupt_download = false;
-    tst::check(cloud::gcp::detail::read_small_file(destination) == "preserved",
+    tst::check(cldmux::gcp::detail::read_small_file(destination) == "preserved",
                "AWS corrupt download preserves its destination");
 
     client.storage().remove("cloud://test-bucket/object");
     client.storage().remove("cloud://test-bucket/empty");
-    tst::throws<cloud::error>([&] { (void)client.storage().stat("cloud://test-bucket/object"); },
+    tst::throws<cldmux::error>([&] { (void)client.storage().stat("cloud://test-bucket/object"); },
                               "AWS S3 remove deletes the routed object");
     tst::check(server.aws_storage_puts == 2 && server.aws_storage_deletes == 2 &&
                    server.aws_storage_gets >= 3,
@@ -1795,18 +1807,18 @@ void aws_storage_tests() {
 
 void azure_storage_tests() {
     fake_server server;
-    cloud::client client(azure_storage_config(server));
+    auto client = bind(azure_storage_config(server));
 
-    cloud::put_options create_only;
+    cldmux::put_options create_only;
     create_only.content_type = "text/plain";
     create_only.if_generation_match = "0";
     const auto stored =
         client.storage().put("cloud://test-container/object", "payload", create_only);
     tst::check(stored.name == "object" && stored.generation == "\"azure-version\"" &&
-                   stored.size == 7 && stored.crc32c == cloud::gcp::detail::crc32c("payload"),
+                   stored.size == 7 && stored.crc32c == cldmux::gcp::detail::crc32c("payload"),
                "Azure Blob put returns portable metadata");
     const auto empty = client.storage().put("cloud://test-container/empty", "", create_only);
-    tst::check(empty.size == 0 && empty.crc32c == cloud::gcp::detail::crc32c(""),
+    tst::check(empty.size == 0 && empty.crc32c == cldmux::gcp::detail::crc32c(""),
                "Azure Blob put transmits an explicit empty object");
     tst::check(client.storage().get("cloud://test-container/object") == "payload",
                "Azure Blob get verifies the stored checksum");
@@ -1814,7 +1826,7 @@ void azure_storage_tests() {
     tst::check(metadata.etag == "\"azure-version\"" && metadata.size == 7,
                "Azure Blob stat maps ETag and size");
 
-    cloud::list_options listing;
+    cldmux::list_options listing;
     listing.delimiter = "/";
     const auto objects = client.storage().list("cloud://test-container/dir/", listing);
     tst::check(objects.objects.size() == 2 &&
@@ -1826,38 +1838,38 @@ void azure_storage_tests() {
                "Azure Blob list decodes names, parses metadata, and follows markers");
 
     const auto source = std::filesystem::temp_directory_path() /
-                        ("cloud-h-azure-source-" + cloud::gcp::detail::random_uuid());
+                        ("cldmux-h-azure-source-" + cldmux::gcp::detail::random_uuid());
     const auto destination = std::filesystem::temp_directory_path() /
-                             ("cloud-h-azure-destination-" + cloud::gcp::detail::random_uuid());
-    cloud::gcp::detail::TemporaryPathGuard source_guard(source);
-    cloud::gcp::detail::TemporaryPathGuard destination_guard(destination);
+                             ("cldmux-h-azure-destination-" + cldmux::gcp::detail::random_uuid());
+    cldmux::gcp::detail::TemporaryPathGuard source_guard(source);
+    cldmux::gcp::detail::TemporaryPathGuard destination_guard(destination);
     {
         std::ofstream output(source, std::ios::binary | std::ios::trunc);
         output << "file-payload";
     }
-    cloud::put_options replace;
+    cldmux::put_options replace;
     replace.if_generation_match = "\"azure-version\"";
     const auto file = client.storage().put_file("cloud://test-container/file", source, replace);
     tst::check(file.size == 12 && server.azure_storage_file_puts == 1,
                "Azure streamed file upload uses PUT");
     client.storage().get_file("cloud://test-container/file", destination);
-    tst::check(cloud::gcp::detail::read_small_file(destination) == "file-payload",
+    tst::check(cldmux::gcp::detail::read_small_file(destination) == "file-payload",
                "Azure Blob get_file streams a verified file");
     {
         std::ofstream output(destination, std::ios::binary | std::ios::trunc);
         output << "preserved";
     }
     server.corrupt_download = true;
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { client.storage().get_file("cloud://test-container/file", destination); },
         "Azure Blob get_file rejects a corrupt checksum");
     server.corrupt_download = false;
-    tst::check(cloud::gcp::detail::read_small_file(destination) == "preserved",
+    tst::check(cldmux::gcp::detail::read_small_file(destination) == "preserved",
                "Azure corrupt download preserves its destination");
 
     client.storage().remove("cloud://test-container/object");
     client.storage().remove("cloud://test-container/empty");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { (void)client.storage().stat("cloud://test-container/object"); },
         "Azure Blob remove deletes the routed object");
     tst::check(server.azure_storage_puts == 2 && server.azure_storage_deletes == 2 &&
@@ -1873,12 +1885,10 @@ void storage_route_tests() {
     config.provider.reset();
     config.providers = {"aws", "azure"};
     config.azure.storage_endpoint = server.url() + "/blob";
-    config.azure.storage_auth = cloud::auth::bearer("azure-storage-token");
-    cloud::client router(std::move(config));
-    tst::throws<cloud::error>([&] { (void)router.storage().stat("cloud://test-bucket/object"); },
-                              "multi-provider storage requires a route");
+    config.azure.storage_auth = cldmux::auth::bearer("azure-storage-token");
+    cldmux::router router(std::move(config));
 
-    cloud::put_options create_only;
+    cldmux::put_options create_only;
     create_only.if_generation_match = "0";
     const auto aws = router.route("aws");
     const auto azure = router.route("azure");
@@ -1891,8 +1901,8 @@ void storage_route_tests() {
                "route(provider) binds cloud URIs to exactly one storage backend");
 }
 
-cloud::config aws_compute_config(const fake_server& server) {
-    cloud::config config;
+cldmux::config aws_compute_config(const fake_server& server) {
+    cldmux::config config;
     config.provider = "aws";
     config.region = "eu-west-1";
     // Deliberately differ from the returned instance AZ: operation locations
@@ -1910,7 +1920,7 @@ cloud::config aws_compute_config(const fake_server& server) {
 
 void aws_compute_tests() {
     fake_server server;
-    cloud::client client(aws_compute_config(server));
+    auto client = bind(aws_compute_config(server));
 
     const auto instances = client.compute().instances();
     tst::check(instances.size() == 2 && instances[0].id == "i-list-a" &&
@@ -1929,15 +1939,15 @@ void aws_compute_tests() {
                    server.aws_compute_create_polls >= 2,
                "AWS RunInstances reuses its idempotency token and polls pending to running");
     const auto clock_origin = std::chrono::steady_clock::time_point{};
-    tst::check(cloud::detail::bounded_retry_delay(
+    tst::check(cldmux::detail::bounded_retry_delay(
                    0, clock_origin + std::chrono::milliseconds(20), clock_origin) ==
                    std::chrono::milliseconds(20) &&
-                   cloud::detail::bounded_retry_delay(
+                   cldmux::detail::bounded_retry_delay(
                        0, std::chrono::steady_clock::time_point::max(), clock_origin) ==
                        std::chrono::milliseconds(100),
                "provider retry delays are deterministically capped by operation deadlines");
     server.aws_compute_retry_wait = true;
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { created.wait(std::chrono::milliseconds(20), std::chrono::milliseconds(1)); },
         "AWS operation retry honours its wait deadline");
     server.aws_compute_retry_wait = false;
@@ -1968,27 +1978,27 @@ void aws_compute_tests() {
                    server.aws_compute_destroys == 1 &&
                    server.aws_compute_destroy_polls >= 2 && server.aws_compute_valid,
                "AWS raw-instance actions sign requests and observe their terminal states");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { (void)client.compute().create("aws-missing", "missing"); },
         "AWS create rejects an unknown logical template before HTTP");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { (void)client.compute().create("aws-existing", "worker"); },
         "AWS create rejects an existing managed Name tag");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { (void)client.compute().create("i-0123456789abcdef0", "worker"); },
         "AWS create reserves exact EC2 instance-ID syntax");
-    tst::throws<cloud::error>([&] { (void)client.compute().start("aws-ambiguous"); },
+    tst::throws<cldmux::error>([&] { (void)client.compute().start("aws-ambiguous"); },
                               "AWS name resolution detects ambiguity across pages");
 }
 
-cloud::config azure_compute_config(const fake_server& server) {
-    cloud::config config;
+cldmux::config azure_compute_config(const fake_server& server) {
+    cldmux::config config;
     config.provider = "azure";
     config.region = "westeurope";
     config.allow_insecure_http = true;
-    config.auth = cloud::auth::bearer("azure-batch-token");
-    config.azure.storage_auth = cloud::auth::bearer("azure-storage-token");
-    config.azure.management_auth = cloud::auth::bearer("azure-management-token");
+    config.auth = cldmux::auth::bearer("azure-batch-token");
+    config.azure.storage_auth = cldmux::auth::bearer("azure-storage-token");
+    config.azure.management_auth = cldmux::auth::bearer("azure-management-token");
     config.azure.management_endpoint = server.url() + "/arm";
     config.azure.subscription_id = "subscription";
     config.azure.resource_group = "workers";
@@ -2005,10 +2015,10 @@ cloud::config azure_compute_config(const fake_server& server) {
 
 void azure_compute_tests() {
     fake_server server;
-    cloud::client client(azure_compute_config(server));
+    auto client = bind(azure_compute_config(server));
 
     server.azure_cross_origin_next = true;
-    tst::throws<cloud::error>([&] { (void)client.compute().instances(); },
+    tst::throws<cldmux::error>([&] { (void)client.compute().instances(); },
                               "Azure list rejects a cross-origin nextLink");
     server.azure_cross_origin_next = false;
 
@@ -2025,7 +2035,7 @@ void azure_compute_tests() {
                "Azure create returns a portable operation with its native location");
     created.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
     server.azure_compute_retry_wait = true;
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { created.wait(std::chrono::milliseconds(20), std::chrono::milliseconds(1)); },
         "Azure operation retry honours its wait deadline");
     server.azure_compute_retry_wait = false;
@@ -2040,7 +2050,7 @@ void azure_compute_tests() {
     server.azure_cross_origin_operation = true;
     const auto untrusted = client.compute().create("azure-cross", "worker");
     server.azure_cross_origin_operation = false;
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { untrusted.wait(std::chrono::seconds(1), std::chrono::milliseconds(1)); },
         "Azure operation polling rejects a cross-origin asynchronous URL");
 
@@ -2049,13 +2059,13 @@ void azure_compute_tests() {
                    server.azure_compute_operation_polls >= 5 && server.azure_compute_valid,
                "Azure raw compute uses inline image/network definitions, deallocation, and a "
                "management-scoped bearer");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { (void)client.compute().create("azure-missing", "missing"); },
         "Azure create rejects an unknown logical template before HTTP");
 }
 
-cloud::config aws_mount_config(const fake_server& server) {
-    cloud::config config;
+cldmux::config aws_mount_config(const fake_server& server) {
+    cldmux::config config;
     config.provider = "aws";
     config.region = "eu-west-1";
     config.allow_insecure_http = true;
@@ -2074,8 +2084,8 @@ cloud::config aws_mount_config(const fake_server& server) {
     return config;
 }
 
-cloud::job_spec aws_mount_spec() {
-    cloud::job_spec spec;
+cldmux::job_spec aws_mount_spec() {
+    cldmux::job_spec spec;
     spec.name = "aws-mounted";
     spec.image = "image";
     spec.command = {"run"};
@@ -2088,19 +2098,19 @@ cloud::job_spec aws_mount_spec() {
 
 void aws_mount_tests() {
     fake_server server;
-    cloud::client client(aws_mount_config(server));
+    auto client = bind(aws_mount_config(server));
     const auto spec = aws_mount_spec();
 
     auto gpu = spec;
     gpu.resources.gpu = "nvidia-l4";
-    tst::throws<cloud::error>([&] { (void)client.run(gpu); },
+    tst::throws<cldmux::error>([&] { (void)client.run(gpu); },
                               "AWS mounted GPU jobs fail closed");
     tst::check(server.aws_registers == 0, "AWS mounted GPU rejection precedes HTTP");
 
     auto missing_queue_config = aws_mount_config(server);
     missing_queue_config.aws.fargate_job_queue.clear();
-    cloud::client missing_queue(std::move(missing_queue_config));
-    tst::throws<cloud::error>([&] { (void)missing_queue.run(spec); },
+    auto missing_queue = bind(std::move(missing_queue_config));
+    tst::throws<cldmux::error>([&] { (void)missing_queue.run(spec); },
                               "AWS mounted jobs require an explicit Fargate queue");
     tst::check(server.aws_registers == 0, "AWS missing-queue rejection precedes HTTP");
 
@@ -2109,12 +2119,12 @@ void aws_mount_tests() {
                "AWS mounted planning selects Fargate without accelerators");
 
     auto priced_config = aws_mount_config(server);
-    std::optional<cloud::price_request> priced_request;
-    priced_config.lookup_hourly_cost = [&](const cloud::price_request& request) {
+    std::optional<cldmux::price_request> priced_request;
+    priced_config.lookup_hourly_cost = [&](const cldmux::price_request& request) {
         priced_request = request;
         return std::optional<double>(0.25);
     };
-    cloud::client priced(std::move(priced_config));
+    auto priced = bind(std::move(priced_config));
     auto rounded = spec;
     rounded.resources.memory_gb = 4.1;
     const auto priced_plan = priced.plan(rounded);
@@ -2125,8 +2135,8 @@ void aws_mount_tests() {
 
     auto catalogue_config = aws_mount_config(server);
     catalogue_config.aws.pricing_endpoint = server.url();
-    catalogue_config.prices = cloud::price_source::public_catalogue;
-    cloud::client catalogue(std::move(catalogue_config));
+    catalogue_config.prices = cldmux::price_source::public_catalogue;
+    auto catalogue = bind(std::move(catalogue_config));
     const auto rounded_catalogue = catalogue.plan(rounded);
     const auto exact_catalogue = catalogue.plan(spec);
     (void)catalogue.plan(rounded);
@@ -2141,15 +2151,15 @@ void aws_mount_tests() {
     auto spot_config = aws_mount_config(server);
     spot_config.aws.fargate_spot_job_queue = "fargate-spot-queue";
     spot_config.aws.pricing_endpoint = server.url();
-    spot_config.prices = cloud::price_source::public_catalogue;
-    cloud::client spot_catalogue(std::move(spot_config));
+    spot_config.prices = cldmux::price_source::public_catalogue;
+    auto spot_catalogue = bind(std::move(spot_config));
     auto spot = spec;
     spot.resources.spot = true;
     tst::check(!spot_catalogue.plan(spot).estimated_hourly_cost &&
                    server.aws_fargate_price_reads == 4 && server.aws_spot_reads == 0,
                "AWS Fargate Spot remains unavailable without an unstable web-price lookup");
     spot.resources.max_price_per_hour = 1;
-    tst::throws<cloud::error>([&] { (void)spot_catalogue.plan(spot); },
+    tst::throws<cldmux::error>([&] { (void)spot_catalogue.plan(spot); },
                               "AWS Fargate Spot price ceiling fails closed");
 
     const auto job = client.run(spec);
@@ -2158,12 +2168,12 @@ void aws_mount_tests() {
                "AWS S3 Files submission carries Fargate volumes, roles, mounts, and queue");
 }
 
-cloud::config azure_mount_config(const fake_server& server) {
-    cloud::config config;
+cldmux::config azure_mount_config(const fake_server& server) {
+    cldmux::config config;
     config.provider = "azure";
     config.region = "westeurope";
     config.allow_insecure_http = true;
-    config.auth = cloud::auth::bearer("azure-token");
+    config.auth = cldmux::auth::bearer("azure-token");
     config.azure.batch_endpoint = server.url();
     config.azure.storage_account = "storageaccount";
     config.azure.storage_sas = "sv=test&sig=secret";
@@ -2173,8 +2183,8 @@ cloud::config azure_mount_config(const fake_server& server) {
     return config;
 }
 
-cloud::job_spec azure_mount_spec() {
-    cloud::job_spec spec;
+cldmux::job_spec azure_mount_spec() {
+    cldmux::job_spec spec;
     spec.name = "azure-mounted";
     spec.image = "image";
     spec.command = {"run", "--fast"};
@@ -2187,12 +2197,12 @@ cloud::job_spec azure_mount_spec() {
 
 void azure_mount_tests() {
     fake_server server;
-    cloud::client client(azure_mount_config(server));
+    auto client = bind(azure_mount_config(server));
     const auto spec = azure_mount_spec();
 
     auto prefix = spec;
     prefix.mounts.front().source = "cloud://input-container/prefix/";
-    tst::throws<cloud::error>([&] { (void)client.run(prefix); },
+    tst::throws<cldmux::error>([&] { (void)client.run(prefix); },
                               "Azure Blob mounts reject prefix-only sources");
     tst::check(server.azure_jobs == 0, "Azure prefix rejection precedes HTTP");
 
@@ -2205,7 +2215,7 @@ void azure_mount_tests() {
 void aws_lifecycle_tests() {
     fake_server server;
 
-    cloud::config aws_config;
+    cldmux::config aws_config;
     aws_config.provider = "aws";
     aws_config.region = "eu-west-1";
     aws_config.allow_insecure_http = true;
@@ -2213,7 +2223,7 @@ void aws_lifecycle_tests() {
     aws_config.aws.secret_access_key = "secret";
     aws_config.aws.batch_endpoint = server.url();
     aws_config.aws.logs_endpoint = server.url();
-    cloud::aws_gpu_target gpu_target;
+    cldmux::aws_gpu_target gpu_target;
     gpu_target.job_queue = "gpu-queue";
     gpu_target.machine_type = "g6.xlarge";
     gpu_target.cpus = 4;
@@ -2223,8 +2233,8 @@ void aws_lifecycle_tests() {
     aws_config.poll_interval = std::chrono::milliseconds(1);
     aws_config.final_log_delay = std::chrono::milliseconds(1);
     aws_config.final_log_timeout = std::chrono::milliseconds(20);
-    cloud::client aws(std::move(aws_config));
-    cloud::job_spec aws_spec;
+    auto aws = bind(std::move(aws_config));
+    cldmux::job_spec aws_spec;
     aws_spec.name = "aws-gpu";
     aws_spec.image = "image";
     aws_spec.command = {"run"};
@@ -2239,7 +2249,7 @@ void aws_lifecycle_tests() {
                "AWS GPU queue planning");
     auto aws_overcommit = aws_spec;
     aws_overcommit.resources.gpu_count = 2;
-    tst::throws<cloud::error>([&] { (void)aws.plan(aws_overcommit); }, "AWS GPU target capacity");
+    tst::throws<cldmux::error>([&] { (void)aws.plan(aws_overcommit); }, "AWS GPU target capacity");
     const auto aws_job = aws.run(aws_spec);
     const auto aws_result = aws_job.wait();
     tst::check(aws_result.success() && aws_job.logs().size() == 1 &&
@@ -2266,7 +2276,7 @@ void aws_lifecycle_tests() {
     const auto paged_job = aws.run(aws_spec);
     const int capped_log_reads = server.aws_log_reads;
     server.aws_endless_logs = true;
-    tst::throws<cloud::error>([&] { (void)paged_job.logs(); }, "AWS CloudWatch pagination cap");
+    tst::throws<cldmux::error>([&] { (void)paged_job.logs(); }, "AWS CloudWatch pagination cap");
     server.aws_endless_logs = false;
     tst::check(server.aws_log_reads == capped_log_reads + 100 && paged_job.logs().size() == 1 &&
                    paged_job.wait().success(),
@@ -2277,34 +2287,34 @@ void aws_lifecycle_tests() {
         server.aws_cancel_accepted = false;
         server.aws_cancel_mode = mode;
         retry_job.cancel();
-        tst::check(retry_job.status() == cloud::job_state::cancelled &&
+        tst::check(retry_job.status() == cldmux::job_state::cancelled &&
                        server.aws_cancel_requests == 2 && server.aws_cancel_accepted,
                    label);
         server.aws_cancel_mode = 0;
     };
     cancellation_retry(1, "AWS CancelJob retries an ambiguous transport failure");
     cancellation_retry(2, "AWS TerminateJob retries an ambiguous transport failure");
-    tst::check(aws.supports("aws", cloud::feature::containers) &&
-                   aws.supports("aws", cloud::feature::accelerators) &&
-                   aws.supports("aws", cloud::feature::object_storage) &&
-                   aws.supports("aws", cloud::feature::storage_mounts),
+    tst::check(aws.supports(cldmux::feature::containers) &&
+                   aws.supports(cldmux::feature::accelerators) &&
+                   aws.supports(cldmux::feature::object_storage) &&
+                   aws.supports(cldmux::feature::storage_mounts),
                "AWS capabilities");
 }
 
 void azure_lifecycle_tests() {
     fake_server server;
 
-    cloud::config azure_config;
+    cldmux::config azure_config;
     azure_config.provider = "azure";
     azure_config.region = "europe";
-    azure_config.auth = cloud::auth::bearer("azure-token");
+    azure_config.auth = cldmux::auth::bearer("azure-token");
     azure_config.allow_insecure_http = true;
     azure_config.azure.batch_endpoint = server.url();
     azure_config.poll_interval = std::chrono::milliseconds(1);
     azure_config.final_log_delay = std::chrono::milliseconds(1);
     azure_config.final_log_timeout = std::chrono::milliseconds(20);
-    cloud::client azure(std::move(azure_config));
-    cloud::job_spec azure_spec;
+    auto azure = bind(std::move(azure_config));
+    cldmux::job_spec azure_spec;
     azure_spec.name = "azure-gpu";
     azure_spec.image = "image";
     azure_spec.command = {"run", "--fast"};
@@ -2334,21 +2344,21 @@ void azure_lifecycle_tests() {
 void pricing_tests() {
     fake_server server;
 
-    cloud::job_spec price_spec;
+    cldmux::job_spec price_spec;
     price_spec.image = "image";
     price_spec.command = {"run"};
     price_spec.resources.cpus = 4;
     price_spec.resources.memory_gb = 16;
 
-    cloud::config gcp_prices;
+    cldmux::config gcp_prices;
     gcp_prices.provider = "gcp";
     gcp_prices.project = "test";
     gcp_prices.region = "europe";
-    gcp_prices.auth = cloud::auth::bearer("gcp-token");
+    gcp_prices.auth = cldmux::auth::bearer("gcp-token");
     gcp_prices.allow_insecure_http = true;
     gcp_prices.billing_endpoint = server.url();
-    gcp_prices.prices = cloud::price_source::public_catalogue;
-    cloud::client gcp_priced(std::move(gcp_prices));
+    gcp_prices.prices = cldmux::price_source::public_catalogue;
+    auto gcp_priced = bind(std::move(gcp_prices));
     tst::check(std::fabs(*gcp_priced.plan(price_spec).estimated_hourly_cost - 0.072) < 1e-12,
                "GCP built-in component price");
     auto fractional_timeout = price_spec;
@@ -2356,7 +2366,7 @@ void pricing_tests() {
     const auto fractional_diagnostics =
         gcp_priced.diagnose(fractional_timeout, std::chrono::seconds(1));
     tst::check(fractional_diagnostics.provider_attempt_timeout == std::chrono::seconds(2) &&
-                   cloud::detail::batch_body(fractional_timeout,
+                   cldmux::detail::batch_body(fractional_timeout,
                                              fractional_diagnostics.selected_plan)
                            .find("\"maxRunDuration\":\"2s\"") != std::string::npos,
                "diagnostic and GCP payload share ceil-second timeout rounding");
@@ -2382,22 +2392,22 @@ void pricing_tests() {
     tst::check(!gcp_priced.plan(gcp_bundled_disk_price).estimated_hourly_cost,
                "GCP bundled Local SSD shape has no incomplete catalogue quote");
     gcp_bundled_disk_price.resources.max_price_per_hour = 100;
-    tst::throws<cloud::error>([&] { (void)gcp_priced.plan(gcp_bundled_disk_price); },
+    tst::throws<cldmux::error>([&] { (void)gcp_priced.plan(gcp_bundled_disk_price); },
                               "GCP bundled Local SSD price ceiling fails closed");
     tst::check(server.gcp_price_reads == 4,
                "GCP bundled Local SSD shape skips component catalogue lookup");
 
-    cloud::config rich_lookup;
+    cldmux::config rich_lookup;
     rich_lookup.provider = "gcp";
     rich_lookup.project = "test";
     rich_lookup.regions["gcp"] = "europe-west4";
     rich_lookup.zones["gcp"] = "europe-west4-a";
-    std::optional<cloud::price_request> observed_price_request;
-    rich_lookup.lookup_hourly_cost = [&](const cloud::price_request& request) {
+    std::optional<cldmux::price_request> observed_price_request;
+    rich_lookup.lookup_hourly_cost = [&](const cldmux::price_request& request) {
         observed_price_request = request;
         return std::optional<double>(0.5);
     };
-    cloud::client rich_priced(std::move(rich_lookup));
+    auto rich_priced = bind(std::move(rich_lookup));
     auto two_t4 = price_spec;
     two_t4.resources.gpu = "t4";
     two_t4.resources.gpu_count = 2;
@@ -2412,30 +2422,30 @@ void pricing_tests() {
                    observed_price_request->cpus == 4 && observed_price_request->memory_gb == 16,
                "rich price lookup receives native location and attached accelerators");
 
-    cloud::config legacy_lookup;
+    cldmux::config legacy_lookup;
     legacy_lookup.provider = "gcp";
     legacy_lookup.project = "test";
     legacy_lookup.estimate_hourly_cost = [](auto, auto, auto, bool) {
         return std::optional<double>(0.01);
     };
-    cloud::client legacy_priced(std::move(legacy_lookup));
-    tst::throws<cloud::error>([&] { (void)legacy_priced.plan(two_t4); },
+    auto legacy_priced = bind(std::move(legacy_lookup));
+    tst::throws<cldmux::error>([&] { (void)legacy_priced.plan(two_t4); },
                               "legacy price estimator fails closed for accelerator plans");
 
-    cloud::config overflowing_price;
+    cldmux::config overflowing_price;
     overflowing_price.provider = "gcp";
     overflowing_price.project = "test";
-    overflowing_price.lookup_hourly_cost = [](const cloud::price_request&) {
+    overflowing_price.lookup_hourly_cost = [](const cldmux::price_request&) {
         return std::optional<double>((std::numeric_limits<double>::max)());
     };
-    cloud::client overflowing_priced(std::move(overflowing_price));
+    auto overflowing_priced = bind(std::move(overflowing_price));
     auto overflowing_spec = price_spec;
     overflowing_spec.timeout = std::chrono::hours(2);
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { (void)overflowing_priced.diagnose(overflowing_spec, std::chrono::hours(2)); },
         "overflowing diagnostic cost fails closed");
 
-    cloud::config aws_prices;
+    cldmux::config aws_prices;
     aws_prices.provider = "aws";
     aws_prices.region = "eu-west-1";
     aws_prices.allow_insecure_http = true;
@@ -2444,8 +2454,8 @@ void pricing_tests() {
     aws_prices.aws.job_queue = "cpu-queue";
     aws_prices.aws.machine_type = "m6i.xlarge";
     aws_prices.aws.pricing_endpoint = server.url();
-    aws_prices.prices = cloud::price_source::public_catalogue;
-    cloud::client aws_priced(std::move(aws_prices));
+    aws_prices.prices = cldmux::price_source::public_catalogue;
+    auto aws_priced = bind(std::move(aws_prices));
     price_spec.timeout = std::chrono::seconds(60);
     tst::check(aws_priced.plan(price_spec).estimated_hourly_cost == 0.42,
                "AWS built-in on-demand price");
@@ -2463,7 +2473,7 @@ void pricing_tests() {
     tst::check(server.aws_registers == 0 && server.aws_submits == 0,
                "AWS diagnostics perform no mutations");
 
-    cloud::config aws_spot_prices;
+    cldmux::config aws_spot_prices;
     aws_spot_prices.provider = "aws";
     aws_spot_prices.region = "eu-west-1";
     aws_spot_prices.zone = "eu-west-1a";
@@ -2473,22 +2483,22 @@ void pricing_tests() {
     aws_spot_prices.aws.spot_job_queue = "spot-queue";
     aws_spot_prices.aws.spot_machine_type = "m6i.xlarge";
     aws_spot_prices.aws.ec2_endpoint = server.url();
-    aws_spot_prices.prices = cloud::price_source::public_catalogue;
-    cloud::client aws_spot_priced(std::move(aws_spot_prices));
+    aws_spot_prices.prices = cldmux::price_source::public_catalogue;
+    auto aws_spot_priced = bind(std::move(aws_spot_prices));
     price_spec.resources.spot = true;
     tst::check(aws_spot_priced.plan(price_spec).estimated_hourly_cost == 0.125,
                "AWS built-in Spot price");
     price_spec.resources.spot = false;
 
-    cloud::config azure_prices;
+    cldmux::config azure_prices;
     azure_prices.provider = "azure";
     azure_prices.region = "europe";
     azure_prices.allow_insecure_http = true;
-    azure_prices.auth = cloud::auth::bearer("azure-token");
+    azure_prices.auth = cldmux::auth::bearer("azure-token");
     azure_prices.azure.batch_endpoint = server.url();
     azure_prices.azure.pricing_endpoint = server.url();
-    azure_prices.prices = cloud::price_source::public_catalogue;
-    cloud::client azure_priced(std::move(azure_prices));
+    azure_prices.prices = cldmux::price_source::public_catalogue;
+    auto azure_priced = bind(std::move(azure_prices));
     tst::check(azure_priced.plan(price_spec).estimated_hourly_cost == 0.20,
                "Azure built-in retail price");
     const auto azure_diagnostics =
@@ -2509,190 +2519,197 @@ void pricing_tests() {
     price_spec.resources.spot = false;
 
     server.azure_cross_origin_price = true;
-    cloud::config unsafe_azure_prices;
+    cldmux::config unsafe_azure_prices;
     unsafe_azure_prices.provider = "azure";
     unsafe_azure_prices.region = "europe";
     unsafe_azure_prices.allow_insecure_http = true;
     unsafe_azure_prices.azure.batch_endpoint = server.url();
     unsafe_azure_prices.azure.pricing_endpoint = server.url();
-    unsafe_azure_prices.prices = cloud::price_source::public_catalogue;
-    cloud::client unsafe_azure_priced(std::move(unsafe_azure_prices));
-    tst::throws<cloud::error>([&] { (void)unsafe_azure_priced.plan(price_spec); },
+    unsafe_azure_prices.prices = cldmux::price_source::public_catalogue;
+    auto unsafe_azure_priced = bind(std::move(unsafe_azure_prices));
+    tst::throws<cldmux::error>([&] { (void)unsafe_azure_priced.plan(price_spec); },
                               "Azure retail pagination rejects a cross-origin URL");
     server.azure_cross_origin_price = false;
 
-    cloud::config cheapest_config;
+    cldmux::config cheapest_config;
     cheapest_config.providers = {"gcp", "aws", "azure"};
-    cheapest_config.selection = cloud::selection::lowest_cost;
+    cheapest_config.selection = cldmux::selection::lowest_cost;
     cheapest_config.aws.job_queue = "cpu-queue";
     cheapest_config.aws.machine_type = "m6i.xlarge";
     cheapest_config.azure.batch_endpoint = "https://example.invalid";
-    cheapest_config.estimate_hourly_cost = [](auto provider, auto, auto, bool) {
+    std::size_t price_lookups = 0;
+    cheapest_config.estimate_hourly_cost = [&price_lookups](auto provider, auto, auto, bool) {
+        ++price_lookups;
         return std::optional<double>(provider == "azure" ? 0.1 : provider == "aws" ? 0.2 : 0.3);
     };
-    cloud::client cheapest(std::move(cheapest_config));
+    cldmux::router cheapest(std::move(cheapest_config));
+    const auto prebound = cheapest.route("azure");
+    tst::throws<cldmux::error>(
+        [&] { (void)prebound.diagnose(price_spec, std::chrono::milliseconds::zero()); },
+        "bound diagnostics reject invalid runtime before pricing");
+    tst::throws<cldmux::error>(
+        [&] { (void)cheapest.diagnose(price_spec, std::chrono::seconds(61)); },
+        "routed diagnostics reject invalid runtime before pricing");
+    tst::check(price_lookups == 0, "invalid diagnostics perform no price lookup");
     const auto cheapest_diagnostics =
         cheapest.diagnose(price_spec, std::chrono::seconds(30));
     tst::check(cheapest_diagnostics.selected_plan.provider == "azure" &&
                    cheapest_diagnostics.estimated_cost_for_expected_attempt_runtime &&
                    std::fabs(*cheapest_diagnostics.estimated_cost_for_expected_attempt_runtime -
-                             (0.1 / 120.0)) < 1e-12,
-               "lowest-cost provider selection and diagnostic cost");
-    tst::throws<cloud::error>([&] { (void)cheapest.selected_provider(); },
-                              "unrouted multi-provider client has no selected provider");
-    tst::throws<cloud::error>([&] { (void)cheapest.storage().list("cloud://bucket"); },
-                              "unrouted multi-provider storage fails closed");
-    tst::throws<cloud::error>([&] { (void)cheapest.compute().instances(); },
-                              "unrouted multi-provider compute fails closed");
+                             (0.1 / 120.0)) < 1e-12 &&
+                   price_lookups == 3,
+               "diagnostics plan each provider exactly once");
     const auto azure_route = cheapest.route(price_spec);
-    tst::check(azure_route.selected_provider() == "azure" &&
-                   azure_route.plan(price_spec).provider == "azure",
-               "route(job) fixes the planned provider");
+    tst::check(azure_route.selected_provider() == "azure" && price_lookups == 6,
+               "route(job) plans once and fixes the selected provider");
+    tst::check(azure_route.plan(price_spec).provider == "azure" && price_lookups == 7,
+               "bound planning cannot switch providers");
     const auto aws_override = cheapest.route("aws");
-    tst::check(aws_override.selected_provider() == "aws" &&
-                   aws_override.plan(price_spec).provider == "aws",
-               "route(provider) overrides cheapest routing locally");
-    tst::throws<cloud::error>([&] { (void)cheapest.route("unknown"); },
+    tst::check(aws_override.selected_provider() == "aws" && price_lookups == 7,
+               "route(provider) overrides routing without implicit planning");
+    tst::check(aws_override.plan(price_spec).provider == "aws" && price_lookups == 8,
+               "explicitly bound planning prices only its provider");
+    tst::throws<cldmux::error>([&] { (void)cheapest.route("unknown"); },
                               "explicit route rejects an unknown provider");
 }
 
 void environment_factory_tests() {
     environment_guard environment{
-        "CLOUD_REGION",
-        "CLOUD_ZONE",
-        "CLOUD_GCP_PROJECT",
-        "CLOUD_GCP_REGION",
-        "CLOUD_GCP_ZONE",
-        "CLOUD_COMPUTE_TEMPLATE",
-        "CLOUD_GCP_INSTANCE_TEMPLATE",
-        "CLOUD_AWS_JOB_QUEUE",
-        "CLOUD_AWS_SPOT_JOB_QUEUE",
-        "CLOUD_AWS_FARGATE_JOB_QUEUE",
-        "CLOUD_AWS_FARGATE_SPOT_JOB_QUEUE",
-        "CLOUD_AWS_EXECUTION_ROLE_ARN",
-        "CLOUD_AWS_JOB_ROLE_ARN",
-        "CLOUD_AWS_S3_FILES_BUCKET",
-        "CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN",
-        "CLOUD_AWS_S3_FILES_ACCESS_POINT_ARN",
-        "CLOUD_AWS_S3_FILES_INPUT_BUCKET",
-        "CLOUD_AWS_S3_FILES_INPUT_FILE_SYSTEM_ARN",
-        "CLOUD_AWS_S3_FILES_INPUT_ACCESS_POINT_ARN",
-        "CLOUD_AWS_S3_FILES_OUTPUT_BUCKET",
-        "CLOUD_AWS_S3_FILES_OUTPUT_FILE_SYSTEM_ARN",
-        "CLOUD_AWS_S3_FILES_OUTPUT_ACCESS_POINT_ARN",
-        "CLOUD_AWS_LAUNCH_TEMPLATE_ID",
-        "CLOUD_AWS_LAUNCH_TEMPLATE_NAME",
-        "CLOUD_AWS_LAUNCH_TEMPLATE_VERSION",
-        "CLOUD_AWS_MACHINE_TYPE",
-        "CLOUD_AWS_SPOT_MACHINE_TYPE",
-        "CLOUD_AWS_LOG_GROUP",
-        "CLOUD_AWS_REGION",
-        "CLOUD_AWS_ZONE",
-        "CLOUD_AWS_GPU_MODEL",
-        "CLOUD_AWS_GPU_JOB_QUEUE",
-        "CLOUD_AWS_GPU_SPOT_JOB_QUEUE",
-        "CLOUD_AWS_GPU_MACHINE_TYPE",
-        "CLOUD_AWS_GPU_CPUS",
-        "CLOUD_AWS_GPU_MEMORY_GB",
-        "CLOUD_AWS_GPU_COUNT",
+        "CLDMUX_REGION",
+        "CLDMUX_ZONE",
+        "CLDMUX_GCP_PROJECT",
+        "CLDMUX_GCP_REGION",
+        "CLDMUX_GCP_ZONE",
+        "CLDMUX_COMPUTE_TEMPLATE",
+        "CLDMUX_GCP_INSTANCE_TEMPLATE",
+        "CLDMUX_AWS_JOB_QUEUE",
+        "CLDMUX_AWS_SPOT_JOB_QUEUE",
+        "CLDMUX_AWS_FARGATE_JOB_QUEUE",
+        "CLDMUX_AWS_FARGATE_SPOT_JOB_QUEUE",
+        "CLDMUX_AWS_EXECUTION_ROLE_ARN",
+        "CLDMUX_AWS_JOB_ROLE_ARN",
+        "CLDMUX_AWS_S3_FILES_BUCKET",
+        "CLDMUX_AWS_S3_FILES_FILE_SYSTEM_ARN",
+        "CLDMUX_AWS_S3_FILES_ACCESS_POINT_ARN",
+        "CLDMUX_AWS_S3_FILES_INPUT_BUCKET",
+        "CLDMUX_AWS_S3_FILES_INPUT_FILE_SYSTEM_ARN",
+        "CLDMUX_AWS_S3_FILES_INPUT_ACCESS_POINT_ARN",
+        "CLDMUX_AWS_S3_FILES_OUTPUT_BUCKET",
+        "CLDMUX_AWS_S3_FILES_OUTPUT_FILE_SYSTEM_ARN",
+        "CLDMUX_AWS_S3_FILES_OUTPUT_ACCESS_POINT_ARN",
+        "CLDMUX_AWS_LAUNCH_TEMPLATE_ID",
+        "CLDMUX_AWS_LAUNCH_TEMPLATE_NAME",
+        "CLDMUX_AWS_LAUNCH_TEMPLATE_VERSION",
+        "CLDMUX_AWS_MACHINE_TYPE",
+        "CLDMUX_AWS_SPOT_MACHINE_TYPE",
+        "CLDMUX_AWS_LOG_GROUP",
+        "CLDMUX_AWS_REGION",
+        "CLDMUX_AWS_ZONE",
+        "CLDMUX_AWS_GPU_MODEL",
+        "CLDMUX_AWS_GPU_JOB_QUEUE",
+        "CLDMUX_AWS_GPU_SPOT_JOB_QUEUE",
+        "CLDMUX_AWS_GPU_MACHINE_TYPE",
+        "CLDMUX_AWS_GPU_CPUS",
+        "CLDMUX_AWS_GPU_MEMORY_GB",
+        "CLDMUX_AWS_GPU_COUNT",
         "AWS_ACCESS_KEY_ID",
         "AWS_SECRET_ACCESS_KEY",
         "AWS_SESSION_TOKEN",
-        "CLOUD_AZURE_BATCH_ENDPOINT",
-        "CLOUD_AZURE_REGION",
-        "CLOUD_AZURE_BATCH_TOKEN",
-        "CLOUD_AZURE_STORAGE_ACCOUNT",
-        "CLOUD_AZURE_STORAGE_TOKEN",
-        "CLOUD_AZURE_STORAGE_SAS",
-        "CLOUD_AZURE_SUBSCRIPTION_ID",
-        "CLOUD_AZURE_RESOURCE_GROUP",
-        "CLOUD_AZURE_MANAGEMENT_TOKEN",
-        "CLOUD_AZURE_VM_IMAGE_ID",
-        "CLOUD_AZURE_VM_SUBNET_ID",
-        "CLOUD_AZURE_VM_SIZE",
-        "CLOUD_AZURE_VM_LOCATION",
-        "CLOUD_AZURE_VM_OS_DISK_TYPE",
+        "CLDMUX_AZURE_BATCH_ENDPOINT",
+        "CLDMUX_AZURE_REGION",
+        "CLDMUX_AZURE_BATCH_TOKEN",
+        "CLDMUX_AZURE_STORAGE_ACCOUNT",
+        "CLDMUX_AZURE_STORAGE_TOKEN",
+        "CLDMUX_AZURE_STORAGE_SAS",
+        "CLDMUX_AZURE_SUBSCRIPTION_ID",
+        "CLDMUX_AZURE_RESOURCE_GROUP",
+        "CLDMUX_AZURE_MANAGEMENT_TOKEN",
+        "CLDMUX_AZURE_VM_IMAGE_ID",
+        "CLDMUX_AZURE_VM_SUBNET_ID",
+        "CLDMUX_AZURE_VM_SIZE",
+        "CLDMUX_AZURE_VM_LOCATION",
+        "CLDMUX_AZURE_VM_OS_DISK_TYPE",
     };
 
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("unknown"); },
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("unknown"); },
                               "environment factory rejects an unknown provider");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [] {
-            (void)cloud::client::from_environment("cheapest", cloud::price_source::none);
+            (void)cldmux::router::from_environment("cheapest", cldmux::price_source::none);
         },
         "cheapest environment factory rejects disabled pricing");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("gcp"); },
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("gcp"); },
                               "environment factory requires a GCP project");
-    const auto storage_only_aws = cloud::client::from_environment("aws");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("azure"); },
+    const auto storage_only_aws = cldmux::router::from_environment("aws");
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("azure"); },
                               "environment factory requires an Azure endpoint");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("cheapest"); },
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("cheapest"); },
                               "cheapest routing rejects an empty environment");
-    environment.set("CLOUD_GCP_PROJECT", "bad/project");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("gcp"); },
+    environment.set("CLDMUX_GCP_PROJECT", "bad/project");
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("gcp"); },
                               "environment factory validates the GCP project");
-    environment.unset("CLOUD_GCP_PROJECT");
+    environment.unset("CLDMUX_GCP_PROJECT");
 
-    cloud::job_spec spec;
+    cldmux::job_spec spec;
     spec.image = "image";
     spec.command = {"run"};
     spec.resources.cpus = 4;
     spec.resources.memory_gb = 16;
-    tst::throws<cloud::error>([&] { (void)storage_only_aws.plan(spec); },
+    tst::throws<cldmux::error>([&] { (void)storage_only_aws.plan(spec); },
                               "AWS job planning still requires a Batch queue");
 
-    environment.set("CLOUD_REGION", "us");
-    environment.set("CLOUD_ZONE", "shared-zone");
-    environment.set("CLOUD_GCP_PROJECT", "test-project");
-    environment.set("CLOUD_COMPUTE_TEMPLATE", "worker");
-    environment.set("CLOUD_GCP_INSTANCE_TEMPLATE", "gcp-worker-template");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("cheapest"); },
+    environment.set("CLDMUX_REGION", "us");
+    environment.set("CLDMUX_ZONE", "shared-zone");
+    environment.set("CLDMUX_GCP_PROJECT", "test-project");
+    environment.set("CLDMUX_COMPUTE_TEMPLATE", "worker");
+    environment.set("CLDMUX_GCP_INSTANCE_TEMPLATE", "gcp-worker-template");
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("cheapest"); },
                               "cheapest routing requires at least two providers");
-    environment.set("CLOUD_GCP_REGION", "europe-west4");
-    environment.set("CLOUD_GCP_ZONE", "europe-west4-a");
+    environment.set("CLDMUX_GCP_REGION", "europe-west4");
+    environment.set("CLDMUX_GCP_ZONE", "europe-west4-a");
 
-    const cloud::config gcp_config = cloud::detail::config_from_environment("gcp");
+    const cldmux::config gcp_config = cldmux::detail::config_from_environment("gcp");
     tst::check(gcp_config.provider && *gcp_config.provider == "gcp" &&
                    gcp_config.project == "test-project" && gcp_config.region == "us" &&
                    gcp_config.zone == "shared-zone" &&
-                   cloud::detail::configured_region(gcp_config, "gcp") == "europe-west4" &&
-                   cloud::detail::configured_zone(gcp_config, "gcp") == "europe-west4-a" &&
+                   cldmux::detail::configured_region(gcp_config, "gcp") == "europe-west4" &&
+                   cldmux::detail::configured_zone(gcp_config, "gcp") == "europe-west4-a" &&
                    gcp_config.instance_templates.at("worker").gcp_instance_template ==
                        "gcp-worker-template",
                "GCP environment mapping");
-    const auto gcp_plan = cloud::client::from_environment("gcp").plan(spec);
+    const auto gcp_plan = cldmux::router::from_environment("gcp").plan(spec);
     tst::check(gcp_plan.provider == "gcp" && gcp_plan.region == "europe-west4" &&
                    gcp_plan.machine_type == "e2-standard-4" && !gcp_plan.estimated_hourly_cost,
-               "GCP environment client plans locally");
+               "GCP environment router plans locally");
 
-    environment.set("CLOUD_AWS_JOB_QUEUE", "cpu-queue");
-    environment.set("CLOUD_AWS_SPOT_JOB_QUEUE", "cpu-spot-queue");
-    environment.set("CLOUD_AWS_MACHINE_TYPE", "m6i.xlarge");
-    environment.set("CLOUD_AWS_SPOT_MACHINE_TYPE", "m6i.xlarge");
-    environment.set("CLOUD_AWS_LOG_GROUP", "/aws/batch/cloud-test");
-    environment.set("CLOUD_AWS_REGION", "eu-west-1");
-    environment.set("CLOUD_AWS_ZONE", "eu-west-1a");
-    environment.set("CLOUD_AWS_FARGATE_JOB_QUEUE", "fargate-queue");
-    environment.set("CLOUD_AWS_EXECUTION_ROLE_ARN", "arn:aws:iam::123:role/execution");
-    environment.set("CLOUD_AWS_JOB_ROLE_ARN", "arn:aws:iam::123:role/job");
-    environment.set("CLOUD_AWS_S3_FILES_BUCKET", "inputs");
-    environment.set("CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN",
+    environment.set("CLDMUX_AWS_JOB_QUEUE", "cpu-queue");
+    environment.set("CLDMUX_AWS_SPOT_JOB_QUEUE", "cpu-spot-queue");
+    environment.set("CLDMUX_AWS_MACHINE_TYPE", "m6i.xlarge");
+    environment.set("CLDMUX_AWS_SPOT_MACHINE_TYPE", "m6i.xlarge");
+    environment.set("CLDMUX_AWS_LOG_GROUP", "/aws/batch/cldmux-test");
+    environment.set("CLDMUX_AWS_REGION", "eu-west-1");
+    environment.set("CLDMUX_AWS_ZONE", "eu-west-1a");
+    environment.set("CLDMUX_AWS_FARGATE_JOB_QUEUE", "fargate-queue");
+    environment.set("CLDMUX_AWS_EXECUTION_ROLE_ARN", "arn:aws:iam::123:role/execution");
+    environment.set("CLDMUX_AWS_JOB_ROLE_ARN", "arn:aws:iam::123:role/job");
+    environment.set("CLDMUX_AWS_S3_FILES_BUCKET", "inputs");
+    environment.set("CLDMUX_AWS_S3_FILES_FILE_SYSTEM_ARN",
                     "arn:aws:s3files:eu-west-1:123:file-system/fs-1");
-    environment.set("CLOUD_AWS_S3_FILES_INPUT_BUCKET", "dispatch-input");
-    environment.set("CLOUD_AWS_S3_FILES_INPUT_FILE_SYSTEM_ARN",
+    environment.set("CLDMUX_AWS_S3_FILES_INPUT_BUCKET", "dispatch-input");
+    environment.set("CLDMUX_AWS_S3_FILES_INPUT_FILE_SYSTEM_ARN",
                     "arn:aws:s3files:eu-west-1:123:file-system/fs-input");
-    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "dispatch-output");
-    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_FILE_SYSTEM_ARN",
+    environment.set("CLDMUX_AWS_S3_FILES_OUTPUT_BUCKET", "dispatch-output");
+    environment.set("CLDMUX_AWS_S3_FILES_OUTPUT_FILE_SYSTEM_ARN",
                     "arn:aws:s3files:eu-west-1:123:file-system/fs-output");
-    environment.set("CLOUD_AWS_LAUNCH_TEMPLATE_ID", "lt-123");
+    environment.set("CLDMUX_AWS_LAUNCH_TEMPLATE_ID", "lt-123");
 
-    const cloud::config aws_config = cloud::detail::config_from_environment("aws");
+    const cldmux::config aws_config = cldmux::detail::config_from_environment("aws");
     tst::check(aws_config.provider && *aws_config.provider == "aws" &&
                    aws_config.aws.job_queue == "cpu-queue" &&
                    aws_config.aws.spot_job_queue == "cpu-spot-queue" &&
                    aws_config.aws.machine_type == "m6i.xlarge" &&
                    aws_config.aws.spot_machine_type == "m6i.xlarge" &&
-                   aws_config.aws.log_group == "/aws/batch/cloud-test" &&
+                   aws_config.aws.log_group == "/aws/batch/cldmux-test" &&
                    aws_config.aws.fargate_job_queue == "fargate-queue" &&
                    aws_config.aws.s3_files.at("inputs").file_system_arn.find("fs-1") !=
                        std::string::npos &&
@@ -2703,46 +2720,46 @@ void environment_factory_tests() {
                        "fs-output") !=
                        std::string::npos &&
                    aws_config.instance_templates.at("worker").aws.id == "lt-123" &&
-                   cloud::detail::configured_region(aws_config, "aws") == "eu-west-1" &&
-                   cloud::detail::configured_zone(aws_config, "aws") == "eu-west-1a",
+                   cldmux::detail::configured_region(aws_config, "aws") == "eu-west-1" &&
+                   cldmux::detail::configured_zone(aws_config, "aws") == "eu-west-1a",
                "AWS environment mapping");
-    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "inputs");
-    tst::throws<cloud::error>([] { (void)cloud::detail::config_from_environment("aws"); },
+    environment.set("CLDMUX_AWS_S3_FILES_OUTPUT_BUCKET", "inputs");
+    tst::throws<cldmux::error>([] { (void)cldmux::detail::config_from_environment("aws"); },
                               "AWS environment rejects conflicting named mount mappings");
-    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "dispatch-output");
-    const auto aws_plan = cloud::client::from_environment("aws").plan(spec);
+    environment.set("CLDMUX_AWS_S3_FILES_OUTPUT_BUCKET", "dispatch-output");
+    const auto aws_plan = cldmux::router::from_environment("aws").plan(spec);
     tst::check(aws_plan.provider == "aws" && aws_plan.region == "eu-west-1" &&
                    aws_plan.machine_type == "m6i.xlarge" && !aws_plan.estimated_hourly_cost,
-               "AWS environment client plans locally");
+               "AWS environment router plans locally");
 
-    environment.unset("CLOUD_AWS_JOB_QUEUE");
-    environment.unset("CLOUD_AWS_MACHINE_TYPE");
+    environment.unset("CLDMUX_AWS_JOB_QUEUE");
+    environment.unset("CLDMUX_AWS_MACHINE_TYPE");
     auto spot_spec = spec;
     spot_spec.resources.spot = true;
-    const auto spot_plan = cloud::client::from_environment("aws").plan(spot_spec);
+    const auto spot_plan = cldmux::router::from_environment("aws").plan(spot_spec);
     tst::check(spot_plan.machine_type == "m6i.xlarge" && spot_plan.region == "eu-west-1",
                "AWS environment permits a Spot-only route");
-    environment.set("CLOUD_AWS_JOB_QUEUE", "cpu-queue");
-    environment.set("CLOUD_AWS_MACHINE_TYPE", "m6i.xlarge");
+    environment.set("CLDMUX_AWS_JOB_QUEUE", "cpu-queue");
+    environment.set("CLDMUX_AWS_MACHINE_TYPE", "m6i.xlarge");
 
-    environment.set("CLOUD_AZURE_REGION", "westeurope");
-    environment.set("CLOUD_AZURE_BATCH_ENDPOINT", "https://evil.example");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("azure"); },
+    environment.set("CLDMUX_AZURE_REGION", "westeurope");
+    environment.set("CLDMUX_AZURE_BATCH_ENDPOINT", "https://evil.example");
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("azure"); },
                               "Azure environment rejects an arbitrary token destination");
-    environment.set("CLOUD_AZURE_BATCH_ENDPOINT", "https://test.westeurope.batch.azure.com/jobs");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("azure"); },
+    environment.set("CLDMUX_AZURE_BATCH_ENDPOINT", "https://test.westeurope.batch.azure.com/jobs");
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("azure"); },
                               "Azure environment rejects an endpoint path");
-    environment.set("CLOUD_AZURE_BATCH_ENDPOINT", "https://test.westeurope.batch.azure.com");
-    environment.set("CLOUD_AZURE_STORAGE_ACCOUNT", "teststorage");
-    environment.set("CLOUD_AZURE_STORAGE_SAS", "?sv=test&sig=secret");
-    environment.set("CLOUD_AZURE_SUBSCRIPTION_ID", "subscription");
-    environment.set("CLOUD_AZURE_RESOURCE_GROUP", "workers");
-    environment.set("CLOUD_AZURE_VM_IMAGE_ID", "/subscriptions/example/images/worker");
-    environment.set("CLOUD_AZURE_VM_SUBNET_ID", "/subscriptions/example/subnets/workers");
-    environment.set("CLOUD_AZURE_VM_SIZE", "Standard_D4s_v5");
-    environment.set("CLOUD_AZURE_VM_LOCATION", "westeurope");
+    environment.set("CLDMUX_AZURE_BATCH_ENDPOINT", "https://test.westeurope.batch.azure.com");
+    environment.set("CLDMUX_AZURE_STORAGE_ACCOUNT", "teststorage");
+    environment.set("CLDMUX_AZURE_STORAGE_SAS", "?sv=test&sig=secret");
+    environment.set("CLDMUX_AZURE_SUBSCRIPTION_ID", "subscription");
+    environment.set("CLDMUX_AZURE_RESOURCE_GROUP", "workers");
+    environment.set("CLDMUX_AZURE_VM_IMAGE_ID", "/subscriptions/example/images/worker");
+    environment.set("CLDMUX_AZURE_VM_SUBNET_ID", "/subscriptions/example/subnets/workers");
+    environment.set("CLDMUX_AZURE_VM_SIZE", "Standard_D4s_v5");
+    environment.set("CLDMUX_AZURE_VM_LOCATION", "westeurope");
 
-    const cloud::config azure_config = cloud::detail::config_from_environment("azure");
+    const cldmux::config azure_config = cldmux::detail::config_from_environment("azure");
     tst::check(azure_config.provider && *azure_config.provider == "azure" &&
                    azure_config.azure.batch_endpoint == "https://test.westeurope.batch.azure.com" &&
                    azure_config.azure.storage_account == "teststorage" &&
@@ -2750,70 +2767,70 @@ void environment_factory_tests() {
                    azure_config.instance_templates.at("worker").azure.machine_type ==
                        "Standard_D4s_v5" &&
                    azure_config.azure.auth &&
-                   cloud::detail::configured_region(azure_config, "azure") == "westeurope",
+                   cldmux::detail::configured_region(azure_config, "azure") == "westeurope",
                "Azure environment mapping");
-    const auto azure_plan = cloud::client::from_environment("azure").plan(spec);
+    const auto azure_plan = cldmux::router::from_environment("azure").plan(spec);
     tst::check(azure_plan.provider == "azure" && azure_plan.region == "westeurope" &&
                    azure_plan.machine_type == "Standard_D4s_v5" &&
                    !azure_plan.estimated_hourly_cost,
-               "Azure environment client plans locally");
+               "Azure environment router plans locally");
 
     environment.set("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
     environment.set("AWS_SECRET_ACCESS_KEY", "secret");
-    cloud::config cheapest_config = cloud::detail::config_from_environment("cheapest");
-    tst::check(cheapest_config.providers == std::vector<cloud::provider>{"gcp", "aws", "azure"} &&
-                   cheapest_config.selection == cloud::selection::lowest_cost &&
-                   cheapest_config.prices == cloud::price_source::public_catalogue,
+    cldmux::config cheapest_config = cldmux::detail::config_from_environment("cheapest");
+    tst::check(cheapest_config.providers == std::vector<cldmux::provider>{"gcp", "aws", "azure"} &&
+                   cheapest_config.selection == cldmux::selection::lowest_cost &&
+                   cheapest_config.prices == cldmux::price_source::public_catalogue,
                "cheapest environment uses stable provider order");
 
-    std::vector<cloud::provider> compared;
-    cheapest_config.lookup_hourly_cost = [&](const cloud::price_request& request) {
+    std::vector<cldmux::provider> compared;
+    cheapest_config.lookup_hourly_cost = [&](const cldmux::price_request& request) {
         compared.push_back(request.provider);
         return std::optional<double>(request.provider == "azure" ? 0.10
                                      : request.provider == "aws" ? 0.20
                                                                  : 0.30);
     };
-    const auto cheapest_plan = cloud::client(std::move(cheapest_config)).plan(spec);
-    tst::check(compared == std::vector<cloud::provider>{"gcp", "aws", "azure"} &&
+    const auto cheapest_plan = cldmux::router(std::move(cheapest_config)).plan(spec);
+    tst::check(compared == std::vector<cldmux::provider>{"gcp", "aws", "azure"} &&
                    cheapest_plan.provider == "azure" && cheapest_plan.estimated_hourly_cost == 0.10,
                "cheapest environment compares without a network request");
 
-    cloud::config tied_config = cloud::detail::config_from_environment("cheapest");
-    tied_config.lookup_hourly_cost = [](const cloud::price_request&) {
+    cldmux::config tied_config = cldmux::detail::config_from_environment("cheapest");
+    tied_config.lookup_hourly_cost = [](const cldmux::price_request&) {
         return std::optional<double>(0.25);
     };
-    tst::check(cloud::client(std::move(tied_config)).plan(spec).provider == "gcp",
+    tst::check(cldmux::router(std::move(tied_config)).plan(spec).provider == "gcp",
                "cheapest price ties follow configured order");
 
-    cloud::config missing_quote = cloud::detail::config_from_environment("cheapest");
-    missing_quote.lookup_hourly_cost = [](const cloud::price_request& request) {
+    cldmux::config missing_quote = cldmux::detail::config_from_environment("cheapest");
+    missing_quote.lookup_hourly_cost = [](const cldmux::price_request& request) {
         return request.provider == "aws" ? std::nullopt : std::optional<double>(0.25);
     };
-    tst::throws<cloud::error>([&] { (void)cloud::client(missing_quote).plan(spec); },
+    tst::throws<cldmux::error>([&] { (void)cldmux::router(missing_quote).plan(spec); },
                               "cheapest routing rejects a partial quote set");
 
-    cloud::config failed_provider = cloud::detail::config_from_environment("cheapest");
-    failed_provider.lookup_hourly_cost = [](const cloud::price_request& request) {
+    cldmux::config failed_provider = cldmux::detail::config_from_environment("cheapest");
+    failed_provider.lookup_hourly_cost = [](const cldmux::price_request& request) {
         if (request.provider == "azure")
-            throw cloud::error("price provider failed");
+            throw cldmux::error("price provider failed");
         return std::optional<double>(0.25);
     };
-    tst::throws<cloud::error>([&] { (void)cloud::client(failed_provider).plan(spec); },
+    tst::throws<cldmux::error>([&] { (void)cldmux::router(failed_provider).plan(spec); },
                               "cheapest routing rejects a failed provider");
 
-    environment.set("CLOUD_AWS_GPU_MODEL", "nvidia-l4");
-    environment.set("CLOUD_AWS_GPU_JOB_QUEUE", "l4-queue");
-    environment.set("CLOUD_AWS_GPU_SPOT_JOB_QUEUE", "l4-spot-queue");
-    environment.set("CLOUD_AWS_GPU_MACHINE_TYPE", "g6.xlarge");
-    environment.set("CLOUD_AWS_GPU_CPUS", "4");
-    environment.set("CLOUD_AWS_GPU_MEMORY_GB", "16");
-    environment.set("CLOUD_AWS_GPU_COUNT", "1");
-    environment.unset("CLOUD_AWS_JOB_QUEUE");
-    environment.unset("CLOUD_AWS_SPOT_JOB_QUEUE");
-    environment.unset("CLOUD_AWS_MACHINE_TYPE");
-    environment.unset("CLOUD_AWS_SPOT_MACHINE_TYPE");
+    environment.set("CLDMUX_AWS_GPU_MODEL", "nvidia-l4");
+    environment.set("CLDMUX_AWS_GPU_JOB_QUEUE", "l4-queue");
+    environment.set("CLDMUX_AWS_GPU_SPOT_JOB_QUEUE", "l4-spot-queue");
+    environment.set("CLDMUX_AWS_GPU_MACHINE_TYPE", "g6.xlarge");
+    environment.set("CLDMUX_AWS_GPU_CPUS", "4");
+    environment.set("CLDMUX_AWS_GPU_MEMORY_GB", "16");
+    environment.set("CLDMUX_AWS_GPU_COUNT", "1");
+    environment.unset("CLDMUX_AWS_JOB_QUEUE");
+    environment.unset("CLDMUX_AWS_SPOT_JOB_QUEUE");
+    environment.unset("CLDMUX_AWS_MACHINE_TYPE");
+    environment.unset("CLDMUX_AWS_SPOT_MACHINE_TYPE");
 
-    const cloud::config gpu_config = cloud::detail::config_from_environment("aws");
+    const cldmux::config gpu_config = cldmux::detail::config_from_environment("aws");
     const auto target = gpu_config.aws.gpu_targets.find("l4");
     tst::check(target != gpu_config.aws.gpu_targets.end() &&
                    target->second.job_queue == "l4-queue" &&
@@ -2823,52 +2840,52 @@ void environment_factory_tests() {
                "complete AWS GPU environment mapping");
     auto gpu_spec = spec;
     gpu_spec.resources.gpu = "L4";
-    const auto gpu_plan = cloud::client::from_environment("aws").plan(gpu_spec);
+    const auto gpu_plan = cldmux::router::from_environment("aws").plan(gpu_spec);
     tst::check(gpu_plan.machine_type == "g6.xlarge" && gpu_plan.accelerator == "l4",
-               "AWS GPU-only environment client planning");
+               "AWS GPU-only environment router planning");
 
-    environment.unset("CLOUD_AWS_GPU_MEMORY_GB");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
+    environment.unset("CLDMUX_AWS_GPU_MEMORY_GB");
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("aws"); },
                               "partial AWS GPU environment is rejected");
-    environment.set("CLOUD_AWS_GPU_MEMORY_GB", "16");
-    environment.set("CLOUD_AWS_GPU_CPUS", "4x");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
+    environment.set("CLDMUX_AWS_GPU_MEMORY_GB", "16");
+    environment.set("CLDMUX_AWS_GPU_CPUS", "4x");
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("aws"); },
                               "malformed AWS GPU integer is rejected");
-    environment.set("CLOUD_AWS_GPU_CPUS", "4");
-    environment.set("CLOUD_AWS_GPU_MEMORY_GB", "not-a-number");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
+    environment.set("CLDMUX_AWS_GPU_CPUS", "4");
+    environment.set("CLDMUX_AWS_GPU_MEMORY_GB", "not-a-number");
+    tst::throws<cldmux::error>([] { (void)cldmux::router::from_environment("aws"); },
                               "malformed AWS GPU decimal is rejected");
 
-    const auto scientific = cloud::detail::parse_decimal("1.25e2");
+    const auto scientific = cldmux::detail::parse_decimal("1.25e2");
     tst::check(scientific && *scientific == 125.0, "portable decimal exponent parsing");
     for (const std::string_view invalid : {"", "+1", "1e", "1x", "nan", "inf", "1e-9999"})
-        tst::check(!cloud::detail::parse_decimal(invalid),
+        tst::check(!cldmux::detail::parse_decimal(invalid),
                    "malformed decimal is rejected: " + std::string(invalid));
 }
 
 void planning_tests() {
-    static_assert(cloud::gcp::version == CLOUD_H_VERSION);
-    static_assert(CLOUD_H_VERSION_NUM == 0x000400);
-    static_assert(std::is_aggregate_v<cloud::resources>);
-    static_assert(std::is_aggregate_v<cloud::job_spec>);
-    static_assert(std::is_aggregate_v<cloud::run_diagnostics>);
-    static_assert(std::is_aggregate_v<cloud::command_record>);
-    static_assert(!std::is_aggregate_v<cloud::command_output>);
+    static_assert(cldmux::gcp::version == CLDMUX_VERSION);
+    static_assert(CLDMUX_VERSION_NUM == 0x000500);
+    static_assert(std::is_aggregate_v<cldmux::resources>);
+    static_assert(std::is_aggregate_v<cldmux::job_spec>);
+    static_assert(std::is_aggregate_v<cldmux::run_diagnostics>);
+    static_assert(std::is_aggregate_v<cldmux::command_record>);
+    static_assert(!std::is_aggregate_v<cldmux::command_output>);
 
-    cloud::config config;
+    cldmux::config config;
     config.project = "test-project";
     config.region = "europe";
-    config.auth = cloud::auth::bearer("test-token");
-    config.lookup_hourly_cost = [](const cloud::price_request& request) {
+    config.auth = cldmux::auth::bearer("test-token");
+    config.lookup_hourly_cost = [](const cldmux::price_request& request) {
         tst::check(request.machine_type == "e2-standard-4" ||
                        request.machine_type == "g2-standard-4",
                    "price machine");
         tst::check(request.spot, "price spot");
         return std::optional<double>(0.24);
     };
-    cloud::client client(std::move(config));
+    auto client = bind(std::move(config));
 
-    cloud::job_spec spec;
+    cldmux::job_spec spec;
     spec.name = "Analysis 42";
     spec.image = "python:3.13";
     spec.command = {"python", "analyse.py", "/input/input.csv"};
@@ -2891,10 +2908,10 @@ void planning_tests() {
     tst::check(plan.region == "europe-west4", "region alias");
     tst::check(plan.machine_type == "e2-standard-4", "machine mapping");
     tst::check(plan.estimated_hourly_cost == 0.24, "price estimate");
-    tst::check(client.supports(cloud::feature::spot_instances), "spot support");
-    tst::check(client.supports(cloud::feature::accelerators), "gpu support");
+    tst::check(client.supports(cldmux::feature::spot_instances), "spot support");
+    tst::check(client.supports(cldmux::feature::accelerators), "gpu support");
 
-    const cloud::run_diagnostics diagnostics =
+    const cldmux::run_diagnostics diagnostics =
         client.diagnose(spec, std::chrono::minutes(30));
     tst::check(diagnostics.selected_plan.provider == "gcp" &&
                    diagnostics.expected_attempt_runtime == std::chrono::minutes(30) &&
@@ -2918,30 +2935,30 @@ void planning_tests() {
                                }),
                "diagnostic warnings include plan and runtime qualifications");
 
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { (void)client.diagnose(spec, std::chrono::milliseconds::zero()); },
         "zero expected attempt runtime is rejected");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [&] { (void)client.diagnose(spec, std::chrono::hours(3)); },
         "expected attempt runtime beyond controller timeout is rejected");
 
-    cloud::config unpriced_config;
+    cldmux::config unpriced_config;
     unpriced_config.project = "test-project";
     unpriced_config.region = "europe";
-    unpriced_config.auth = cloud::auth::bearer("test-token");
+    unpriced_config.auth = cldmux::auth::bearer("test-token");
     unpriced_config.lookup_hourly_cost =
-        [](const cloud::price_request&) { return std::optional<double>{}; };
-    cloud::client unpriced(std::move(unpriced_config));
-    cloud::job_spec unpriced_spec = spec;
+        [](const cldmux::price_request&) { return std::optional<double>{}; };
+    auto unpriced = bind(std::move(unpriced_config));
+    cldmux::job_spec unpriced_spec = spec;
     unpriced_spec.resources.max_price_per_hour.reset();
-    const cloud::run_diagnostics unavailable =
+    const cldmux::run_diagnostics unavailable =
         unpriced.diagnose(unpriced_spec, std::chrono::minutes(30));
     tst::check(!unavailable.selected_plan.estimated_hourly_cost &&
                    !unavailable.estimated_cost_for_expected_attempt_runtime,
                "unavailable prices remain unavailable in diagnostics");
 
-    const std::string body = cloud::detail::batch_body(spec, plan);
-    const auto batch = cloud::gcp::detail::parse_json(body);
+    const std::string body = cldmux::detail::batch_body(spec, plan);
+    const auto batch = cldmux::gcp::detail::parse_json(body);
     const auto* groups = batch.get("taskGroups");
     tst::check(groups && groups->array().size() == 1, "Batch task group");
     tst::check(body.find("\"entrypoint\":\"python\"") != std::string::npos,
@@ -2954,76 +2971,76 @@ void planning_tests() {
     tst::check(body.find("\"provisioningModel\":\"SPOT\"") != std::string::npos, "spot");
     tst::check(body.find("batch-runner@test-project.iam.gserviceaccount.com") != std::string::npos,
                "service account");
-    tst::check(body.find("/mnt/disks/cloud-0:/input:ro") != std::string::npos, "read-only mount");
+    tst::check(body.find("/mnt/disks/cldmux-0:/input:ro") != std::string::npos, "read-only mount");
     tst::check(body.find("\"remotePath\":\"inputs/run-42/\"") != std::string::npos, "GCS prefix");
     tst::check(body.find("\"cloud-hpp\":\"temporary\"") != std::string::npos,
                "stable provider resource label");
 
-    const auto uri = cloud::detail::parse_uri("cloud://bucket/path/to/object");
+    const auto uri = cldmux::detail::parse_uri("cloud://bucket/path/to/object");
     tst::check(uri.bucket == "bucket" && uri.key == "path/to/object", "cloud URI");
-    tst::check(cloud::gcp::detail::crc32c("123456789") == "4waSgw==", "CRC32C");
-    tst::check(cloud::gcp::detail::field(cloud::gcp::detail::parse_json("{\"x\":\"\\u03bb\"}"),
+    tst::check(cldmux::gcp::detail::crc32c("123456789") == "4waSgw==", "CRC32C");
+    tst::check(cldmux::gcp::detail::field(cldmux::gcp::detail::parse_json("{\"x\":\"\\u03bb\"}"),
                                          "x") == "\xce\xbb",
                "JSON unicode");
-    const auto json = cloud::gcp::detail::parse_json("{\"items\":[{},{}],\"number\":-1.25e+2}");
+    const auto json = cldmux::gcp::detail::parse_json("{\"items\":[{},{}],\"number\":-1.25e+2}");
     tst::check(json.get("items") && json.get("items")->array().size() == 2 &&
-                   cloud::gcp::detail::field(json, "number") == "-1.25e+2",
+                   cldmux::gcp::detail::field(json, "number") == "-1.25e+2",
                "templated JSON collections and numbers");
-    tst::throws<cloud::error>([] { (void)cloud::gcp::detail::parse_json("[\v]"); },
+    tst::throws<cldmux::error>([] { (void)cldmux::gcp::detail::parse_json("[\v]"); },
                               "JSON whitespace is locale independent");
     for (const std::string_view invalid : {"1.", "1e", "-"})
-        tst::throws<cloud::error>([=] { (void)cloud::gcp::detail::parse_json(invalid); },
+        tst::throws<cldmux::error>([=] { (void)cldmux::gcp::detail::parse_json(invalid); },
                                   "malformed JSON number rejected");
-    cloud::gcp::detail::JsonLimits depth_limit;
+    cldmux::gcp::detail::JsonLimits depth_limit;
     depth_limit.max_depth = 2;
-    (void)cloud::gcp::detail::parse_json("[[0]]", depth_limit);
-    tst::throws<cloud::error>(
-        [&] { (void)cloud::gcp::detail::parse_json("[[[0]]]", depth_limit); },
+    (void)cldmux::gcp::detail::parse_json("[[0]]", depth_limit);
+    tst::throws<cldmux::error>(
+        [&] { (void)cldmux::gcp::detail::parse_json("[[[0]]]", depth_limit); },
         "JSON nesting limit");
-    cloud::gcp::detail::JsonLimits node_limit;
+    cldmux::gcp::detail::JsonLimits node_limit;
     node_limit.max_nodes = 3;
-    (void)cloud::gcp::detail::parse_json("[0,1]", node_limit);
-    tst::throws<cloud::error>(
-        [&] { (void)cloud::gcp::detail::parse_json("[0,1,2]", node_limit); },
+    (void)cldmux::gcp::detail::parse_json("[0,1]", node_limit);
+    tst::throws<cldmux::error>(
+        [&] { (void)cldmux::gcp::detail::parse_json("[0,1,2]", node_limit); },
         "JSON node limit");
-    cloud::gcp::detail::JsonLimits byte_limit;
+    cldmux::gcp::detail::JsonLimits byte_limit;
     byte_limit.max_bytes = 3;
-    (void)cloud::gcp::detail::parse_json("[0]", byte_limit);
+    (void)cldmux::gcp::detail::parse_json("[0]", byte_limit);
     byte_limit.max_bytes = 2;
-    tst::throws<cloud::error>([&] { (void)cloud::gcp::detail::parse_json("[0]", byte_limit); },
+    tst::throws<cldmux::error>([&] { (void)cldmux::gcp::detail::parse_json("[0]", byte_limit); },
                               "JSON byte limit");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [] {
-            (void)cloud::gcp::detail::unsigned_field(
-                cloud::gcp::detail::parse_json("{\"value\":\"42suffix\"}"), "value");
+            (void)cldmux::gcp::detail::unsigned_field(
+                cldmux::gcp::detail::parse_json("{\"value\":\"42suffix\"}"), "value");
         },
         "unsigned provider field requires complete input consumption");
-    tst::check(!cloud::gcp::detail::is_ascii_alnum(static_cast<char>(0xe5)),
+    tst::check(!cldmux::gcp::detail::is_ascii_alnum(static_cast<char>(0xe5)),
                "identifier grammar is ASCII");
-    tst::check(cloud::detail::parse_state("QUEUED") == cloud::job_state::queued &&
-                   cloud::detail::parse_state("SCHEDULED") == cloud::job_state::scheduled &&
-                   cloud::detail::parse_state("RUNNING") == cloud::job_state::running &&
-                   cloud::detail::parse_state("SUCCEEDED") == cloud::job_state::succeeded &&
-                   cloud::detail::parse_state("FAILED") == cloud::job_state::failed &&
-                   cloud::detail::parse_state("CANCELLATION_IN_PROGRESS") ==
-                       cloud::job_state::cancelling &&
-                   cloud::detail::parse_state("CANCELLED") == cloud::job_state::cancelled &&
-                   cloud::detail::parse_state("DELETION_IN_PROGRESS") ==
-                       cloud::job_state::deleting &&
-                   cloud::detail::parse_state("NOT_A_STATE") == cloud::job_state::unknown,
+    tst::check(cldmux::detail::parse_state("QUEUED") == cldmux::job_state::queued &&
+                   cldmux::detail::parse_state("SCHEDULED") == cldmux::job_state::scheduled &&
+                   cldmux::detail::parse_state("RUNNING") == cldmux::job_state::running &&
+                   cldmux::detail::parse_state("SUCCEEDED") == cldmux::job_state::succeeded &&
+                   cldmux::detail::parse_state("FAILED") == cldmux::job_state::failed &&
+                   cldmux::detail::parse_state("CANCELLATION_IN_PROGRESS") ==
+                       cldmux::job_state::cancelling &&
+                   cldmux::detail::parse_state("CANCELLED") == cldmux::job_state::cancelled &&
+                   cldmux::detail::parse_state("DELETION_IN_PROGRESS") ==
+                       cldmux::job_state::deleting &&
+                   cldmux::detail::parse_state("NOT_A_STATE") == cldmux::job_state::unknown,
                "Batch state table");
 
-    cloud::detail::job_data azure_cancel_race;
+    cldmux::detail::job_data azure_cancel_race;
     azure_cancel_race.chosen.provider = "azure";
     azure_cancel_race.cancel_requested = true;
-    tst::check(cloud::detail::update(
+    tst::check(cldmux::detail::update(
                    azure_cancel_race,
-                   cloud::gcp::detail::parse_json(
+                   cldmux::gcp::detail::parse_json(
                        "{\"state\":\"completed\",\"executionInfo\":{\"result\":\"success\"}}")) ==
-                   cloud::job_state::succeeded,
+                   cldmux::job_state::succeeded,
                "Azure completion wins a cancellation race");
 
-    const std::string id = cloud::detail::job_id("42 / VERY Long Job Name !!!");
+    const std::string id = cldmux::detail::job_id("42 / VERY Long Job Name !!!");
     tst::check(id.size() <= 63 && std::isalpha(static_cast<unsigned char>(id.front())),
                "Batch job id");
     for (const char raw : id) {
@@ -3033,7 +3050,7 @@ void planning_tests() {
 
     auto too_expensive = spec;
     too_expensive.resources.max_price_per_hour = 0.10;
-    tst::throws<cloud::error>([&] { (void)client.plan(too_expensive); }, "price ceiling");
+    tst::throws<cldmux::error>([&] { (void)client.plan(too_expensive); }, "price ceiling");
 
     auto gpu = spec;
     gpu.resources.gpu = "L4";
@@ -3041,46 +3058,46 @@ void planning_tests() {
     tst::check(gpu_plan.machine_type == "g2-standard-4" && gpu_plan.accelerator == "l4" &&
                    gpu_plan.accelerator_count == 1,
                "GCP L4 mapping");
-    tst::check(cloud::detail::batch_body(gpu, gpu_plan).find("installGpuDrivers") !=
+    tst::check(cldmux::detail::batch_body(gpu, gpu_plan).find("installGpuDrivers") !=
                    std::string::npos,
                "GCP GPU driver policy");
 
     auto invalid_price = spec;
     invalid_price.resources.max_price_per_hour = std::numeric_limits<double>::quiet_NaN();
-    tst::throws<cloud::error>([&] { (void)client.plan(invalid_price); }, "invalid price ceiling");
+    tst::throws<cldmux::error>([&] { (void)client.plan(invalid_price); }, "invalid price ceiling");
 
     auto invalid_job = spec;
     invalid_job.command.clear();
-    tst::throws<cloud::error>([&] { (void)client.plan(invalid_job); }, "plan validates command");
+    tst::throws<cldmux::error>([&] { (void)client.plan(invalid_job); }, "plan validates command");
     invalid_job = spec;
     invalid_job.retries = 11;
-    tst::throws<cloud::error>([&] { (void)client.plan(invalid_job); }, "plan validates retries");
+    tst::throws<cldmux::error>([&] { (void)client.plan(invalid_job); }, "plan validates retries");
     invalid_job = spec;
     invalid_job.mounts.front().source = "cloud://inputs/one-object";
-    tst::throws<cloud::error>([&] { (void)client.plan(invalid_job); }, "prefix-only mounts");
+    tst::throws<cldmux::error>([&] { (void)client.plan(invalid_job); }, "prefix-only mounts");
 
-    cloud::config unsupported;
+    cldmux::config unsupported;
     unsupported.provider = "aws";
     unsupported.project = "test";
-    unsupported.auth = cloud::auth::bearer("test");
-    cloud::client aws(std::move(unsupported));
-    tst::throws<cloud::error>([&] { (void)aws.plan(spec); }, "unsupported AWS");
-    tst::throws<cloud::error>([&] { (void)aws.storage().list("cloud://bucket"); },
+    unsupported.auth = cldmux::auth::bearer("test");
+    auto aws = bind(std::move(unsupported));
+    tst::throws<cldmux::error>([&] { (void)aws.plan(spec); }, "unsupported AWS");
+    tst::throws<cldmux::error>([&] { (void)aws.storage().list("cloud://bucket"); },
                               "unsupported AWS storage");
 
-    cloud::config automatic;
+    cldmux::config automatic;
     automatic.project = "test";
-    automatic.selection = cloud::selection::lowest_cost;
-    automatic.auth = cloud::auth::bearer("test");
-    cloud::client cheapest(std::move(automatic));
-    tst::throws<cloud::error>([&] { (void)cheapest.plan(spec); }, "unsupported lowest cost");
+    automatic.selection = cldmux::selection::lowest_cost;
+    automatic.auth = cldmux::auth::bearer("test");
+    cldmux::router cheapest(std::move(automatic));
+    tst::throws<cldmux::error>([&] { (void)cheapest.plan(spec); }, "unsupported lowest cost");
 
-    cloud::config unsafe;
+    cldmux::config unsafe;
     unsafe.project = "test";
     unsafe.region = "europe-west4\"}";
-    unsafe.auth = cloud::auth::bearer("test");
-    cloud::client unsafe_region(std::move(unsafe));
-    tst::throws<cloud::error>([&] { (void)unsafe_region.plan(spec); }, "region validation");
+    unsafe.auth = cldmux::auth::bearer("test");
+    auto unsafe_region = bind(std::move(unsafe));
+    tst::throws<cldmux::error>([&] { (void)unsafe_region.plan(spec); }, "region validation");
 }
 
 void command_output_tests() {
@@ -3093,7 +3110,7 @@ void command_output_tests() {
     {
         global_locale_guard locale_scope(
             std::locale(std::locale::classic(), new comma_decimal_point));
-        cloud::command_output basic;
+        cldmux::command_output basic;
         basic.add_number("hourly_rate_estimate_usd", 0.24)
             .add_duration_seconds("runtime_seconds", std::chrono::milliseconds(1'500))
             .add_boolean("spot", true)
@@ -3111,7 +3128,7 @@ void command_output_tests() {
                    "warning=second\n",
                "command output is ordered, locale-stable, and escaped");
 
-    cloud::command_output modified;
+    cldmux::command_output modified;
     modified.add("provider", "gcp")
         .add("warning", "one")
         .add("provider", "aws")
@@ -3128,37 +3145,37 @@ void command_output_tests() {
                "command records can be replaced, renamed, erased, and inspected");
 
     std::ostringstream one_record;
-    cloud::write_command_record(one_record, "UPPER_2", "a=b c\n");
+    cldmux::write_command_record(one_record, "UPPER_2", "a=b c\n");
     tst::check(one_record.str() == "UPPER_2=a=b c\\n\n",
                "one live command record uses the same syntax");
 
     std::ostringstream pending_width;
     pending_width << std::setfill('.') << std::setw(20);
-    cloud::write_command_record(pending_width, "key", "value");
+    cldmux::write_command_record(pending_width, "key", "value");
     tst::check(pending_width.str() == "key=value\n",
                "stream formatting cannot pad a command record");
 
     for (const std::string_view invalid : {"", "1bad", "bad-key", "space key"})
-        tst::throws<cloud::error>(
+        tst::throws<cldmux::error>(
             [=] {
-                cloud::command_output value;
+                cldmux::command_output value;
                 value.add(invalid, "value");
             },
             "command output rejects malformed keys");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [] {
-            cloud::command_output value;
+            cldmux::command_output value;
             value.add("valid", "value").rename("valid", "not.valid");
         },
         "command output rejects a malformed replacement key");
-    tst::throws<cloud::error>(
+    tst::throws<cldmux::error>(
         [] {
-            cloud::command_output value;
+            cldmux::command_output value;
             value.add_number("value", std::numeric_limits<double>::infinity());
         },
         "command output rejects non-finite numbers");
 
-    cloud::job_spec job;
+    cldmux::job_spec job;
     job.name = "job\n42";
     job.resources.cpus = 4;
     job.resources.memory_gb = 16.5;
@@ -3166,7 +3183,7 @@ void command_output_tests() {
     job.resources.gpu_count = 1;
     job.resources.spot = true;
 
-    cloud::run_diagnostics report;
+    cldmux::run_diagnostics report;
     report.selected_plan.provider = "aws";
     report.selected_plan.region = "eu-west-1";
     report.selected_plan.machine_type = "g5.xlarge";
@@ -3181,8 +3198,8 @@ void command_output_tests() {
     report.estimated_cost_for_expected_attempt_runtime = 0.006;
     report.warnings = {"first", "second\nline"};
 
-    cloud::command_output diagnostics =
-        cloud::command_output::diagnostics("cheapest", job, report);
+    cldmux::command_output diagnostics =
+        cldmux::command_output::diagnostics("cheapest", job, report);
     diagnostics.add("program", "test");
     std::ostringstream diagnostic_text;
     diagnostics.write(diagnostic_text);
@@ -3218,7 +3235,7 @@ void command_output_tests() {
     report.selected_plan.estimated_hourly_cost.reset();
     report.estimated_cost_for_expected_attempt_runtime.reset();
     std::ostringstream unavailable;
-    cloud::command_output::diagnostics("azure", job, report).write(unavailable);
+    cldmux::command_output::diagnostics("azure", job, report).write(unavailable);
     tst::check(unavailable.str().find("provider_job_timeout_seconds=123\n") !=
                        std::string::npos &&
                    unavailable.str().find("hourly_rate_estimate_usd=unavailable\n") !=
@@ -3228,34 +3245,34 @@ void command_output_tests() {
                        std::string::npos,
                "diagnostics distinguish watchdogs and unavailable prices");
 
-    const std::array<std::pair<cloud::job_state, std::string_view>, 10> states{{
-        {cloud::job_state::queued, "queued"},
-        {cloud::job_state::scheduled, "scheduled"},
-        {cloud::job_state::running, "running"},
-        {cloud::job_state::succeeded, "succeeded"},
-        {cloud::job_state::failed, "failed"},
-        {cloud::job_state::cancelling, "cancelling"},
-        {cloud::job_state::cancelled, "cancelled"},
-        {cloud::job_state::deleting, "deleting"},
-        {cloud::job_state::unknown, "unknown"},
-        {static_cast<cloud::job_state>(999), "unknown"},
+    const std::array<std::pair<cldmux::job_state, std::string_view>, 10> states{{
+        {cldmux::job_state::queued, "queued"},
+        {cldmux::job_state::scheduled, "scheduled"},
+        {cldmux::job_state::running, "running"},
+        {cldmux::job_state::succeeded, "succeeded"},
+        {cldmux::job_state::failed, "failed"},
+        {cldmux::job_state::cancelling, "cancelling"},
+        {cldmux::job_state::cancelled, "cancelled"},
+        {cldmux::job_state::deleting, "deleting"},
+        {cldmux::job_state::unknown, "unknown"},
+        {static_cast<cldmux::job_state>(999), "unknown"},
     }};
     for (const auto& state : states) {
-        cloud::result value;
+        cldmux::result value;
         value.state = state.first;
         std::ostringstream state_text;
-        cloud::command_output::job_result(value).write(state_text);
+        cldmux::command_output::job_result(value).write(state_text);
         tst::check(state_text.str() == "job_state=" + std::string(state.second) + "\n",
                    "command result normalises every job state");
     }
 
-    cloud::result failed;
-    failed.state = cloud::job_state::failed;
+    cldmux::result failed;
+    failed.state = cldmux::job_state::failed;
     failed.exit_code = 17;
     failed.message = "kept for stderr";
     failed.warnings = {"one", "two"};
     std::ostringstream result_text;
-    cloud::command_output::job_result(failed).write(result_text);
+    cldmux::command_output::job_result(failed).write(result_text);
     tst::check(result_text.str() ==
                    "job_state=failed\n"
                    "exit_code=17\n"
@@ -3270,7 +3287,7 @@ int main() {
     return tst::run(
         TST_CASE("plans and validates GCP workloads", planning_tests()),
         TST_CASE("bounds private provider responses", transport_limit_tests()),
-        TST_CASE("constructs clients from the environment", environment_factory_tests()),
+        TST_CASE("constructs routers from the environment", environment_factory_tests()),
         TST_CASE("runs GCP lifecycle, storage, and compute", gcp_lifecycle_tests()),
         TST_CASE("maps the storage facade to AWS S3", aws_storage_tests()),
         TST_CASE("maps the storage facade to Azure Blob", azure_storage_tests()),

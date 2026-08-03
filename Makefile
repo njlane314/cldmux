@@ -7,25 +7,26 @@ TST_DIR ?= ../tst
 BUILD_DIR ?= build
 
 AMALGAMATOR := $(BUILD_DIR)/amalgamate
-AMALGAMATE_ARGS := --root include/cloud/cloud.hpp --include-root include --output cloud
-INTERNAL_HEADERS := $(shell find include/cloud -type f -name '*.hpp' | sort)
+AMALGAMATE_ARGS := --root include/cldmux/cldmux.hpp --include-root include --output cldmux
+INTERNAL_HEADERS := $(shell find include/cldmux -type f -name '*.hpp' | sort)
 INTERNAL_HEADER_PROBES := tests/compile/api.cpp tests/compile/client.cpp \
+    tests/compile/router.cpp \
     tests/compile/job.cpp tests/compile/plan.cpp tests/compile/config.cpp \
     tests/compile/http.cpp tests/compile/json.cpp tests/compile/pricing.cpp \
     tests/compile/provider.cpp tests/compile/storage.cpp \
     tests/compile/submission.cpp tests/compile/gcp.cpp tests/compile/aws.cpp \
     tests/compile/azure.cpp
 
-TEST := /tmp/cloud-test
-TEST_SAN := /tmp/cloud-test-san
-EXAMPLE := /tmp/cloud-example
-EMPIRICAL := /tmp/cloud-empirical
-EMPIRICAL_SAN := /tmp/cloud-empirical-san
-DISPATCH := /tmp/cloud-dispatch
-DISPATCH_TEST := /tmp/cloud-dispatch-test
-DISPATCH_SAN := /tmp/cloud-dispatch-san
-DISPATCH_TEST_SAN := /tmp/cloud-dispatch-test-san
-ODR := /tmp/cloud-odr
+TEST := /tmp/cldmux-test
+TEST_SAN := /tmp/cldmux-test-san
+EXAMPLE := /tmp/cldmux-example
+EMPIRICAL := /tmp/cldmux-empirical
+EMPIRICAL_SAN := /tmp/cldmux-empirical-san
+DISPATCH := /tmp/cldmux-dispatch
+DISPATCH_TEST := /tmp/cldmux-dispatch-test
+DISPATCH_SAN := /tmp/cldmux-dispatch-san
+DISPATCH_TEST_SAN := /tmp/cldmux-dispatch-test-san
+ODR := /tmp/cldmux-odr
 
 .PHONY: check check-readme check-headers check-tool check-amalgamation \
     check-library check-odr check-cli check-empirical check-dispatch \
@@ -34,7 +35,7 @@ ODR := /tmp/cloud-odr
 
 check: check-readme check-headers check-tool check-library check-odr check-cli \
     check-empirical check-dispatch check-stale-names
-	@! grep -n "$$(printf '\t')" cloud \
+	@! grep -n "$$(printf '\t')" cldmux \
 		$$(find apps include tests tools -type f) example.cpp test.cpp README.md
 
 check-stale-names:
@@ -42,12 +43,22 @@ check-stale-names:
 		names=$$(find . -path './.git' -prune -o -path './build' -prune -o \
 			-iname '*bu[r]st*' -print); \
 		test -z "$$names"; \
+		old_paths=$$(find . -path './.git' -prune -o -path './build' -prune -o \
+			\( -name 'cl[o]ud' -o -path './include/cl[o]ud/*' \) -print); \
+		test -z "$$old_paths"; \
 		status=0; \
 		grep -Rni 'bu[r]st' apps include tests tools .github || status=$$?; \
 		test "$$status" -eq 1; \
 		status=0; \
-		grep -ni 'bu[r]st' Makefile README.md cloud example.cpp test.cpp || \
+		grep -ni 'bu[r]st' Makefile README.md cldmux example.cpp test.cpp || \
 			status=$$?; \
+		test "$$status" -eq 1; \
+		status=0; \
+		git grep -nE '#include[[:space:]]*[<"]cl[o]ud([/>"])|cl[o]ud::|'\
+'namespace[[:space:]]+cl[o]ud|CLO[U]D_H_VERSION|NJLANE314_CLO[U]D|'\
+'(^|[^A-Z0-9_])CLO[U]D_(REGION|ZONE|GCP_|AWS_|AZURE_|COMPUTE_TEMPLATE)|'\
+'cl[o]ud-(run|empirical|example|dispatch|test|odr|amalgamate)|'\
+'\.cl[o]ud-empirical-history|njlane314/cl[o]ud' -- . || status=$$?; \
 		test "$$status" -eq 1
 
 check-readme:
@@ -115,7 +126,7 @@ dispatch: check-amalgamation
 		apps/dispatch.cpp apps/dispatch_main.cpp $(CURL_LIBS) -pthread -o $(DISPATCH)
 
 check-dispatch-header:
-	@! grep -nE '^[[:space:]]*#include[[:space:]].*cloud|cloud::' apps/dispatch.hpp
+	@! grep -nE '^[[:space:]]*#include[[:space:]].*cldmux|cldmux::' apps/dispatch.hpp
 	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. \
 		-fsyntax-only tests/compile/dispatch.cpp
 
@@ -127,8 +138,8 @@ check-dispatch: check-dispatch-header dispatch
 	sh tests/dispatch.sh $(DISPATCH)
 
 check-cli: example
-	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
-		CLOUD_GCP_REGION=europe-west4 $(EXAMPLE) gcp)"; \
+	@output="$$(env -i PATH="$(PATH)" CLDMUX_GCP_PROJECT=test-project \
+		CLDMUX_GCP_REGION=europe-west4 $(EXAMPLE) gcp)"; \
 		printf '%s\n' "$$output"; \
 		printf '%s\n' "$$output" | grep -q '^output_version=1$$'; \
 		printf '%s\n' "$$output" | grep -q '^requested_provider=gcp$$'; \
@@ -143,20 +154,20 @@ check-cli: example
 		printf '%s\n' "$$output" | \
 			grep -q '^estimated_cost_for_expected_attempt_runtime_usd=unavailable$$'; \
 		printf '%s\n' "$$output" | grep -q '^preflight=planned$$'; \
-		printf '%s\n' "$$output" | grep -q '^program=cloud-run$$'; \
+		printf '%s\n' "$$output" | grep -q '^program=cldmux-run$$'; \
 		printf '%s\n' "$$output" | grep -q '^status=dry-run$$'; \
 		! printf '%s\n' "$$output" | grep -Ev '^[a-z_]+=.*$$'
-	@output="$$(env -i PATH="$(PATH)" CLOUD_AWS_JOB_QUEUE=test-queue \
-		CLOUD_AWS_REGION=eu-west-1 $(EXAMPLE) aws)"; \
+	@output="$$(env -i PATH="$(PATH)" CLDMUX_AWS_JOB_QUEUE=test-queue \
+		CLDMUX_AWS_REGION=eu-west-1 $(EXAMPLE) aws)"; \
 		printf '%s\n' "$$output" | grep -q '^provider=aws$$'; \
 		printf '%s\n' "$$output" | grep -q '^provider_job_timeout_seconds=not-applicable$$'
 	@output="$$(env -i PATH="$(PATH)" \
-		CLOUD_AZURE_BATCH_ENDPOINT=https://test.westeurope.batch.azure.com \
-		CLOUD_AZURE_REGION=westeurope $(EXAMPLE) azure)"; \
+		CLDMUX_AZURE_BATCH_ENDPOINT=https://test.westeurope.batch.azure.com \
+		CLDMUX_AZURE_REGION=westeurope $(EXAMPLE) azure)"; \
 		printf '%s\n' "$$output" | grep -q '^provider=azure$$'; \
 		printf '%s\n' "$$output" | grep -q '^provider_job_timeout_seconds=1290$$'
 	@output="$$($(EXAMPLE) --help)"; \
-		printf '%s\n' "$$output" | grep -q '^Usage: cloud-run '; \
+		printf '%s\n' "$$output" | grep -q '^Usage: cldmux-run '; \
 		printf '%s\n' "$$output" | grep -q '^  cheapest   compare every configured provider'
 	@status=0; env -i PATH="$(PATH)" $(EXAMPLE) >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
@@ -181,12 +192,12 @@ check-cli: example
 	@status=0; $(EXAMPLE) gcp --expected-attempt-runtime=1m \
 		--expected-attempt-runtime=2m >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
-	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
-		CLOUD_GCP_REGION=europe-west4 $(EXAMPLE) gcp \
+	@output="$$(env -i PATH="$(PATH)" CLDMUX_GCP_PROJECT=test-project \
+		CLDMUX_GCP_REGION=europe-west4 $(EXAMPLE) gcp \
 		--expected-attempt-runtime=30s)"; \
 		printf '%s\n' "$$output" | grep -q '^expected_attempt_runtime_seconds=30$$'
-	@status=0; output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
-		CLOUD_GCP_REGION=europe-west4 $(EXAMPLE) gcp \
+	@status=0; output="$$(env -i PATH="$(PATH)" CLDMUX_GCP_PROJECT=test-project \
+		CLDMUX_GCP_REGION=europe-west4 $(EXAMPLE) gcp \
 		--expected-attempt-runtime=16m 2>&1)" || status=$$?; \
 		test $$status -eq 2; \
 		test "$$output" = 'error=Expected attempt runtime must not exceed the controller timeout'

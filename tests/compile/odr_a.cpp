@@ -1,6 +1,6 @@
-#include <cloud>
+#include <cldmux>
 
-int cloud_odr_a() {
-    cloud::job_spec job;
-    return job.resources.cpus == 1 ? CLOUD_H_VERSION_NUM : 0;
+int cldmux_odr_a() {
+    cldmux::job_spec job;
+    return job.resources.cpus == 1 ? CLDMUX_VERSION_NUM : 0;
 }

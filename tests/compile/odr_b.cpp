@@ -1,7 +1,7 @@
-#include <cloud>
+#include <cldmux>
 
-int cloud_odr_b() {
-    cloud::command_output output;
+int cldmux_odr_b() {
+    cldmux::command_output output;
     output.add("probe", "b");
-    return output.records().size() == 1 ? CLOUD_H_VERSION_NUM : 0;
+    return output.records().size() == 1 ? CLDMUX_VERSION_NUM : 0;
 }

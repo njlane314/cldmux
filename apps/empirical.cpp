@@ -1,4 +1,4 @@
-#include <cloud>
+#include <cldmux>
 
 #include <algorithm>
 #include <charconv>
@@ -29,7 +29,7 @@ struct options {
     std::string workload;
     std::vector<std::string> candidates;
     std::optional<std::string> provider_override;
-    std::filesystem::path history_path = ".cloud-empirical-history";
+    std::filesystem::path history_path = ".cldmux-empirical-history";
     std::chrono::milliseconds expected_elapsed{std::chrono::minutes(5)};
     std::uint64_t minimum_observations = 3;
     std::map<std::string, double, std::less<>> hourly_quotes;
@@ -67,8 +67,8 @@ struct runtime_statistics {
 
 struct candidate {
     std::string provider;
-    cloud::client client;
-    cloud::plan plan;
+    cldmux::client client;
+    cldmux::plan plan;
     double hourly_quote_usd = 0;
     bool quote_overridden = false;
     double known_data_cost_usd = 0;
@@ -203,7 +203,7 @@ void set_once(bool& seen, std::string_view name) {
 }
 
 void print_help(std::ostream& output) {
-    output << "Usage: cloud-empirical WORKLOAD "
+    output << "Usage: cldmux-empirical WORKLOAD "
               "--candidates=gcp,aws[,azure] [OPTIONS]\n"
            << "\n"
            << "Route by quote snapshot * learned elapsed / 3600 + data-cost snapshot.\n"
@@ -211,7 +211,7 @@ void print_help(std::ostream& output) {
            << "\n"
            << "Options:\n"
            << "  --provider=aws                  override empirical selection\n"
-           << "  --history=PATH                 ledger (default .cloud-empirical-history)\n"
+           << "  --history=PATH                 ledger (default .cldmux-empirical-history)\n"
            << "  --minimum-observations=3       successful samples required per provider\n"
            << "  --expected-elapsed=5m          common cold-start fallback (s, m, h)\n"
            << "  --data-cost=aws:0.02           caller USD data-cost snapshot per run\n"
@@ -454,7 +454,7 @@ private:
     std::filesystem::path path_;
 };
 
-std::string accelerator_name(const cloud::plan& value) {
+std::string accelerator_name(const cldmux::plan& value) {
     return value.accelerator.empty() ? "none" : value.accelerator;
 }
 
@@ -471,7 +471,7 @@ bool same_memory(double left, double right) {
 
 class empirical_router {
 public:
-    empirical_router(options configuration, cloud::job_spec job,
+    empirical_router(options configuration, cldmux::job_spec job,
                      std::vector<observation> observations)
         : options_(std::move(configuration)), job_(std::move(job)),
           observations_(std::move(observations)) {}
@@ -520,11 +520,13 @@ private:
         if (options_.no_catalogue && supplied_quote == options_.hourly_quotes.end())
             throw std::runtime_error("no hourly quote supplied for candidate " + provider);
 
-        cloud::client client =
+        cldmux::router router =
             supplied_quote == options_.hourly_quotes.end()
-                ? cloud::client::from_environment(provider, cloud::price_source::public_catalogue)
-                : cloud::client::from_environment(provider);
-        cloud::plan plan = client.plan(job_);
+                ? cldmux::router::from_environment(provider,
+                                                   cldmux::price_source::public_catalogue)
+                : cldmux::router::from_environment(provider);
+        cldmux::plan plan = router.plan(job_);
+        cldmux::client client = router.route(plan.provider);
         if (plan.provider != provider)
             throw std::runtime_error("planned provider does not match candidate " + provider);
         if (!safe_history_token(plan.region))
@@ -576,7 +578,7 @@ private:
     }
 
     [[nodiscard]] bool matches(const observation& item, const std::string& provider,
-                               const cloud::plan& plan) const {
+                               const cldmux::plan& plan) const {
         return item.succeeded && item.workload == options_.workload && item.provider == provider &&
                item.region == plan.region && item.machine == plan.machine_type &&
                item.accelerator == accelerator_name(plan) &&
@@ -587,13 +589,13 @@ private:
     }
 
     options options_;
-    cloud::job_spec job_;
+    cldmux::job_spec job_;
     std::vector<observation> observations_;
 };
 
-cloud::command_output diagnostic_output(const options& configuration,
+cldmux::command_output diagnostic_output(const options& configuration,
                                         const routing_decision& decision) {
-    cloud::command_output output;
+    cldmux::command_output output;
     output.add("output_version", "1");
     output.add("router", "empirical");
     output.add("workload", configuration.workload);
@@ -631,7 +633,7 @@ cloud::command_output diagnostic_output(const options& configuration,
         if (value.quote_overridden)
             output.add("warning", value.provider +
                                       ": caller-supplied hourly quote is not verified or "
-                                      "repriced by cloud");
+                                      "repriced by cldmux");
     }
 
     output.add("routing_basis", decision.basis);
@@ -653,7 +655,7 @@ cloud::command_output diagnostic_output(const options& configuration,
     return output;
 }
 
-observation make_observation(const options& configuration, const cloud::job_spec& job,
+observation make_observation(const options& configuration, const cldmux::job_spec& job,
                              const candidate& selected, double elapsed_seconds, bool succeeded) {
     const auto unix_time = std::chrono::duration_cast<std::chrono::seconds>(
                                std::chrono::system_clock::now().time_since_epoch())
@@ -687,7 +689,7 @@ int main(int argc, char* argv[]) {
         // This is application-owned workload policy. Change the workload key
         // whenever image, command, inputs, or other runtime-relevant behaviour
         // changes; native plan fields also prevent observations crossing shapes.
-        cloud::job_spec job;
+        cldmux::job_spec job;
         job.name = "empirical-job";
         job.image = "ubuntu:24.04";
         job.command = {"/bin/echo", "hello"};
@@ -703,67 +705,67 @@ int main(int argc, char* argv[]) {
         diagnostic_output(configuration, decision).write(std::cout);
 
         if (!configuration.submit) {
-            cloud::write_command_record(std::cout, "status", "dry-run");
+            cldmux::write_command_record(std::cout, "status", "dry-run");
             return 0;
         }
 
         const candidate& selected = decision.candidates[decision.selected];
         history.prepare_append();
-        cloud::result result;
-        std::optional<cloud::job> submitted;
+        cldmux::result result;
+        std::optional<cldmux::job> submitted;
         double elapsed_seconds = 0;
         try {
-            cloud::write_command_record(std::cout, "status", "submitting");
+            cldmux::write_command_record(std::cout, "status", "submitting");
             std::cout.flush();
             const auto started = std::chrono::steady_clock::now();
             submitted.emplace(selected.client.run(job));
-            cloud::write_command_record(std::cout, "job_id", submitted->id());
+            cldmux::write_command_record(std::cout, "job_id", submitted->id());
             std::cout.flush();
             result = submitted->wait();
             elapsed_seconds =
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
         } catch (...) {
             if (submitted)
-                cloud::write_command_record(
+                cldmux::write_command_record(
                     std::cout, "warning",
                     "a terminal result was not received; cancellation and cleanup are "
                     "best effort");
-            cloud::write_command_record(std::cout, "status", "failed");
+            cldmux::write_command_record(std::cout, "status", "failed");
             throw;
         }
 
         // Once a terminal result exists, local diagnostics and ledger failures
-        // must not change that cloud result or encourage a duplicate submission.
+        // must not change that cldmux result or encourage a duplicate submission.
         try {
             for (const auto& line : submitted->logs())
-                cloud::write_command_record(std::cout, "log", line.text);
-            cloud::write_command_record(std::cout, "observed_elapsed_seconds",
+                cldmux::write_command_record(std::cout, "log", line.text);
+            cldmux::write_command_record(std::cout, "observed_elapsed_seconds",
                                         format_number(elapsed_seconds));
-            cloud::write_command_record(
+            cldmux::write_command_record(
                 std::cout, "observed_routing_cost_proxy_usd",
                 format_number(effective_cost(selected.hourly_quote_usd, elapsed_seconds,
                                              selected.known_data_cost_usd)));
 
             history.append(
                 make_observation(configuration, job, selected, elapsed_seconds, result.success()));
-            cloud::write_command_record(std::cout, "history_recorded", "true");
+            cldmux::write_command_record(std::cout, "history_recorded", "true");
         } catch (const std::exception& failure) {
-            cloud::write_command_record(std::cout, "history_recorded", "false");
-            cloud::write_command_record(std::cout, "warning",
+            cldmux::write_command_record(std::cout, "history_recorded", "false");
+            cldmux::write_command_record(std::cout, "warning",
                                         std::string("empirical observation was not recorded: ") +
                                             failure.what());
         }
 
-        cloud::command_output::job_result(result).write(std::cout);
+        cldmux::command_output::job_result(result).write(std::cout);
         if (!result.success()) {
-            cloud::write_command_record(std::cerr, "error", result.error());
-            cloud::write_command_record(std::cout, "status", "failed");
+            cldmux::write_command_record(std::cerr, "error", result.error());
+            cldmux::write_command_record(std::cout, "status", "failed");
             return 1;
         }
-        cloud::write_command_record(std::cout, "status", "succeeded");
+        cldmux::write_command_record(std::cout, "status", "succeeded");
         return 0;
     } catch (const std::exception& failure) {
-        cloud::write_command_record(std::cerr, "error", failure.what());
+        cldmux::write_command_record(std::cerr, "error", failure.what());
         return 2;
     }
 }

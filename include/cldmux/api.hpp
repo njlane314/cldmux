@@ -1,10 +1,10 @@
 #pragma once
 
-#include "cloud/detail/providers/gcp.hpp"
+#include "cldmux/detail/providers/gcp.hpp"
 
 // Public API: portable jobs, storage, and raw compute -------------------------
 
-namespace cloud {
+namespace cldmux {
 
 // Storage and instance values deliberately use one compact representation for
 // every provider. Native identifiers remain provider-shaped strings.
@@ -151,7 +151,7 @@ struct job_spec {
     // and Azure rejects it because its auto-pool has no equivalent job field.
     std::string service_account;
     std::vector<mount> mounts;
-    cloud::resources resources;
+    cldmux::resources resources;
 
     // retries requests this many policy retries after the first attempt.
     // Qualifying failures differ by provider, and provider-managed recovery or
@@ -174,7 +174,7 @@ struct job_spec {
 struct plan {
     // Native location/shape selected without allocating compute. Estimates are
     // advisory; a maximum price fails closed unless an estimate is available.
-    cloud::provider provider = "gcp";
+    cldmux::provider provider = "gcp";
     std::string region;
     std::string machine_type;
     std::string accelerator;
@@ -192,7 +192,7 @@ struct plan {
 // compute-only, while callback contents remain caller-defined. Unavailable
 // prices remain unavailable rather than being reported as zero.
 struct run_diagnostics {
-    cloud::plan selected_plan;
+    cldmux::plan selected_plan;
     // Caller-modelled active duration for one attempt. Queueing, provisioning,
     // retries, recovery, cancellation, and cleanup are outside this value.
     std::chrono::milliseconds expected_attempt_runtime{};
@@ -315,7 +315,7 @@ public:
 
     // result.message is deliberately absent: the application decides whether
     // an error belongs on stdout, stderr, or somewhere else.
-    [[nodiscard]] static command_output job_result(const cloud::result& value) {
+    [[nodiscard]] static command_output job_result(const cldmux::result& value) {
         command_output out;
         out.add("job_state", state_name(value.state));
         if (value.exit_code)
@@ -491,7 +491,7 @@ struct price_request {
     // Exact native plan sent to a trusted caller callback. Returning nullopt
     // means no quote is available; otherwise the result must be finite,
     // nonnegative USD per hour. max_price_per_hour then fails closed.
-    cloud::provider provider;
+    cldmux::provider provider;
     std::string region;
     std::string zone;
     std::string machine_type;
@@ -557,8 +557,8 @@ struct azure_instance_template {
 
 struct instance_template {
     std::string gcp_instance_template;
-    cloud::aws_launch_template aws;
-    cloud::azure_instance_template azure;
+    cldmux::aws_launch_template aws;
+    cldmux::azure_instance_template azure;
 };
 
 struct aws_config {
@@ -601,19 +601,19 @@ struct azure_config {
     // For example: https://account.westeurope.batch.azure.com
     std::string batch_endpoint;
     // When absent, config::auth supplies the Batch bearer token. This override
-    // lets a multi-provider client use an Azure-scoped token independently.
-    std::optional<cloud::auth> auth;
+    // lets a multi-provider router use an Azure-scoped token independently.
+    std::optional<cldmux::auth> auth;
     // Blob and Resource Manager use different OAuth audiences from Batch.
     // Separate overrides preserve correct token caching in multi-cloud clients.
     std::string storage_account;
-    std::optional<cloud::auth> storage_auth;
+    std::optional<cldmux::auth> storage_auth;
     // A SAS is used only by Batch nodes for BlobFuse mounts. Controller object
     // operations continue to prefer the storage-scoped bearer token above.
     std::string storage_sas;
     std::string storage_endpoint;
     std::string subscription_id;
     std::string resource_group;
-    std::optional<cloud::auth> management_auth;
+    std::optional<cldmux::auth> management_auth;
     std::string management_endpoint = "https://management.azure.com";
     std::string compute_api_version = "2025-04-01";
     // Image fields describe the auto-pool node image, not the submitted
@@ -630,29 +630,29 @@ struct config {
     // provider forces exactly one backend. Otherwise providers is considered in
     // order. ordered returns the first runnable plan; lowest_cost requires priced
     // comparable candidates and at least two runnable providers.
-    std::optional<cloud::provider> provider;
-    std::vector<cloud::provider> providers{"gcp"};
-    cloud::selection selection = cloud::selection::ordered;
+    std::optional<cldmux::provider> provider;
+    std::vector<cldmux::provider> providers{"gcp"};
+    cldmux::selection selection = cldmux::selection::ordered;
 
     // project is GCP-specific. Per-provider maps override the shared region/zone
-    // fallbacks, allowing one multi-provider client to carry native locations.
+    // fallbacks, allowing one multi-provider router to carry native locations.
     std::string project;
     std::string region = "europe";
     std::string zone;
-    std::map<cloud::provider, std::string, std::less<>> regions;
-    std::map<cloud::provider, std::string, std::less<>> zones;
+    std::map<cldmux::provider, std::string, std::less<>> regions;
+    std::map<cldmux::provider, std::string, std::less<>> zones;
 
     // GCP and Azure bearer authentication; AWS credentials live in aws_config.
-    cloud::auth auth = cloud::auth::default_chain();
-    cloud::aws_config aws;
-    cloud::azure_config azure;
+    cldmux::auth auth = cldmux::auth::default_chain();
+    cldmux::aws_config aws;
+    cldmux::azure_config azure;
     // Many logical templates may be supplied in C++. from_environment() keeps
-    // its contract concise by loading at most one named CLOUD_COMPUTE_TEMPLATE.
-    std::map<std::string, cloud::instance_template, std::less<>> instance_templates;
+    // its contract concise by loading at most one named CLDMUX_COMPUTE_TEMPLATE.
+    std::map<std::string, cldmux::instance_template, std::less<>> instance_templates;
 
     // Price precedence is lookup_hourly_cost, compatibility estimator, then the
     // opt-in public catalogue. Supplying either callback suppresses catalogue lookup.
-    cloud::price_source prices = cloud::price_source::none;
+    cldmux::price_source prices = cldmux::price_source::none;
     price_lookup lookup_hourly_cost;
     price_estimator estimate_hourly_cost;
     std::chrono::milliseconds price_cache_ttl{std::chrono::hours(1)};
@@ -680,4 +680,4 @@ struct config {
     std::string billing_endpoint = "https://cloudbilling.googleapis.com";
 };
 
-} // namespace cloud
+} // namespace cldmux

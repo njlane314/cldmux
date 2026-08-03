@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/plan.hpp"
+#include "cldmux/plan.hpp"
 
-namespace cloud {
+namespace cldmux {
 namespace detail {
 
 // Shared provider state, transports, and wire helpers -------------------------
@@ -11,7 +11,7 @@ namespace detail {
 // this state alive, so callbacks and credential caches outlive the client object
 // from which a job/storage/compute handle was copied.
 struct client_state {
-    cloud::config config;
+    cldmux::config config;
     gcp::Cloud raw;
     gcp::Credentials azure_batch_auth;
     gcp::Credentials azure_storage_auth;
@@ -21,7 +21,7 @@ struct client_state {
                      std::less<>>
         price_cache;
 
-    static gcp::Config low_level(const cloud::config& value) {
+    static gcp::Config low_level(const cldmux::config& value) {
         gcp::Config out;
         out.project = value.project;
         out.zone = configured_zone(value, "gcp");
@@ -36,7 +36,7 @@ struct client_state {
         return out;
     }
 
-    explicit client_state(cloud::config value)
+    explicit client_state(cldmux::config value)
         : config(std::move(value)), raw(low_level(config)),
           azure_batch_auth((config.azure.auth ? *config.azure.auth : config.auth)
                                .for_scope("https://batch.core.windows.net/.default")),
@@ -120,7 +120,7 @@ aws_signature(const client_state& client, std::string region, std::string servic
     // A refresh callback wins over explicit fields, which win over the standard
     // environment variables. Profiles, SSO, ECS, and EC2 metadata are outside
     // this small header and can be adapted through the callback.
-    cloud::aws_credentials supplied;
+    cldmux::aws_credentials supplied;
     if (client.config.aws.credentials) {
         supplied = client.config.aws.credentials();
     } else if (!client.config.aws.access_key_id.empty() ||
@@ -524,4 +524,4 @@ inline std::vector<std::string> conditional_headers(const put_options& options) 
 
 
 } // namespace detail
-} // namespace cloud
+} // namespace cldmux

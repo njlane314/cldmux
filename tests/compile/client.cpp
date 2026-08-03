@@ -1,6 +1,6 @@
-#include <cloud/client.hpp>
+#include <cldmux/client.hpp>
 
 int main() {
-    static_assert(CLOUD_H_VERSION_NUM >= 0x000400);
+    static_assert(CLDMUX_VERSION_NUM >= 0x000500);
     return 0;
 }

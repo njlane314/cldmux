@@ -1,8 +1,8 @@
 #pragma once
 
-#include "cloud/api.hpp"
+#include "cldmux/api.hpp"
 
-namespace cloud {
+namespace cldmux {
 
 // Planning and provider validation --------------------------------------------
 
@@ -88,32 +88,6 @@ inline void validate_project(std::string_view value) {
     for (const char c : value)
         if (!gcp::detail::is_ascii_alnum(c) && c != '-' && c != '.' && c != ':')
             throw error("Invalid GCP project identifier");
-}
-
-inline provider selected_provider(const config& cfg, std::vector<std::string>* warnings = nullptr) {
-    // This helper resolves configuration only; multi-provider planning happens
-    // in make_plan(), where validation and price availability are also known.
-    const std::vector<provider> choices =
-        cfg.provider ? std::vector<provider>{*cfg.provider} : cfg.providers;
-    if (choices.empty())
-        throw error("No cloud provider configured");
-    for (const auto& value : choices) {
-        if (implemented(value))
-            return value;
-        if (warnings)
-            warnings->push_back(value + " backend is not implemented; skipped");
-        if (cfg.provider)
-            throw error(value + " backend is not implemented");
-    }
-    throw error("None of the configured cloud providers is implemented");
-}
-
-inline std::optional<provider> implicit_route(const config& cfg) {
-    if (cfg.provider)
-        return selected_provider(cfg);
-    if (cfg.providers.size() == 1 && implemented(cfg.providers.front()))
-        return cfg.providers.front();
-    return std::nullopt;
 }
 
 inline bool configured_provider(const config& cfg, std::string_view wanted) {
@@ -204,19 +178,19 @@ inline double positive_environment_decimal(std::string_view name) {
 }
 
 inline void environment_locations(config& out) {
-    if (const std::string value = gcp::detail::env("CLOUD_REGION"); !value.empty())
+    if (const std::string value = gcp::detail::env("CLDMUX_REGION"); !value.empty())
         out.region = value;
-    if (const std::string value = gcp::detail::env("CLOUD_ZONE"); !value.empty())
+    if (const std::string value = gcp::detail::env("CLDMUX_ZONE"); !value.empty())
         out.zone = value;
-    if (const std::string value = gcp::detail::env("CLOUD_GCP_REGION"); !value.empty())
+    if (const std::string value = gcp::detail::env("CLDMUX_GCP_REGION"); !value.empty())
         out.regions["gcp"] = value;
-    if (const std::string value = gcp::detail::env("CLOUD_AWS_REGION"); !value.empty())
+    if (const std::string value = gcp::detail::env("CLDMUX_AWS_REGION"); !value.empty())
         out.regions["aws"] = value;
-    if (const std::string value = gcp::detail::env("CLOUD_AZURE_REGION"); !value.empty())
+    if (const std::string value = gcp::detail::env("CLDMUX_AZURE_REGION"); !value.empty())
         out.regions["azure"] = value;
-    if (const std::string value = gcp::detail::env("CLOUD_GCP_ZONE"); !value.empty())
+    if (const std::string value = gcp::detail::env("CLDMUX_GCP_ZONE"); !value.empty())
         out.zones["gcp"] = value;
-    if (const std::string value = gcp::detail::env("CLOUD_AWS_ZONE"); !value.empty())
+    if (const std::string value = gcp::detail::env("CLDMUX_AWS_ZONE"); !value.empty())
         out.zones["aws"] = value;
 }
 
@@ -224,37 +198,37 @@ inline bool environment_aws_configured() {
     // Storage-only and raw-instance-only settings do not make Batch runnable.
     // Fargate queues are included because mounted CPU jobs have a composable
     // public-catalogue vCPU and memory price.
-    return !gcp::detail::env("CLOUD_AWS_JOB_QUEUE").empty() ||
-           !gcp::detail::env("CLOUD_AWS_SPOT_JOB_QUEUE").empty() ||
-           !gcp::detail::env("CLOUD_AWS_FARGATE_JOB_QUEUE").empty() ||
-           !gcp::detail::env("CLOUD_AWS_FARGATE_SPOT_JOB_QUEUE").empty() ||
-           !gcp::detail::env("CLOUD_AWS_GPU_MODEL").empty() ||
-           !gcp::detail::env("CLOUD_AWS_GPU_JOB_QUEUE").empty() ||
-           !gcp::detail::env("CLOUD_AWS_GPU_SPOT_JOB_QUEUE").empty() ||
-           !gcp::detail::env("CLOUD_AWS_GPU_MACHINE_TYPE").empty() ||
-           !gcp::detail::env("CLOUD_AWS_GPU_CPUS").empty() ||
-           !gcp::detail::env("CLOUD_AWS_GPU_MEMORY_GB").empty() ||
-           !gcp::detail::env("CLOUD_AWS_GPU_COUNT").empty();
+    return !gcp::detail::env("CLDMUX_AWS_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_SPOT_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_FARGATE_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_FARGATE_SPOT_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_GPU_MODEL").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_GPU_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_GPU_SPOT_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_GPU_MACHINE_TYPE").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_GPU_CPUS").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_GPU_MEMORY_GB").empty() ||
+           !gcp::detail::env("CLDMUX_AWS_GPU_COUNT").empty();
 }
 
 inline std::string environment_compute_template() {
-    return gcp::detail::env("CLOUD_COMPUTE_TEMPLATE");
+    return gcp::detail::env("CLDMUX_COMPUTE_TEMPLATE");
 }
 
 inline void require_environment_template(std::string_view native_name,
                                          const std::string& logical) {
     if (logical.empty())
-        throw error(std::string(native_name) + " requires CLOUD_COMPUTE_TEMPLATE");
+        throw error(std::string(native_name) + " requires CLDMUX_COMPUTE_TEMPLATE");
 }
 
 inline void environment_aws_gpu_target(config& out) {
-    const std::string model = gcp::detail::env("CLOUD_AWS_GPU_MODEL");
-    const std::string queue = gcp::detail::env("CLOUD_AWS_GPU_JOB_QUEUE");
-    const std::string spot_queue = gcp::detail::env("CLOUD_AWS_GPU_SPOT_JOB_QUEUE");
-    const std::string machine = gcp::detail::env("CLOUD_AWS_GPU_MACHINE_TYPE");
-    const std::string cpus = gcp::detail::env("CLOUD_AWS_GPU_CPUS");
-    const std::string memory = gcp::detail::env("CLOUD_AWS_GPU_MEMORY_GB");
-    const std::string count = gcp::detail::env("CLOUD_AWS_GPU_COUNT");
+    const std::string model = gcp::detail::env("CLDMUX_AWS_GPU_MODEL");
+    const std::string queue = gcp::detail::env("CLDMUX_AWS_GPU_JOB_QUEUE");
+    const std::string spot_queue = gcp::detail::env("CLDMUX_AWS_GPU_SPOT_JOB_QUEUE");
+    const std::string machine = gcp::detail::env("CLDMUX_AWS_GPU_MACHINE_TYPE");
+    const std::string cpus = gcp::detail::env("CLDMUX_AWS_GPU_CPUS");
+    const std::string memory = gcp::detail::env("CLDMUX_AWS_GPU_MEMORY_GB");
+    const std::string count = gcp::detail::env("CLDMUX_AWS_GPU_COUNT");
     const bool present = !model.empty() || !queue.empty() || !spot_queue.empty() ||
                          !machine.empty() || !cpus.empty() || !memory.empty() || !count.empty();
     if (!present)
@@ -268,27 +242,27 @@ inline void environment_aws_gpu_target(config& out) {
     target.job_queue = queue;
     target.spot_job_queue = spot_queue;
     target.machine_type = machine;
-    target.cpus = positive_environment_integer("CLOUD_AWS_GPU_CPUS");
-    target.memory_gb = positive_environment_decimal("CLOUD_AWS_GPU_MEMORY_GB");
-    target.gpus = positive_environment_integer("CLOUD_AWS_GPU_COUNT");
+    target.cpus = positive_environment_integer("CLDMUX_AWS_GPU_CPUS");
+    target.memory_gb = positive_environment_decimal("CLDMUX_AWS_GPU_MEMORY_GB");
+    target.gpus = positive_environment_integer("CLDMUX_AWS_GPU_COUNT");
     out.aws.gpu_targets[canonical] = std::move(target);
 }
 
 inline void environment_gcp(config& out) {
-    out.project = gcp::detail::env("CLOUD_GCP_PROJECT");
+    out.project = gcp::detail::env("CLDMUX_GCP_PROJECT");
     if (out.project.empty())
-        throw error("GCP environment configuration requires CLOUD_GCP_PROJECT");
+        throw error("GCP environment configuration requires CLDMUX_GCP_PROJECT");
     validate_project(out.project);
-    const std::string native = gcp::detail::env("CLOUD_GCP_INSTANCE_TEMPLATE");
+    const std::string native = gcp::detail::env("CLDMUX_GCP_INSTANCE_TEMPLATE");
     if (!native.empty()) {
         const std::string logical = environment_compute_template();
-        require_environment_template("CLOUD_GCP_INSTANCE_TEMPLATE", logical);
+        require_environment_template("CLDMUX_GCP_INSTANCE_TEMPLATE", logical);
         out.instance_templates[logical].gcp_instance_template = native;
     }
 }
 
 inline void environment_aws_s3_files(config& out, std::string_view role) {
-    std::string prefix = "CLOUD_AWS_S3_FILES";
+    std::string prefix = "CLDMUX_AWS_S3_FILES";
     if (!role.empty())
         prefix += '_' + std::string(role);
     const std::string bucket = gcp::detail::env(prefix + "_BUCKET");
@@ -306,16 +280,16 @@ inline void environment_aws_s3_files(config& out, std::string_view role) {
 }
 
 inline void environment_aws(config& out, bool comparing_prices) {
-    out.aws.job_queue = gcp::detail::env("CLOUD_AWS_JOB_QUEUE");
-    out.aws.spot_job_queue = gcp::detail::env("CLOUD_AWS_SPOT_JOB_QUEUE");
-    out.aws.fargate_job_queue = gcp::detail::env("CLOUD_AWS_FARGATE_JOB_QUEUE");
+    out.aws.job_queue = gcp::detail::env("CLDMUX_AWS_JOB_QUEUE");
+    out.aws.spot_job_queue = gcp::detail::env("CLDMUX_AWS_SPOT_JOB_QUEUE");
+    out.aws.fargate_job_queue = gcp::detail::env("CLDMUX_AWS_FARGATE_JOB_QUEUE");
     out.aws.fargate_spot_job_queue =
-        gcp::detail::env("CLOUD_AWS_FARGATE_SPOT_JOB_QUEUE");
-    out.aws.execution_role_arn = gcp::detail::env("CLOUD_AWS_EXECUTION_ROLE_ARN");
-    out.aws.job_role_arn = gcp::detail::env("CLOUD_AWS_JOB_ROLE_ARN");
-    out.aws.machine_type = gcp::detail::env("CLOUD_AWS_MACHINE_TYPE");
-    out.aws.spot_machine_type = gcp::detail::env("CLOUD_AWS_SPOT_MACHINE_TYPE");
-    if (const std::string value = gcp::detail::env("CLOUD_AWS_LOG_GROUP"); !value.empty())
+        gcp::detail::env("CLDMUX_AWS_FARGATE_SPOT_JOB_QUEUE");
+    out.aws.execution_role_arn = gcp::detail::env("CLDMUX_AWS_EXECUTION_ROLE_ARN");
+    out.aws.job_role_arn = gcp::detail::env("CLDMUX_AWS_JOB_ROLE_ARN");
+    out.aws.machine_type = gcp::detail::env("CLDMUX_AWS_MACHINE_TYPE");
+    out.aws.spot_machine_type = gcp::detail::env("CLDMUX_AWS_SPOT_MACHINE_TYPE");
+    if (const std::string value = gcp::detail::env("CLDMUX_AWS_LOG_GROUP"); !value.empty())
         out.aws.log_group = value;
     environment_aws_gpu_target(out);
 
@@ -323,15 +297,15 @@ inline void environment_aws(config& out, bool comparing_prices) {
     environment_aws_s3_files(out, "INPUT");
     environment_aws_s3_files(out, "OUTPUT");
 
-    const std::string launch_id = gcp::detail::env("CLOUD_AWS_LAUNCH_TEMPLATE_ID");
-    const std::string launch_name = gcp::detail::env("CLOUD_AWS_LAUNCH_TEMPLATE_NAME");
-    const std::string launch_version = gcp::detail::env("CLOUD_AWS_LAUNCH_TEMPLATE_VERSION");
+    const std::string launch_id = gcp::detail::env("CLDMUX_AWS_LAUNCH_TEMPLATE_ID");
+    const std::string launch_name = gcp::detail::env("CLDMUX_AWS_LAUNCH_TEMPLATE_NAME");
+    const std::string launch_version = gcp::detail::env("CLDMUX_AWS_LAUNCH_TEMPLATE_VERSION");
     if (!launch_id.empty() || !launch_name.empty() || !launch_version.empty()) {
         const std::string logical = environment_compute_template();
         require_environment_template("AWS launch-template configuration", logical);
         if (launch_id.empty() == launch_name.empty())
             throw error("AWS raw compute requires exactly one of "
-                        "CLOUD_AWS_LAUNCH_TEMPLATE_ID and CLOUD_AWS_LAUNCH_TEMPLATE_NAME");
+                        "CLDMUX_AWS_LAUNCH_TEMPLATE_ID and CLDMUX_AWS_LAUNCH_TEMPLATE_NAME");
         auto& target = out.instance_templates[logical].aws;
         target.id = launch_id;
         target.name = launch_name;
@@ -351,7 +325,7 @@ inline void environment_aws(config& out, bool comparing_prices) {
         !out.aws.fargate_job_queue.empty() || !out.aws.fargate_spot_job_queue.empty();
     if (comparing_prices && !priced_cpu && !priced_spot && !priced_gpu && !fargate)
         throw error("AWS price comparison requires an exact EC2 machine queue or a Fargate "
-                    "queue; EC2 Spot pricing also requires CLOUD_AWS_ZONE");
+                    "queue; EC2 Spot pricing also requires CLDMUX_AWS_ZONE");
     if (comparing_prices && (gcp::detail::env("AWS_ACCESS_KEY_ID").empty() ||
                              gcp::detail::env("AWS_SECRET_ACCESS_KEY").empty()))
         throw error("AWS price comparison requires AWS_ACCESS_KEY_ID and "
@@ -361,32 +335,32 @@ inline void environment_aws(config& out, bool comparing_prices) {
 inline void validate_environment_azure_endpoint(const config& out, std::string endpoint) {
     constexpr std::string_view scheme = "https://";
     if (!gcp::detail::starts_with(endpoint, scheme))
-        throw error("CLOUD_AZURE_BATCH_ENDPOINT must use HTTPS");
+        throw error("CLDMUX_AZURE_BATCH_ENDPOINT must use HTTPS");
     endpoint.erase(0, scheme.size());
     std::transform(endpoint.begin(), endpoint.end(), endpoint.begin(), gcp::detail::ascii_lower);
     const std::string azure_region = region(configured_region(out, "azure"), "azure");
     const std::string suffix = "." + azure_region + ".batch.azure.com";
     if (!gcp::detail::ends_with(endpoint, suffix) || endpoint.size() <= suffix.size())
-        throw error("CLOUD_AZURE_BATCH_ENDPOINT must be "
+        throw error("CLDMUX_AZURE_BATCH_ENDPOINT must be "
                     "https://ACCOUNT.REGION.batch.azure.com");
     endpoint.resize(endpoint.size() - suffix.size());
     if (endpoint.size() < 3 || endpoint.size() > 24 ||
         !std::all_of(endpoint.begin(), endpoint.end(), [](char c) {
             return gcp::detail::is_ascii_lower(c) || gcp::detail::is_ascii_digit(c);
         }))
-        throw error("CLOUD_AZURE_BATCH_ENDPOINT contains an invalid Batch account name");
+        throw error("CLDMUX_AZURE_BATCH_ENDPOINT contains an invalid Batch account name");
 }
 
 inline void environment_azure(config& out) {
     out.azure.batch_endpoint =
-        gcp::detail::base_url(gcp::detail::env("CLOUD_AZURE_BATCH_ENDPOINT"));
+        gcp::detail::base_url(gcp::detail::env("CLDMUX_AZURE_BATCH_ENDPOINT"));
     // Restrict bearer-token destinations in the minimal environment contract.
-    // Explicit cloud::config remains the escape hatch for a trusted proxy or a
+    // Explicit cldmux::config remains the escape hatch for a trusted proxy or a
     // sovereign-cloud endpoint with a different DNS suffix.
     if (!out.azure.batch_endpoint.empty())
         validate_environment_azure_endpoint(out, out.azure.batch_endpoint);
 
-    out.azure.storage_account = gcp::detail::env("CLOUD_AZURE_STORAGE_ACCOUNT");
+    out.azure.storage_account = gcp::detail::env("CLDMUX_AZURE_STORAGE_ACCOUNT");
     if (!out.azure.storage_account.empty()) {
         if (out.azure.storage_account.size() < 3 || out.azure.storage_account.size() > 24 ||
             !std::all_of(out.azure.storage_account.begin(), out.azure.storage_account.end(),
@@ -394,29 +368,29 @@ inline void environment_azure(config& out) {
                              return gcp::detail::is_ascii_lower(c) ||
                                     gcp::detail::is_ascii_digit(c);
                          }))
-            throw error("CLOUD_AZURE_STORAGE_ACCOUNT must contain 3-24 lowercase letters or "
+            throw error("CLDMUX_AZURE_STORAGE_ACCOUNT must contain 3-24 lowercase letters or "
                         "digits");
         out.azure.storage_endpoint =
             "https://" + out.azure.storage_account + ".blob.core.windows.net";
     }
-    out.azure.storage_sas = gcp::detail::env("CLOUD_AZURE_STORAGE_SAS");
+    out.azure.storage_sas = gcp::detail::env("CLDMUX_AZURE_STORAGE_SAS");
     if (!out.azure.storage_sas.empty() && out.azure.storage_sas.front() == '?')
         out.azure.storage_sas.erase(out.azure.storage_sas.begin());
 
-    out.azure.subscription_id = gcp::detail::env("CLOUD_AZURE_SUBSCRIPTION_ID");
-    out.azure.resource_group = gcp::detail::env("CLOUD_AZURE_RESOURCE_GROUP");
-    const std::string image = gcp::detail::env("CLOUD_AZURE_VM_IMAGE_ID");
-    const std::string subnet = gcp::detail::env("CLOUD_AZURE_VM_SUBNET_ID");
-    const std::string size = gcp::detail::env("CLOUD_AZURE_VM_SIZE");
-    const std::string location = gcp::detail::env("CLOUD_AZURE_VM_LOCATION");
-    const std::string disk = gcp::detail::env("CLOUD_AZURE_VM_OS_DISK_TYPE");
+    out.azure.subscription_id = gcp::detail::env("CLDMUX_AZURE_SUBSCRIPTION_ID");
+    out.azure.resource_group = gcp::detail::env("CLDMUX_AZURE_RESOURCE_GROUP");
+    const std::string image = gcp::detail::env("CLDMUX_AZURE_VM_IMAGE_ID");
+    const std::string subnet = gcp::detail::env("CLDMUX_AZURE_VM_SUBNET_ID");
+    const std::string size = gcp::detail::env("CLDMUX_AZURE_VM_SIZE");
+    const std::string location = gcp::detail::env("CLDMUX_AZURE_VM_LOCATION");
+    const std::string disk = gcp::detail::env("CLDMUX_AZURE_VM_OS_DISK_TYPE");
     if (!image.empty() || !subnet.empty() || !size.empty() || !location.empty() ||
         !disk.empty()) {
         const std::string logical = environment_compute_template();
         require_environment_template("Azure VM template configuration", logical);
         if (image.empty() || subnet.empty() || size.empty())
-            throw error("Azure raw compute requires CLOUD_AZURE_VM_IMAGE_ID, "
-                        "CLOUD_AZURE_VM_SUBNET_ID, and CLOUD_AZURE_VM_SIZE");
+            throw error("Azure raw compute requires CLDMUX_AZURE_VM_IMAGE_ID, "
+                        "CLDMUX_AZURE_VM_SUBNET_ID, and CLDMUX_AZURE_VM_SIZE");
         auto& target = out.instance_templates[logical].azure;
         target.image_id = image;
         target.subnet_id = subnet;
@@ -428,8 +402,8 @@ inline void environment_azure(config& out) {
     const bool raw_configured = !image.empty() || !out.azure.subscription_id.empty() ||
                                 !out.azure.resource_group.empty();
     if (raw_configured && (out.azure.subscription_id.empty() || out.azure.resource_group.empty()))
-        throw error("Azure raw compute requires CLOUD_AZURE_SUBSCRIPTION_ID and "
-                    "CLOUD_AZURE_RESOURCE_GROUP");
+        throw error("Azure raw compute requires CLDMUX_AZURE_SUBSCRIPTION_ID and "
+                    "CLDMUX_AZURE_RESOURCE_GROUP");
     if (out.azure.batch_endpoint.empty() && out.azure.storage_account.empty() && !raw_configured)
         throw error("Azure environment configuration requires Batch, Blob Storage, or raw VM "
                     "settings");
@@ -440,11 +414,11 @@ inline void environment_azure(config& out) {
     const auto environment_auth = auth::from([](std::string_view scope) {
         std::string variable;
         if (scope == "https://storage.azure.com/.default")
-            variable = "CLOUD_AZURE_STORAGE_TOKEN";
+            variable = "CLDMUX_AZURE_STORAGE_TOKEN";
         else if (scope == "https://management.azure.com/.default")
-            variable = "CLOUD_AZURE_MANAGEMENT_TOKEN";
+            variable = "CLDMUX_AZURE_MANAGEMENT_TOKEN";
         else
-            variable = "CLOUD_AZURE_BATCH_TOKEN";
+            variable = "CLDMUX_AZURE_BATCH_TOKEN";
         std::string token = gcp::detail::env(variable);
         if (token.empty())
             throw error(variable + " is required for this Azure operation");
@@ -469,7 +443,7 @@ inline config config_from_environment(std::string_view requested) {
         out.providers.clear();
         out.selection = selection::lowest_cost;
         out.prices = price_source::public_catalogue;
-        if (!gcp::detail::env("CLOUD_GCP_PROJECT").empty()) {
+        if (!gcp::detail::env("CLDMUX_GCP_PROJECT").empty()) {
             environment_gcp(out);
             out.providers.push_back("gcp");
         }
@@ -477,7 +451,7 @@ inline config config_from_environment(std::string_view requested) {
             environment_aws(out, true);
             out.providers.push_back("aws");
         }
-        if (!gcp::detail::env("CLOUD_AZURE_BATCH_ENDPOINT").empty()) {
+        if (!gcp::detail::env("CLDMUX_AZURE_BATCH_ENDPOINT").empty()) {
             environment_azure(out);
             out.providers.push_back("azure");
         }
@@ -683,12 +657,12 @@ inline void validate_provider_spec(std::string_view provider, const config& cfg,
 inline std::uint64_t memory_mib(double memory_gb);
 inline std::uint64_t fargate_memory_mib(const resources& requested);
 
-inline cloud::plan make_provider_plan(const config& cfg, const job_spec& spec,
+inline cldmux::plan make_provider_plan(const config& cfg, const job_spec& spec,
                                       std::string provider) {
     // Provider planning is deterministic and mutation-free. It validates both
     // portable and backend-specific contracts before exposing a native shape.
     validate_spec(spec);
-    cloud::plan out;
+    cldmux::plan out;
     out.provider = std::move(provider);
     if (!implemented(out.provider))
         throw error(out.provider + " backend is not implemented");
@@ -934,7 +908,7 @@ inline std::uint64_t azure_job_timeout_seconds(const job_spec& spec, const confi
            duration_seconds(cfg.final_log_timeout) + duration_seconds(cfg.request_timeout);
 }
 
-inline std::string batch_body(const job_spec& spec, const cloud::plan& chosen) {
+inline std::string batch_body(const job_spec& spec, const cldmux::plan& chosen) {
     // GCP Batch owns queueing and temporary VM lifecycle. The request creates one
     // task, blocks inherited project SSH keys, mounts GCS prefixes through GCS
     // FUSE, and lets Batch install GPU drivers when an accelerator is present.
@@ -949,7 +923,7 @@ inline std::string batch_body(const job_spec& spec, const cloud::plan& chosen) {
     for (std::size_t i = 0; i < spec.mounts.size(); ++i) {
         const auto& item = spec.mounts[i];
         const uri source = parse_uri(item.source);
-        const std::string host = "/mnt/disks/cloud-" + std::to_string(i);
+        const std::string host = "/mnt/disks/cldmux-" + std::to_string(i);
         const std::string remote = source.bucket + (source.key.empty() ? "" : "/" + source.key);
         if (!task_volumes.empty()) {
             task_volumes += ',';
@@ -1027,4 +1001,4 @@ inline std::string job_id(std::string value) {
 }
 
 } // namespace detail
-} // namespace cloud
+} // namespace cldmux

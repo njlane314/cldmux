@@ -1,6 +1,6 @@
-#include <cloud/api.hpp>
+#include <cldmux/api.hpp>
 
 int main() {
-    cloud::job_spec job;
+    cldmux::job_spec job;
     return job.resources.cpus == 1 ? 0 : 1;
 }

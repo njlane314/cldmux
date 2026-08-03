@@ -1,6 +1,6 @@
-int cloud_odr_a();
-int cloud_odr_b();
+int cldmux_odr_a();
+int cldmux_odr_b();
 
 int main() {
-    return cloud_odr_a() == cloud_odr_b() && cloud_odr_a() != 0 ? 0 : 1;
+    return cldmux_odr_a() == cldmux_odr_b() && cldmux_odr_a() != 0 ? 0 : 1;
 }
