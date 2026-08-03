@@ -4939,8 +4939,14 @@ inline std::optional<double> gcp_catalogue_price(const client_state& client,
     std::string page;
     std::unordered_set<std::string> seen_pages;
     std::size_t response_bytes = 0;
+    std::size_t pages = 0;
     constexpr std::size_t max_catalogue_response_bytes = 256 * 1024 * 1024;
     do {
+        // The byte budget bounds ordinary catalogues; this independent ceiling
+        // also bounds a hostile sequence of tiny pages with unique tokens.
+        if (pages == 1024)
+            throw error("GCP catalogue pagination exceeded 1,024 pages");
+        ++pages;
         // Small pages stay comfortably within the private response/tree limits,
         // even when individual SKU descriptions contain many pricing tiers.
         std::string url = endpoint + "/v1/services/6F81-5844-456A/skus?pageSize=200";
