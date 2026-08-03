@@ -51,12 +51,6 @@ jobs:
             standard: c++23
             packages: ''
             sanitise: false
-          - name: Clang 18 C++26 draft
-            os: ubuntu-24.04
-            cxx: clang++-18
-            standard: c++2c
-            packages: libcurl4-openssl-dev clang-18
-            sanitise: false
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7

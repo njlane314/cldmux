@@ -1,7 +1,7 @@
 # CLOUD
 
 [![Build](https://github.com/njlane314/cloud/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/njlane314/cloud/actions/workflows/ci.yml)
-![C++17 to C++26](https://img.shields.io/badge/C%2B%2B-17%20to%2026-00599C)
+![C++17 to C++23](https://img.shields.io/badge/C%2B%2B-17%20to%2023-00599C)
 
 `cloud.h` is one C++17-or-newer header for running a container on temporary cloud
 compute:
@@ -603,15 +603,7 @@ for AWS Spot observations, `config.zones`.
 ## C++ COMPATIBILITY
 
 C++17 is the minimum language version. The same public interface is checked in
-C++17, C++20, C++23, and C++26 modes; later modes do not enable a different API.
-The C++26 check verifies source compatibility with the evolving compiler mode,
-not that a compiler implements every C++26 library facility.
-
-The local C++26 target tries `-std=c++26` and then the older `-std=c++2c`
-spelling. It reports a skip when the selected compiler supports neither; choose
-a particular spelling with, for example,
-`make check-c++26 CXX26_STANDARD=c++2c`. CI uses Clang 18's `-std=c++2c` mode,
-so the C++26 check is required there rather than skipped.
+C++17, C++20, and C++23 modes; later modes do not enable a different API.
 
 ## TEST
 
@@ -621,14 +613,12 @@ make examples
 make check
 make check-c++20
 make check-c++23
-make check-c++26
 make check-standards
 make sanitize
 ```
 
 `make check` uses the C++17 baseline. `make check-standards` checks every
-supported language mode with the selected compiler; its C++26 step follows the
-graceful probing behaviour described above.
+supported language mode with the selected compiler.
 
 In C++20 and newer modes, the test cases use the sibling
 [`tst`](https://github.com/njlane314/tst) single-header library. C++17 uses a

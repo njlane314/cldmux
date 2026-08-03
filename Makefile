@@ -1,6 +1,5 @@
 CXX ?= c++
 CXX_STANDARD ?= c++17
-CXX26_STANDARD ?=
 CXXFLAGS ?= -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror
 CURL_FLAGS := $(shell curl-config --cflags --libs)
 TST_DIR ?= ../tst
@@ -8,7 +7,7 @@ TEST := /tmp/cloud-h-test
 EXAMPLE := /tmp/cloud-h-example
 RUN_EXAMPLE := /tmp/cloud-h-run
 
-.PHONY: check check-standards check-c++17 check-c++20 check-c++23 check-c++26 \
+.PHONY: check check-standards check-c++17 check-c++20 check-c++23 \
 	example examples sanitize
 check: example examples
 	awk '/^```cpp$$/ {code=1; next} code && /^```/ {exit} code {print}' README.md | \
@@ -79,7 +78,6 @@ check-standards:
 	$(MAKE) check-c++17
 	$(MAKE) check-c++20
 	$(MAKE) check-c++23
-	$(MAKE) check-c++26
 
 check-c++17:
 	$(MAKE) check CXX_STANDARD=c++17
@@ -89,34 +87,6 @@ check-c++20:
 
 check-c++23:
 	$(MAKE) check CXX_STANDARD=c++23
-
-# Compiler flag spellings are still transitional. Try the final spelling first,
-# then the widely supported draft spelling, unless the caller chooses one.
-check-c++26:
-	@standard="$(CXX26_STANDARD)"; \
-	if test -n "$$standard"; then \
-		candidates="$$standard"; \
-	else \
-		candidates="c++26 c++2c"; \
-	fi; \
-	for candidate in $$candidates; do \
-		if printf '%s\n' 'int main() {}' | \
-			$(CXX) -std=$$candidate -x c++ -fsyntax-only - >/dev/null 2>&1; then \
-			standard="$$candidate"; \
-			break; \
-		fi; \
-	done; \
-	if test -z "$$standard" || ! printf '%s\n' 'int main() {}' | \
-		$(CXX) -std=$$standard -x c++ -fsyntax-only - >/dev/null 2>&1; then \
-		if test -n "$(CXX26_STANDARD)"; then \
-			echo "C++26 check skipped: $(CXX) does not support -std=$(CXX26_STANDARD)"; \
-		else \
-			echo "C++26 check skipped: $(CXX) supports neither -std=c++26 nor -std=c++2c"; \
-		fi; \
-		exit 0; \
-	fi; \
-	echo "Checking C++26 compatibility with -std=$$standard"; \
-	$(MAKE) check CXX_STANDARD=$$standard
 
 example:
 	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. example.cpp \

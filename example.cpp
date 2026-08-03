@@ -23,7 +23,7 @@ int main(int argc, char* argv[]) {
 
         // job_spec is the provider-independent description of one invocation.
         // Member assignment (rather than designated initialisers) keeps this
-        // example valid in C++17 as well as C++20, C++23, and C++26 modes.
+        // example valid in C++17 as well as C++20 and C++23 modes.
         cloud::job_spec spec;
         spec.name = "simulation-42";
         spec.image = "ghcr.io/example/simulation:latest";
