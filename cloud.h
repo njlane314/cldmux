@@ -1,0 +1,5044 @@
+// cloud.h - small, direct cloud jobs for C++20.
+// C++20, libcurl >= 7.84, and nothing else. Link with: -lcurl -pthread
+//
+// GCP, AWS, and Azure Batch run one container job, expose its logs, and clean
+// up the controller resources. GCS storage and raw GCE controls are included.
+//
+// Typical code stays in namespace cloud: construct config and client, call
+// plan() to validate and resolve a native shape, then call run() to submit. The
+// cloud::gcp namespace exposes the lower-level GCS/GCE primitives used by the
+// portable facade. All definitions are inline; include this file directly and
+// link with libcurl and the platform thread library.
+//
+// Reading map:
+//   1. Low-level GCP values, transport, authentication, storage, and compute
+//   2. Portable job/configuration types
+//   3. Planning, pricing, provider lifecycle, and submission internals
+//   4. Public storage, compute, job, and client handles
+//
+// plan() never allocates compute. It can perform read-only pricing requests
+// when public catalog lookup is enabled. run(), storage(), and compute() can
+// mutate cloud resources and therefore require suitable credentials and IAM.
+
+#ifndef NJLANE314_CLOUD_H_INCLUDED
+#define NJLANE314_CLOUD_H_INCLUDED
+
+#define CLOUD_H_VERSION "0.2.0"
+#define CLOUD_H_VERSION_NUM 0x000200
+
+// Dependencies and compile-time contract --------------------------------------
+
+#include <curl/curl.h>
+
+#include <algorithm>
+#include <array>
+#include <charconv>
+#include <chrono>
+#include <cmath>
+#include <cstdint>
+#include <ctime>
+#include <cstdlib>
+#include <exception>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <iomanip>
+#include <limits>
+#include <locale>
+#include <map>
+#include <memory>
+#include <mutex>
+#include <optional>
+#include <random>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <thread>
+#include <tuple>
+#include <unordered_set>
+#include <utility>
+#include <variant>
+#include <vector>
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wmissing-field-initializers"
+#endif
+
+namespace cloud {
+namespace detail {
+struct client_state;
+}
+} // namespace cloud
+namespace cloud::gcp {
+
+inline constexpr std::string_view version = CLOUD_H_VERSION;
+
+// Low-level GCP configuration and public values -------------------------------
+
+// Every provider-facing failure uses the same exception type. HTTP failures
+// retain the status and a compact response body for programmatic diagnostics;
+// validation and transport failures leave http_status() as zero.
+class Error : public std::runtime_error {
+public:
+    explicit Error(std::string message, long http_status = 0, std::string response = {})
+        : std::runtime_error(std::move(message)), http_status_(http_status),
+          response_(std::move(response)) {}
+
+    [[nodiscard]] long http_status() const noexcept { return http_status_; }
+    [[nodiscard]] const std::string& response() const noexcept { return response_; }
+
+private:
+    long http_status_ = 0;
+    std::string response_;
+};
+
+// Token callbacks may provide an expiry and a quota/billing project. A missing
+// expiry means the token is treated as non-expiring; a zero time point receives
+// a conservative 50-minute lifetime when cached.
+struct AccessToken {
+    std::string value;
+    std::chrono::system_clock::time_point expires_at = std::chrono::system_clock::time_point::max();
+    std::string quota_project;
+};
+
+namespace detail {
+AccessToken automatic_token();
+AccessToken metadata_token();
+} // namespace detail
+
+// Copyable, lazy GCP bearer credentials. Copies share a mutex-protected token
+// cache, which lets clients and handles refresh one callback result together.
+class Credentials {
+public:
+    using Provider = std::function<AccessToken()>;
+
+    Credentials() : Credentials(automatic()) {}
+
+    static Credentials automatic() {
+        return from([] { return detail::automatic_token(); });
+    }
+    static Credentials metadata() {
+        return from([] { return detail::metadata_token(); });
+    }
+
+    static Credentials bearer(std::string token) {
+        if (token.empty())
+            throw Error("Bearer token must not be empty");
+        return from([token = std::move(token)] {
+            return AccessToken{token, std::chrono::system_clock::time_point::max(), {}};
+        });
+    }
+
+    static Credentials from(Provider provider) {
+        if (!provider)
+            throw Error("Credential provider must not be empty");
+        return Credentials(std::make_shared<State>(std::move(provider)));
+    }
+
+    // Copies share one cache. Tokens refresh five minutes early so a request
+    // does not start with a credential likely to expire in flight.
+    [[nodiscard]] AccessToken access_token() const {
+        std::lock_guard lock(state_->mutex);
+        const auto now = std::chrono::system_clock::now();
+        if (state_->cached.value.empty() ||
+            state_->cached.expires_at <= now + std::chrono::minutes(5)) {
+            auto fresh = state_->provider();
+            if (fresh.value.empty())
+                throw Error("Credential provider returned an empty token");
+            if (fresh.expires_at == std::chrono::system_clock::time_point{}) {
+                fresh.expires_at = now + std::chrono::minutes(50);
+            }
+            state_->cached = std::move(fresh);
+        }
+        return state_->cached;
+    }
+
+    void invalidate() const {
+        std::lock_guard lock(state_->mutex);
+        state_->cached = {};
+    }
+
+private:
+    struct State {
+        explicit State(Provider p) : provider(std::move(p)) {}
+        Provider provider;
+        AccessToken cached;
+        std::mutex mutex;
+    };
+
+    explicit Credentials(std::shared_ptr<State> state) : state_(std::move(state)) {}
+    std::shared_ptr<State> state_;
+};
+
+// Configuration for the low-level cloud::gcp API. The portable cloud::config
+// below is normally preferable for jobs spanning more than one provider.
+struct Config {
+    // Empty values are discovered from GOOGLE_CLOUD_PROJECT / GOOGLE_CLOUD_ZONE,
+    // then the GCP metadata server.
+    std::string project;
+    std::string zone;
+    Credentials credentials;
+
+    // Explicit value wins; GOOGLE_CLOUD_QUOTA_PROJECT is the fallback. Leave
+    // empty for resource-based quota.
+    std::string quota_project;
+    std::chrono::milliseconds timeout{60'000};
+    std::chrono::milliseconds transfer_timeout{std::chrono::hours(1)};
+
+    // Endpoint overrides are handy for emulators, private proxies, and tests.
+    // Plain HTTP is rejected unless this is set explicitly.
+    bool allow_insecure_http = false;
+    std::string storage_endpoint = "https://storage.googleapis.com";
+    std::string compute_endpoint = "https://compute.googleapis.com";
+    std::string batch_endpoint = "https://batch.googleapis.com";
+    std::string logging_endpoint = "https://logging.googleapis.com";
+};
+
+// Cloud Storage metadata returned by stat/list/upload operations. Times and
+// hashes retain the spelling returned by the JSON API.
+struct Object {
+    std::string name;
+    std::string generation;
+    std::uint64_t size = 0;
+    std::string content_type;
+    std::string updated;
+    std::string etag;
+    std::string crc32c;
+    std::string md5_hash;
+};
+
+// A delimiter-based listing may contain both concrete objects and common
+// prefixes. Pagination is hidden by Bucket::list().
+struct ObjectList {
+    std::vector<Object> objects;
+    std::vector<std::string> prefixes;
+};
+
+struct ListOptions {
+    std::string prefix;
+    std::string delimiter;
+    bool versions = false;
+    // Zero means fetch every page. Otherwise stop after this many objects.
+    std::size_t limit = 0;
+};
+
+struct PutOptions {
+    std::string content_type = "application/octet-stream";
+    // "0" means create-only. A known generation means compare-and-replace.
+    std::optional<std::string> if_generation_match;
+    bool crc32c = true;
+};
+
+// A compact view of one GCE instance; absent IPs remain empty strings.
+struct Instance {
+    std::string id;
+    std::string name;
+    std::string zone;
+    std::string machine_type;
+    std::string status;
+    std::string internal_ip;
+    std::string external_ip;
+    std::string creation_timestamp;
+};
+
+class Cloud;
+class Bucket;
+class Vm;
+class Operation;
+
+// Internal encoding and JSON ---------------------------------------------------
+
+namespace detail {
+
+// Cloud identifiers and JSON are ASCII grammars. Unlike <cctype>, these
+// helpers are independent of the process-wide C locale and accept plain char.
+inline bool is_ascii_digit(char c) { return c >= '0' && c <= '9'; }
+inline bool is_ascii_lower(char c) { return c >= 'a' && c <= 'z'; }
+inline bool is_ascii_upper(char c) { return c >= 'A' && c <= 'Z'; }
+inline bool is_ascii_alpha(char c) { return is_ascii_lower(c) || is_ascii_upper(c); }
+inline bool is_ascii_alnum(char c) { return is_ascii_alpha(c) || is_ascii_digit(c); }
+inline bool is_ascii_space(char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+inline bool is_json_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+inline char ascii_lower(char c) {
+    return is_ascii_upper(c) ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
+inline std::string trim(std::string value) {
+    const auto not_space = [](char c) { return !is_ascii_space(c); };
+    value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+    value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
+    return value;
+}
+
+inline std::string env(std::string_view name) {
+    const std::string key(name);
+    if (const char* value = std::getenv(key.c_str()))
+        return value;
+    return {};
+}
+
+inline std::string header(std::string_view name, std::string_view value) {
+    if (value.find('\r') != std::string_view::npos || value.find('\n') != std::string_view::npos)
+        throw Error("Invalid newline in HTTP header value");
+    return std::string(name) + ": " + std::string(value);
+}
+
+inline std::string base_url(std::string value) {
+    while (!value.empty() && value.back() == '/')
+        value.pop_back();
+    return value;
+}
+
+inline std::string encode(std::string_view input) {
+    static constexpr char hex[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(input.size() + input.size() / 4);
+    for (const char raw : input) {
+        const auto c = static_cast<unsigned char>(raw);
+        const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                                (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' ||
+                                c == '~';
+        if (unreserved) {
+            out.push_back(static_cast<char>(c));
+        } else {
+            out.push_back('%');
+            out.push_back(hex[c >> 4]);
+            out.push_back(hex[c & 0x0f]);
+        }
+    }
+    return out;
+}
+
+inline std::string json_quote(std::string_view value) {
+    static constexpr char hex[] = "0123456789abcdef";
+    std::string out;
+    out.reserve(value.size() + 2);
+    out.push_back('"');
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        switch (c) {
+        case '"':
+            out += "\\\"";
+            break;
+        case '\\':
+            out += "\\\\";
+            break;
+        case '\b':
+            out += "\\b";
+            break;
+        case '\f':
+            out += "\\f";
+            break;
+        case '\n':
+            out += "\\n";
+            break;
+        case '\r':
+            out += "\\r";
+            break;
+        case '\t':
+            out += "\\t";
+            break;
+        default:
+            if (c < 0x20) {
+                out += "\\u00";
+                out.push_back(hex[c >> 4]);
+                out.push_back(hex[c & 0x0f]);
+            } else {
+                out.push_back(static_cast<char>(c));
+            }
+        }
+    }
+    out.push_back('"');
+    return out;
+}
+
+// A deliberately small read-only JSON value. Numbers retain their original
+// spelling so identifiers and provider counters are never rounded through a
+// floating-point representation.
+class Json {
+public:
+    struct Number {
+        std::string text;
+    };
+    using Array = std::vector<Json>;
+    using Object = std::map<std::string, Json, std::less<>>;
+    using Value = std::variant<std::nullptr_t, bool, std::string, Number, Array, Object>;
+
+    Json() : value_(nullptr) {}
+    explicit Json(Value value) : value_(std::move(value)) {}
+
+    [[nodiscard]] bool is_object() const { return std::holds_alternative<Object>(value_); }
+
+    [[nodiscard]] const Object& object() const {
+        static const Object empty;
+        if (const auto* p = std::get_if<Object>(&value_))
+            return *p;
+        return empty;
+    }
+
+    [[nodiscard]] const Array& array() const {
+        static const Array empty;
+        if (const auto* p = std::get_if<Array>(&value_))
+            return *p;
+        return empty;
+    }
+
+    [[nodiscard]] const Json* get(std::string_view key) const {
+        const auto* obj = std::get_if<Object>(&value_);
+        if (!obj)
+            return nullptr;
+        const auto it = obj->find(key);
+        return it == obj->end() ? nullptr : &it->second;
+    }
+
+    [[nodiscard]] std::string text(std::string fallback = {}) const {
+        if (const auto* p = std::get_if<std::string>(&value_))
+            return *p;
+        if (const auto* p = std::get_if<Number>(&value_))
+            return p->text;
+        return fallback;
+    }
+
+    [[nodiscard]] bool boolean(bool fallback = false) const {
+        if (const auto* p = std::get_if<bool>(&value_))
+            return *p;
+        return fallback;
+    }
+
+private:
+    Value value_;
+};
+
+// Strict recursive-descent parser for provider responses. It accepts exactly
+// JSON whitespace/number/string grammar and converts Unicode escapes to UTF-8.
+class JsonParser {
+public:
+    explicit JsonParser(std::string_view input) : input_(input) {}
+
+    Json parse() {
+        whitespace();
+        Json value = parse_value();
+        whitespace();
+        if (position_ != input_.size())
+            fail("trailing characters");
+        return value;
+    }
+
+private:
+    [[noreturn]] void fail(std::string_view why) const {
+        throw Error("Invalid JSON at byte " + std::to_string(position_) + ": " + std::string(why));
+    }
+
+    void whitespace() {
+        while (position_ < input_.size() && is_json_space(input_[position_]))
+            ++position_;
+    }
+
+    char take() {
+        if (position_ >= input_.size())
+            fail("unexpected end");
+        return input_[position_++];
+    }
+
+    bool consume(std::string_view token) {
+        if (input_.substr(position_, token.size()) != token)
+            return false;
+        position_ += token.size();
+        return true;
+    }
+
+    Json parse_value() {
+        whitespace();
+        if (position_ >= input_.size())
+            fail("expected value");
+        switch (input_[position_]) {
+        case 'n':
+            if (consume("null"))
+                return Json(nullptr);
+            break;
+        case 't':
+            if (consume("true"))
+                return Json(true);
+            break;
+        case 'f':
+            if (consume("false"))
+                return Json(false);
+            break;
+        case '"':
+            return Json(parse_string());
+        case '[':
+            return parse_array();
+        case '{':
+            return parse_object();
+        default:
+            if (input_[position_] == '-' || is_ascii_digit(input_[position_]))
+                return parse_number();
+        }
+        fail("expected value");
+    }
+
+    static void append_utf8(std::string& out, std::uint32_t cp) {
+        if (cp <= 0x7f) {
+            out.push_back(static_cast<char>(cp));
+            return;
+        }
+        static constexpr unsigned char lead[] = {0, 0, 0xc0, 0xe0, 0xf0};
+        const int bytes = cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+        out.push_back(static_cast<char>(lead[bytes] | (cp >> (6 * (bytes - 1)))));
+        for (int shift = 6 * (bytes - 2); shift >= 0; shift -= 6)
+            out.push_back(static_cast<char>(0x80 | ((cp >> shift) & 0x3f)));
+    }
+
+    std::uint32_t hex4() {
+        std::uint32_t value = 0;
+        for (int i = 0; i < 4; ++i) {
+            const char c = take();
+            value <<= 4;
+            if (c >= '0' && c <= '9')
+                value |= static_cast<unsigned>(c - '0');
+            else if (c >= 'a' && c <= 'f')
+                value |= static_cast<unsigned>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F')
+                value |= static_cast<unsigned>(c - 'A' + 10);
+            else
+                fail("invalid unicode escape");
+        }
+        return value;
+    }
+
+    std::string parse_string() {
+        if (take() != '"')
+            fail("expected string");
+        std::string out;
+        while (true) {
+            const unsigned char c = static_cast<unsigned char>(take());
+            if (c == '"')
+                return out;
+            if (c < 0x20)
+                fail("control character in string");
+            if (c != '\\') {
+                out.push_back(static_cast<char>(c));
+                continue;
+            }
+            switch (take()) {
+            case '"':
+                out.push_back('"');
+                break;
+            case '\\':
+                out.push_back('\\');
+                break;
+            case '/':
+                out.push_back('/');
+                break;
+            case 'b':
+                out.push_back('\b');
+                break;
+            case 'f':
+                out.push_back('\f');
+                break;
+            case 'n':
+                out.push_back('\n');
+                break;
+            case 'r':
+                out.push_back('\r');
+                break;
+            case 't':
+                out.push_back('\t');
+                break;
+            case 'u': {
+                std::uint32_t cp = hex4();
+                if (cp >= 0xd800 && cp <= 0xdbff) {
+                    if (take() != '\\' || take() != 'u')
+                        fail("invalid surrogate pair");
+                    const std::uint32_t low = hex4();
+                    if (low < 0xdc00 || low > 0xdfff)
+                        fail("invalid surrogate pair");
+                    cp = 0x10000 + ((cp - 0xd800) << 10) + (low - 0xdc00);
+                } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+                    fail("unpaired low surrogate");
+                }
+                append_utf8(out, cp);
+                break;
+            }
+            default:
+                fail("invalid string escape");
+            }
+        }
+    }
+
+    Json parse_number() {
+        const std::size_t begin = position_;
+        if (input_[position_] == '-')
+            ++position_;
+        if (position_ >= input_.size())
+            fail("invalid number");
+        if (input_[position_] == '0') {
+            ++position_;
+        } else {
+            digits("invalid number");
+        }
+        if (position_ < input_.size() && input_[position_] == '.') {
+            ++position_;
+            digits("invalid number");
+        }
+        if (position_ < input_.size() && (input_[position_] == 'e' || input_[position_] == 'E')) {
+            ++position_;
+            if (position_ < input_.size() && (input_[position_] == '+' || input_[position_] == '-'))
+                ++position_;
+            digits("invalid exponent");
+        }
+        return Json(Json::Number{std::string(input_.substr(begin, position_ - begin))});
+    }
+
+    void digits(std::string_view error) {
+        if (position_ >= input_.size() || !is_ascii_digit(input_[position_]))
+            fail(error);
+        while (position_ < input_.size() && is_ascii_digit(input_[position_]))
+            ++position_;
+    }
+
+    template <typename Collection, typename Append>
+    Json parse_collection(char close, std::string_view separator_error, Collection out,
+                          Append append) {
+        take();
+        whitespace();
+        if (position_ < input_.size() && input_[position_] == close) {
+            ++position_;
+            return Json(std::move(out));
+        }
+        while (true) {
+            append(out);
+            whitespace();
+            const char separator = take();
+            if (separator == close)
+                return Json(std::move(out));
+            if (separator != ',')
+                fail(separator_error);
+            whitespace();
+        }
+    }
+
+    Json parse_array() {
+        return parse_collection(']', "expected ',' or ']'", Json::Array{},
+                                [&](auto& out) { out.push_back(parse_value()); });
+    }
+
+    Json parse_object() {
+        return parse_collection('}', "expected ',' or '}'", Json::Object{}, [&](auto& out) {
+            if (position_ >= input_.size() || input_[position_] != '"')
+                fail("expected object key");
+            std::string key = parse_string();
+            whitespace();
+            if (take() != ':')
+                fail("expected ':'");
+            whitespace();
+            out.emplace(std::move(key), parse_value());
+        });
+    }
+
+    std::string_view input_;
+    std::size_t position_ = 0;
+};
+
+inline Json parse_json(std::string_view text) { return JsonParser(text).parse(); }
+
+inline std::string field(const Json& value, std::string_view key) {
+    const Json* child = value.get(key);
+    return child ? child->text() : std::string{};
+}
+
+template <typename Function>
+inline void for_each_json(const Json& value, std::string_view key, Function function) {
+    if (const auto* items = value.get(key))
+        for (const auto& item : items->array())
+            function(item);
+}
+
+template <typename Item, typename Fetch, typename Parse, typename Visit>
+inline std::vector<Item> paginate(std::size_t limit, Fetch fetch, Parse parse, Visit visit) {
+    // Fetch owns the request, Parse converts each "items" entry, and Visit can
+    // collect side channels such as common prefixes. A nonzero limit stops
+    // before requesting another page once enough concrete items are present.
+    std::vector<Item> result;
+    std::string page;
+    do {
+        const Json json = fetch(page);
+        for_each_json(json, "items", [&](const Json& item) {
+            if (!limit || result.size() < limit)
+                result.push_back(parse(item));
+        });
+        visit(json);
+        page = limit && result.size() >= limit ? std::string{} : field(json, "nextPageToken");
+    } while (!page.empty());
+    return result;
+}
+
+inline std::uint64_t unsigned_field(const Json& value, std::string_view key) {
+    const std::string text = field(value, key);
+    if (text.empty())
+        return 0;
+    try {
+        return std::stoull(text);
+    } catch (...) {
+        throw Error("Invalid unsigned integer in JSON field '" + std::string(key) + "'");
+    }
+}
+
+inline std::string last_path_segment(std::string value) {
+    const auto slash = value.find_last_of('/');
+    return slash == std::string::npos ? value : value.substr(slash + 1);
+}
+
+// GCS exposes CRC32C as base64-encoded, big-endian bytes. Keeping the small
+// Castagnoli implementation here avoids another runtime dependency.
+inline std::uint32_t crc32c_update(std::uint32_t crc, const unsigned char* data, std::size_t size) {
+    crc = ~crc;
+    for (std::size_t i = 0; i < size; ++i) {
+        crc ^= data[i];
+        for (int bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1u)));
+    }
+    return ~crc;
+}
+
+inline std::string crc32c_base64(std::uint32_t crc) {
+    static constexpr char alphabet[] =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const std::array<unsigned char, 4> bytes{
+        static_cast<unsigned char>(crc >> 24), static_cast<unsigned char>(crc >> 16),
+        static_cast<unsigned char>(crc >> 8), static_cast<unsigned char>(crc)};
+    std::string out;
+    out.reserve(8);
+    out.push_back(alphabet[bytes[0] >> 2]);
+    out.push_back(alphabet[((bytes[0] & 3) << 4) | (bytes[1] >> 4)]);
+    out.push_back(alphabet[((bytes[1] & 15) << 2) | (bytes[2] >> 6)]);
+    out.push_back(alphabet[bytes[2] & 63]);
+    out.push_back(alphabet[bytes[3] >> 2]);
+    out.push_back(alphabet[(bytes[3] & 3) << 4]);
+    out += "==";
+    return out;
+}
+
+inline std::string crc32c(std::string_view data) {
+    return crc32c_base64(
+        crc32c_update(0, reinterpret_cast<const unsigned char*>(data.data()), data.size()));
+}
+
+// File uploads are pre-sized and optionally checksummed before libcurl sees
+// them. The shared state keeps the stream alive across retryable requests.
+struct UploadSource {
+    std::filesystem::path path;
+    std::shared_ptr<std::ifstream> stream;
+    curl_off_t size = 0;
+    std::string crc32c;
+};
+
+inline std::shared_ptr<UploadSource> prepare_upload(const std::filesystem::path& path,
+                                                    bool checksum) {
+    auto stream = std::make_shared<std::ifstream>(path, std::ios::binary);
+    if (!*stream)
+        throw Error("Cannot open upload file: " + path.string());
+    stream->seekg(0, std::ios::end);
+    const std::streampos end = stream->tellg();
+    if (end == std::streampos(-1))
+        throw Error("Cannot determine upload file size: " + path.string());
+    const std::streamoff length = end;
+    if (length < 0 || static_cast<std::uintmax_t>(length) >
+                          static_cast<std::uintmax_t>(std::numeric_limits<curl_off_t>::max()))
+        throw Error("Upload file is too large for libcurl: " + path.string());
+    stream->seekg(0, std::ios::beg);
+    if (!*stream)
+        throw Error("Cannot seek upload file: " + path.string());
+
+    std::string digest;
+    if (checksum) {
+        std::array<char, 64 * 1024> buffer{};
+        std::uint32_t crc = 0;
+        while (stream->read(buffer.data(), static_cast<std::streamsize>(buffer.size())) ||
+               stream->gcount() > 0) {
+            const auto count = stream->gcount();
+            crc = crc32c_update(crc, reinterpret_cast<const unsigned char*>(buffer.data()),
+                                static_cast<std::size_t>(count));
+        }
+        if (stream->bad())
+            throw Error("Failed while checksumming upload file: " + path.string());
+        digest = crc32c_base64(crc);
+        stream->clear();
+        stream->seekg(0, std::ios::beg);
+        if (!*stream)
+            throw Error("Cannot rewind upload file: " + path.string());
+    }
+    return std::make_shared<UploadSource>(
+        UploadSource{path, std::move(stream), static_cast<curl_off_t>(length), std::move(digest)});
+}
+
+// RFC 4122 version-4 spelling used for provider idempotency/request IDs. These
+// IDs prevent accidental duplicate mutations; they are not authentication data.
+inline std::string random_uuid() {
+    thread_local std::mt19937_64 random = [] {
+        std::random_device source;
+        std::array<std::uint32_t, 8> seed{};
+        for (auto& word : seed)
+            word = source();
+        std::seed_seq sequence(seed.begin(), seed.end());
+        return std::mt19937_64(sequence);
+    }();
+    std::uniform_int_distribution<unsigned> byte(0, 255);
+    std::array<unsigned char, 16> data{};
+    for (auto& value : data)
+        value = static_cast<unsigned char>(byte(random));
+    data[6] = static_cast<unsigned char>((data[6] & 0x0f) | 0x40);
+    data[8] = static_cast<unsigned char>((data[8] & 0x3f) | 0x80);
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (std::size_t i = 0; i < data.size(); ++i) {
+        if (i == 4 || i == 6 || i == 8 || i == 10)
+            out << '-';
+        out << std::setw(2) << static_cast<unsigned>(data[i]);
+    }
+    return out.str();
+}
+
+// libcurl transport ------------------------------------------------------------
+
+struct CurlGlobal {
+    CurlGlobal() {
+        const CURLcode code = curl_global_init(CURL_GLOBAL_DEFAULT);
+        if (code != CURLE_OK)
+            throw Error("curl_global_init failed");
+        const curl_version_info_data* info = curl_version_info(CURLVERSION_NOW);
+        if (!info || !(info->features & CURL_VERSION_THREADSAFE))
+            throw Error("cloud.h requires a thread-safe libcurl build");
+    }
+    // Deliberately process-lifetime: destructor-time cleanup can race clients
+    // owned by other static objects.
+    ~CurlGlobal() = default;
+};
+
+static_assert(LIBCURL_VERSION_NUM >= 0x075400, "cloud.h requires libcurl 7.84.0 or newer");
+
+inline void ensure_curl() {
+    static CurlGlobal global;
+    (void)global;
+}
+
+// One internal HTTP request. Bodies and file streams are mutually exclusive;
+// downloads may request streaming CRC32C verification before the destination is
+// committed. AwsSignature delegates SigV4 canonicalization to libcurl.
+struct HttpRequest {
+    std::string method = "GET";
+    std::string url;
+    std::vector<std::string> headers;
+    std::string body;
+    std::shared_ptr<UploadSource> upload_file;
+    std::optional<std::filesystem::path> download_file;
+    std::optional<std::string> expected_crc32c;
+    bool calculate_crc32c = false;
+    bool accept_json = true;
+    bool no_proxy = false;
+    std::optional<std::chrono::milliseconds> timeout;
+    std::chrono::milliseconds connect_timeout{10'000};
+    struct AwsSignature {
+        std::string access_key_id;
+        std::string secret_access_key;
+        std::string session_token;
+        std::string region;
+        std::string service;
+    };
+    std::optional<AwsSignature> aws_signature;
+};
+
+// Response headers use lowercase names. crc32c is populated only when the
+// request asked the write callback to calculate it.
+struct HttpResponse {
+    long status = 0;
+    std::string body;
+    std::string crc32c;
+    std::map<std::string, std::string, std::less<>> headers;
+};
+
+// libcurl callbacks are C boundaries and must not throw. They record exceptions
+// and I/O failures here so http() can rethrow after curl_easy_perform returns.
+struct WriteSink {
+    std::string* text = nullptr;
+    std::ofstream* file = nullptr;
+    bool checksum = false;
+    std::uint32_t crc = 0;
+    bool io_error = false;
+    std::exception_ptr exception;
+};
+
+struct HeaderSink {
+    std::map<std::string, std::string, std::less<>>* headers = nullptr;
+    std::exception_ptr exception;
+};
+
+inline std::size_t header_callback(char* data, std::size_t size, std::size_t count,
+                                   void* userdata) noexcept {
+    auto& sink = *static_cast<HeaderSink*>(userdata);
+    try {
+        if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size)
+            return 0;
+        const std::size_t bytes = size * count;
+        std::string_view line(data, bytes);
+        const auto colon = line.find(':');
+        if (colon != std::string_view::npos) {
+            std::string name(line.substr(0, colon));
+            std::transform(name.begin(), name.end(), name.begin(), ascii_lower);
+            std::string value(line.substr(colon + 1));
+            value = trim(std::move(value));
+            (*sink.headers)[std::move(name)] = std::move(value);
+        }
+        return bytes;
+    } catch (...) {
+        sink.exception = std::current_exception();
+        return 0;
+    }
+}
+
+inline std::size_t write_callback(char* data, std::size_t size, std::size_t count,
+                                  void* userdata) noexcept {
+    auto& sink = *static_cast<WriteSink*>(userdata);
+    try {
+        if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) {
+            sink.io_error = true;
+            return 0;
+        }
+        const std::size_t bytes = size * count;
+        if (sink.file) {
+            if (bytes > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
+                sink.io_error = true;
+                return 0;
+            }
+            sink.file->write(data, static_cast<std::streamsize>(bytes));
+            if (!*sink.file) {
+                sink.io_error = true;
+                return 0;
+            }
+        } else {
+            sink.text->append(data, bytes);
+        }
+        if (sink.checksum)
+            sink.crc = crc32c_update(sink.crc, reinterpret_cast<const unsigned char*>(data), bytes);
+        return bytes;
+    } catch (...) {
+        sink.exception = std::current_exception();
+        return 0;
+    }
+}
+
+struct ReadSource {
+    std::ifstream* stream = nullptr;
+    curl_off_t remaining = 0;
+    bool io_error = false;
+    std::exception_ptr exception;
+};
+
+inline std::size_t read_callback(char* data, std::size_t size, std::size_t count,
+                                 void* userdata) noexcept {
+    auto& source = *static_cast<ReadSource*>(userdata);
+    try {
+        if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size) {
+            source.io_error = true;
+            return CURL_READFUNC_ABORT;
+        }
+        std::size_t capacity = size * count;
+        if (source.remaining <= 0)
+            return 0;
+        if (static_cast<std::uintmax_t>(source.remaining) < capacity)
+            capacity = static_cast<std::size_t>(source.remaining);
+        if (capacity > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
+            source.io_error = true;
+            return CURL_READFUNC_ABORT;
+        }
+        source.stream->read(data, static_cast<std::streamsize>(capacity));
+        if (source.stream->bad()) {
+            source.io_error = true;
+            return CURL_READFUNC_ABORT;
+        }
+        const auto received = source.stream->gcount();
+        if (received <= 0) {
+            source.io_error = true;
+            return CURL_READFUNC_ABORT;
+        }
+        source.remaining -= static_cast<curl_off_t>(received);
+        return static_cast<std::size_t>(received);
+    } catch (...) {
+        source.exception = std::current_exception();
+        return CURL_READFUNC_ABORT;
+    }
+}
+
+inline void curl_check(CURLcode code, std::string_view action) {
+    if (code != CURLE_OK)
+        throw Error("libcurl " + std::string(action) + " failed: " + curl_easy_strerror(code));
+}
+
+template <typename Value> inline void curl_set(CURL* curl, CURLoption option, Value value) {
+    curl_check(curl_easy_setopt(curl, option, value), "configuration");
+}
+
+inline long curl_milliseconds(std::chrono::milliseconds value, std::string_view name) {
+    if (value <= std::chrono::milliseconds::zero() ||
+        value.count() > std::numeric_limits<long>::max())
+        throw Error(std::string(name) + " must be a positive libcurl duration");
+    return static_cast<long>(value.count());
+}
+
+inline curl_off_t curl_size(std::size_t value) {
+    if (value > static_cast<std::size_t>(std::numeric_limits<curl_off_t>::max()))
+        throw Error("HTTP request body is too large for libcurl");
+    return static_cast<curl_off_t>(value);
+}
+
+inline std::string read_small_file(const std::filesystem::path& path,
+                                   std::size_t max_bytes = 64 * 1024) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        return {};
+    std::string result(max_bytes, '\0');
+    input.read(result.data(), static_cast<std::streamsize>(result.size()));
+    result.resize(static_cast<std::size_t>(input.gcount()));
+    return result;
+}
+
+inline void remove_noexcept(const std::filesystem::path& path) noexcept {
+    std::error_code ignored;
+    (void)std::filesystem::remove(path, ignored);
+}
+
+// Removes an uncommitted download path during stack unwinding. dismiss() is
+// called only after verification and destination replacement succeed.
+class TemporaryPathGuard {
+public:
+    TemporaryPathGuard() = default;
+    explicit TemporaryPathGuard(std::filesystem::path path)
+        : path_(std::move(path)), active_(true) {}
+    TemporaryPathGuard(const TemporaryPathGuard&) = delete;
+    TemporaryPathGuard& operator=(const TemporaryPathGuard&) = delete;
+    ~TemporaryPathGuard() {
+        if (active_)
+            remove_noexcept(path_);
+    }
+    void dismiss() noexcept { active_ = false; }
+
+private:
+    std::filesystem::path path_;
+    bool active_ = false;
+};
+
+// Execute exactly one HTTP transaction; provider-level helpers own retries.
+// File downloads stream into a sibling temporary file, verify any expected
+// checksum, and only then replace the destination. The compatibility fallback
+// restores an existing destination if a platform cannot replace it atomically.
+inline HttpResponse http(HttpRequest request) {
+    ensure_curl();
+    std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), &curl_easy_cleanup);
+    if (!curl)
+        throw Error("curl_easy_init failed");
+
+    char error_buffer[CURL_ERROR_SIZE] = {};
+    curl_set(curl.get(), CURLOPT_ERRORBUFFER, error_buffer);
+    curl_set(curl.get(), CURLOPT_URL, request.url.c_str());
+    curl_set(curl.get(), CURLOPT_NOSIGNAL, 1L);
+    curl_set(curl.get(), CURLOPT_FOLLOWLOCATION, 0L);
+#if LIBCURL_VERSION_NUM >= 0x075500
+    curl_set(curl.get(), CURLOPT_PROTOCOLS_STR, "http,https");
+#else
+    curl_set(curl.get(), CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
+    curl_set(curl.get(), CURLOPT_TIMEOUT_MS,
+             curl_milliseconds(request.timeout.value_or(std::chrono::milliseconds(60'000)),
+                               "HTTP timeout"));
+    curl_set(curl.get(), CURLOPT_CONNECTTIMEOUT_MS,
+             curl_milliseconds(request.connect_timeout, "HTTP connect timeout"));
+    curl_set(curl.get(), CURLOPT_USERAGENT, "cloud.h/" CLOUD_H_VERSION);
+    if (request.no_proxy)
+        curl_set(curl.get(), CURLOPT_NOPROXY, "*");
+
+    std::string aws_scope;
+    std::string aws_user;
+    if (request.aws_signature) {
+        const auto& signature = *request.aws_signature;
+        if (signature.access_key_id.empty() || signature.secret_access_key.empty() ||
+            signature.region.empty() || signature.service.empty())
+            throw Error("Incomplete AWS request-signing configuration");
+        aws_scope = "aws:amz:" + signature.region + ':' + signature.service;
+        aws_user = signature.access_key_id + ':' + signature.secret_access_key;
+        curl_set(curl.get(), CURLOPT_AWS_SIGV4, aws_scope.c_str());
+        curl_set(curl.get(), CURLOPT_USERPWD, aws_user.c_str());
+        if (!signature.session_token.empty())
+            request.headers.push_back(header("X-Amz-Security-Token", signature.session_token));
+    }
+
+    curl_slist* raw_headers = nullptr;
+    for (const auto& header : request.headers) {
+        curl_slist* appended = curl_slist_append(raw_headers, header.c_str());
+        if (!appended) {
+            curl_slist_free_all(raw_headers);
+            throw Error("libcurl could not allocate request headers");
+        }
+        raw_headers = appended;
+    }
+    std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(raw_headers,
+                                                                        &curl_slist_free_all);
+    if (headers)
+        curl_set(curl.get(), CURLOPT_HTTPHEADER, headers.get());
+
+    ReadSource upload_source;
+    if (request.upload_file) {
+        auto& upload = *request.upload_file->stream;
+        upload.clear();
+        upload.seekg(0, std::ios::beg);
+        if (!upload)
+            throw Error("Cannot rewind upload file: " + request.upload_file->path.string());
+        upload_source.stream = &upload;
+        upload_source.remaining = request.upload_file->size;
+        curl_set(curl.get(), CURLOPT_POST, 1L);
+        curl_set(curl.get(), CURLOPT_READFUNCTION, &read_callback);
+        curl_set(curl.get(), CURLOPT_READDATA, &upload_source);
+        curl_set(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, request.upload_file->size);
+    } else if (request.method == "POST") {
+        curl_set(curl.get(), CURLOPT_POST, 1L);
+        curl_set(curl.get(), CURLOPT_POSTFIELDS, request.body.data());
+        curl_set(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, curl_size(request.body.size()));
+    } else if (request.method == "HEAD") {
+        curl_set(curl.get(), CURLOPT_NOBODY, 1L);
+    } else if (request.method != "GET") {
+        curl_set(curl.get(), CURLOPT_CUSTOMREQUEST, request.method.c_str());
+        if (!request.body.empty()) {
+            curl_set(curl.get(), CURLOPT_POSTFIELDS, request.body.data());
+            curl_set(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, curl_size(request.body.size()));
+        }
+    }
+
+    HttpResponse response;
+    std::filesystem::path temporary;
+    std::optional<TemporaryPathGuard> temporary_guard;
+    std::ofstream output;
+    if (request.download_file) {
+        const auto parent = request.download_file->parent_path();
+        if (!parent.empty())
+            std::filesystem::create_directories(parent);
+        temporary = *request.download_file;
+        temporary += ".gcp-part-" + random_uuid();
+        temporary_guard.emplace(temporary);
+        output.open(temporary, std::ios::binary | std::ios::trunc);
+        if (!output)
+            throw Error("Cannot open download destination: " + temporary.string());
+    }
+    WriteSink sink{request.download_file ? nullptr : &response.body,
+                   request.download_file ? &output : nullptr,
+                   request.calculate_crc32c || request.expected_crc32c.has_value(), 0};
+    curl_set(curl.get(), CURLOPT_WRITEFUNCTION, &write_callback);
+    curl_set(curl.get(), CURLOPT_WRITEDATA, &sink);
+    HeaderSink header_sink{&response.headers};
+    curl_set(curl.get(), CURLOPT_HEADERFUNCTION, &header_callback);
+    curl_set(curl.get(), CURLOPT_HEADERDATA, &header_sink);
+
+    const CURLcode code = curl_easy_perform(curl.get());
+    const CURLcode info_code =
+        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &response.status);
+    bool output_ok = true;
+    if (output.is_open()) {
+        output.flush();
+        output_ok = output.good();
+        output.close();
+        output_ok = output_ok && !output.fail();
+    }
+    if (sink.checksum)
+        response.crc32c = crc32c_base64(sink.crc);
+
+    const auto callback_error = [&]() -> std::optional<std::string> {
+        if (sink.exception)
+            return "HTTP response callback threw an exception";
+        if (header_sink.exception)
+            return "HTTP header callback threw an exception";
+        if (sink.io_error)
+            return "HTTP response could not be written";
+        if (upload_source.exception)
+            return "Upload callback threw an exception";
+        if (upload_source.io_error)
+            return "Upload file could not be read";
+        return std::nullopt;
+    }();
+    if (callback_error) {
+        throw Error(*callback_error);
+    }
+
+    if (code != CURLE_OK) {
+        const std::string detail = error_buffer[0] ? error_buffer : curl_easy_strerror(code);
+        throw Error("HTTP transport failed: " + detail);
+    }
+    if (info_code != CURLE_OK) {
+        curl_check(info_code, "response status lookup");
+    }
+    if (!output_ok) {
+        throw Error("Failed to flush completed download to disk");
+    }
+
+    if (request.download_file) {
+        if (response.status < 200 || response.status >= 300) {
+            response.body = read_small_file(temporary);
+        } else if (request.expected_crc32c && response.crc32c != *request.expected_crc32c) {
+            throw Error("Cloud Storage download checksum mismatch");
+        } else {
+            std::error_code ec;
+            std::filesystem::rename(temporary, *request.download_file, ec);
+            if (ec && std::filesystem::exists(*request.download_file)) {
+                // Windows does not replace an existing destination with rename(). Keep
+                // the old file recoverable until the new one is safely in place.
+                std::filesystem::path backup = *request.download_file;
+                backup += ".gcp-backup-" + random_uuid();
+                std::error_code backup_error;
+                std::filesystem::rename(*request.download_file, backup, backup_error);
+                if (!backup_error) {
+                    ec.clear();
+                    std::filesystem::rename(temporary, *request.download_file, ec);
+                    if (!ec) {
+                        std::filesystem::remove(backup, backup_error);
+                    } else {
+                        std::error_code restore_error;
+                        std::filesystem::rename(backup, *request.download_file, restore_error);
+                    }
+                }
+            }
+            if (ec) {
+                throw Error("Cannot move completed download into place: " + ec.message());
+            }
+            temporary_guard->dismiss();
+        }
+    }
+    return response;
+}
+
+// GCP application default credentials -----------------------------------------
+
+// The default chain is intentionally narrow: explicit bearer-token environment
+// variables, authorized-user ADC JSON, then the metadata server. Service-account
+// key and external-account JSON are left to a caller-supplied token callback.
+inline std::string metadata_host() {
+    std::string host = env("GCE_METADATA_HOST");
+    if (host.empty())
+        host = "metadata.google.internal";
+    if (host.starts_with("http://") || host.starts_with("https://"))
+        return base_url(host);
+    return "http://" + host;
+}
+
+inline std::optional<std::string>
+metadata_get(std::string_view path,
+             std::chrono::milliseconds timeout = std::chrono::milliseconds(800)) {
+    try {
+        auto response = http(HttpRequest{
+            .method = "GET",
+            .url = metadata_host() + "/computeMetadata/v1/" + std::string(path),
+            .headers = {"Metadata-Flavor: Google"},
+            .no_proxy = true,
+            .timeout = timeout,
+            .connect_timeout = std::min(timeout, std::chrono::milliseconds(300)),
+        });
+        if (response.status == 200)
+            return trim(std::move(response.body));
+    } catch (...) {
+    }
+    return std::nullopt;
+}
+
+inline AccessToken metadata_token() {
+    for (int attempt = 0; attempt < 3; ++attempt) {
+        try {
+            auto response = http(HttpRequest{
+                .method = "GET",
+                .url =
+                    metadata_host() + "/computeMetadata/v1/instance/service-accounts/default/token",
+                .headers = {"Metadata-Flavor: Google"},
+                .no_proxy = true,
+                .timeout = std::chrono::milliseconds(1500),
+                .connect_timeout = std::chrono::milliseconds(300),
+            });
+            if (response.status == 200) {
+                const Json json = parse_json(response.body);
+                const std::string token = field(json, "access_token");
+                const auto seconds = unsigned_field(json, "expires_in");
+                if (token.empty() || seconds == 0)
+                    throw Error("Malformed metadata token response");
+                return AccessToken{
+                    token, std::chrono::system_clock::now() + std::chrono::seconds(seconds), {}};
+            }
+            if (response.status != 429 && response.status < 500)
+                throw Error("Metadata token request failed", response.status, response.body);
+        } catch (const Error& error) {
+            if (error.http_status() > 0 && error.http_status() != 429 && error.http_status() < 500)
+                throw;
+            if (attempt == 2)
+                throw;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
+    }
+    throw Error("GCP metadata token is unavailable");
+}
+
+inline AccessToken refresh_authorized_user(const Json& json) {
+    const std::string client_id = field(json, "client_id");
+    const std::string client_secret = field(json, "client_secret");
+    const std::string refresh_token = field(json, "refresh_token");
+    if (client_id.empty() || client_secret.empty() || refresh_token.empty())
+        throw Error("Malformed authorized_user ADC file");
+    const std::string body = "grant_type=refresh_token&client_id=" + encode(client_id) +
+                             "&client_secret=" + encode(client_secret) +
+                             "&refresh_token=" + encode(refresh_token);
+    auto response = http(HttpRequest{
+        .method = "POST",
+        .url = "https://oauth2.googleapis.com/token",
+        .headers = {"Content-Type: application/x-www-form-urlencoded"},
+        .body = body,
+        .timeout = std::chrono::milliseconds(30'000),
+    });
+    if (response.status < 200 || response.status >= 300)
+        throw Error("OAuth token refresh failed", response.status, response.body);
+    const Json token_json = parse_json(response.body);
+    const std::string token = field(token_json, "access_token");
+    const auto seconds = unsigned_field(token_json, "expires_in");
+    if (token.empty() || seconds == 0)
+        throw Error("Malformed OAuth token response");
+    return AccessToken{token, std::chrono::system_clock::now() + std::chrono::seconds(seconds),
+                       field(json, "quota_project_id")};
+}
+
+inline std::optional<std::filesystem::path> well_known_adc_path() {
+    if (const std::string config = env("CLOUDSDK_CONFIG"); !config.empty())
+        return std::filesystem::path(config) / "application_default_credentials.json";
+#ifdef _WIN32
+    if (const std::string appdata = env("APPDATA"); !appdata.empty())
+        return std::filesystem::path(appdata) / "gcloud" / "application_default_credentials.json";
+#else
+    if (const std::string home = env("HOME"); !home.empty())
+        return std::filesystem::path(home) / ".config" / "gcloud" /
+               "application_default_credentials.json";
+#endif
+    return std::nullopt;
+}
+
+inline Json read_json_file(const std::filesystem::path& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input)
+        throw Error("Cannot open credential file: " + path.string());
+    std::ostringstream buffer;
+    buffer << input.rdbuf();
+    if (!input.good() && !input.eof())
+        throw Error("Cannot read credential file: " + path.string());
+    return parse_json(buffer.str());
+}
+
+inline AccessToken token_from_adc_file(const std::filesystem::path& path) {
+    const Json json = read_json_file(path);
+    const std::string type = field(json, "type");
+    if (type == "authorized_user")
+        return refresh_authorized_user(json);
+    throw Error("Unsupported ADC credential type '" + type +
+                "'; inject a token callback for this credential type");
+}
+
+inline AccessToken automatic_token() {
+    if (std::string token = env("GCP_ACCESS_TOKEN"); !token.empty())
+        return AccessToken{std::move(token), std::chrono::system_clock::time_point::max(), {}};
+    if (std::string token = env("GOOGLE_OAUTH_ACCESS_TOKEN"); !token.empty())
+        return AccessToken{std::move(token), std::chrono::system_clock::time_point::max(), {}};
+
+    if (const std::string explicit_path = env("GOOGLE_APPLICATION_CREDENTIALS");
+        !explicit_path.empty())
+        return token_from_adc_file(explicit_path);
+
+    if (const auto path = well_known_adc_path(); path && std::filesystem::exists(*path))
+        return token_from_adc_file(*path);
+
+    try {
+        return metadata_token();
+    } catch (const Error&) {
+    }
+
+    throw Error("No usable Google credentials; use ADC, an attached service account, "
+                "or Credentials::from(...)");
+}
+
+inline std::string compact_error_body(std::string body) {
+    constexpr std::size_t max = 8 * 1024;
+    if (body.size() > max)
+        body.resize(max);
+    return trim(std::move(body));
+}
+
+// Authenticated GCP REST core --------------------------------------------------
+
+// Core centralizes lazy project/zone discovery, bearer headers, a single 401
+// refresh, endpoint validation, and HTTP error normalization. Public Bucket,
+// Vm, Operation, and Cloud handles share it through std::shared_ptr.
+class Core {
+public:
+    explicit Core(Config value) : config(std::move(value)) {
+        if (config.timeout <= std::chrono::milliseconds::zero())
+            throw Error("Config::timeout must be positive");
+        if (config.transfer_timeout <= std::chrono::milliseconds::zero())
+            throw Error("Config::transfer_timeout must be positive");
+        config.storage_endpoint = base_url(std::move(config.storage_endpoint));
+        config.compute_endpoint = base_url(std::move(config.compute_endpoint));
+        config.batch_endpoint = base_url(std::move(config.batch_endpoint));
+        config.logging_endpoint = base_url(std::move(config.logging_endpoint));
+        validate_endpoint(config.storage_endpoint, "storage_endpoint");
+        validate_endpoint(config.compute_endpoint, "compute_endpoint");
+        validate_endpoint(config.batch_endpoint, "batch_endpoint");
+        validate_endpoint(config.logging_endpoint, "logging_endpoint");
+    }
+
+    [[nodiscard]] std::string project() const {
+        std::lock_guard lock(discovery_mutex);
+        if (!resolved_project.empty())
+            return resolved_project;
+        resolved_project = config.project;
+        if (resolved_project.empty())
+            resolved_project = env("GOOGLE_CLOUD_PROJECT");
+        if (resolved_project.empty())
+            resolved_project = env("GCLOUD_PROJECT");
+        if (resolved_project.empty())
+            resolved_project = env("GCP_PROJECT");
+        if (resolved_project.empty()) {
+            if (const auto value = metadata_get("project/project-id"))
+                resolved_project = *value;
+        }
+        if (resolved_project.empty())
+            throw Error("No GCP project configured; set Config::project or GOOGLE_CLOUD_PROJECT");
+        return resolved_project;
+    }
+
+    [[nodiscard]] std::string zone() const {
+        std::lock_guard lock(discovery_mutex);
+        if (!resolved_zone.empty())
+            return resolved_zone;
+        resolved_zone = config.zone;
+        if (resolved_zone.empty())
+            resolved_zone = env("GOOGLE_CLOUD_ZONE");
+        if (resolved_zone.empty())
+            resolved_zone = env("GCP_ZONE");
+        if (resolved_zone.empty()) {
+            if (const auto value = metadata_get("instance/zone"))
+                resolved_zone = last_path_segment(*value);
+        }
+        if (resolved_zone.empty())
+            throw Error("No Compute Engine zone configured; set Config::zone or GOOGLE_CLOUD_ZONE");
+        return resolved_zone;
+    }
+
+    HttpResponse call(HttpRequest request) const {
+        if (!request.timeout)
+            request.timeout = config.timeout;
+
+        const auto execute = [this](HttpRequest current) {
+            const AccessToken token = config.credentials.access_token();
+            current.headers.push_back(header("Authorization", "Bearer " + token.value));
+            if (current.accept_json)
+                current.headers.push_back("Accept: application/json");
+            std::string quota = config.quota_project;
+            if (quota.empty())
+                quota = env("GOOGLE_CLOUD_QUOTA_PROJECT");
+            if (quota.empty())
+                quota = token.quota_project;
+            if (!quota.empty())
+                current.headers.push_back(header("X-Goog-User-Project", quota));
+            return http(std::move(current));
+        };
+
+        HttpResponse response = execute(request);
+        if (response.status == 401) {
+            config.credentials.invalidate();
+            response = execute(std::move(request));
+        }
+        check(response);
+        return response;
+    }
+
+    Json json(HttpRequest request) const { return parse_json(call(std::move(request)).body); }
+
+    std::string compute_url(std::string_view zone, std::string path) const {
+        return config.compute_endpoint + "/compute/v1/projects/" + encode(project()) + "/zones/" +
+               encode(zone) + std::move(path);
+    }
+
+    Config config;
+
+private:
+    void validate_endpoint(const std::string& endpoint, std::string_view option_name) const {
+        if (endpoint.starts_with("https://"))
+            return;
+        if (endpoint.starts_with("http://") && config.allow_insecure_http)
+            return;
+        throw Error("Config::" + std::string(option_name) +
+                    " must use HTTPS (or set allow_insecure_http explicitly)");
+    }
+
+    static void check(const HttpResponse& response) {
+        if (response.status >= 200 && response.status < 300)
+            return;
+        const std::string body = compact_error_body(response.body);
+        std::string message =
+            "Google Cloud request failed with HTTP " + std::to_string(response.status);
+        if (!body.empty())
+            message += ": " + body;
+        throw Error(std::move(message), response.status, body);
+    }
+
+    mutable std::mutex discovery_mutex;
+    mutable std::string resolved_project;
+    mutable std::string resolved_zone;
+};
+
+inline Object parse_object(const Json& json) {
+    return Object{
+        .name = field(json, "name"),
+        .generation = field(json, "generation"),
+        .size = unsigned_field(json, "size"),
+        .content_type = field(json, "contentType"),
+        .updated = field(json, "updated"),
+        .etag = field(json, "etag"),
+        .crc32c = field(json, "crc32c"),
+        .md5_hash = field(json, "md5Hash"),
+    };
+}
+
+inline Instance parse_instance(const Json& json) {
+    Instance result{
+        .id = field(json, "id"),
+        .name = field(json, "name"),
+        .zone = last_path_segment(field(json, "zone")),
+        .machine_type = last_path_segment(field(json, "machineType")),
+        .status = field(json, "status"),
+        .creation_timestamp = field(json, "creationTimestamp"),
+    };
+    for_each_json(json, "networkInterfaces", [&](const Json& interface) {
+        if (result.internal_ip.empty())
+            result.internal_ip = field(interface, "networkIP");
+        for_each_json(interface, "accessConfigs", [&](const Json& config) {
+            if (result.external_ip.empty())
+                result.external_ip = field(config, "natIP");
+        });
+    });
+    return result;
+}
+
+inline std::string operation_error(const Json& json) {
+    const Json* error = json.get("error");
+    std::string result;
+    if (error)
+        for_each_json(*error, "errors", [&](const Json& item) {
+            std::string message = field(item, "message");
+            if (message.empty())
+                message = field(item, "code");
+            if (!message.empty()) {
+                if (!result.empty())
+                    result += "; ";
+                result += message;
+            }
+        });
+    if (result.empty())
+        result = field(json, "httpErrorMessage");
+    const std::string status_code = field(json, "httpErrorStatusCode");
+    if (result.empty() && !status_code.empty() && status_code != "0")
+        result = "HTTP status " + status_code;
+    if (result.empty() && error && error->is_object())
+        result = "unknown operation error";
+    return result;
+}
+
+} // namespace detail
+
+// Low-level GCS and GCE handles ------------------------------------------------
+
+// Bucket uses single-request media uploads. Verified downloads first read
+// metadata, pin that exact generation, calculate CRC32C while streaming, and
+// preserve the destination unless every step succeeds.
+class Bucket {
+public:
+    [[nodiscard]] const std::string& name() const noexcept { return name_; }
+
+    [[nodiscard]] Object stat(std::string_view object) const {
+        return detail::parse_object(core_->json(detail::HttpRequest{
+            .url =
+                storage("/storage/v1/b/" + detail::encode(name_) + "/o/" + detail::encode(object) +
+                        "?fields=name%2Cgeneration%2Csize%2CcontentType%2Cupdated%2Cetag%2Ccrc32c%"
+                        "2Cmd5Hash"),
+        }));
+    }
+
+    [[nodiscard]] ObjectList list(ListOptions options = {}) const {
+        ObjectList result;
+        result.objects = detail::paginate<Object>(
+            options.limit,
+            [&](const std::string& page) {
+                std::string query = "?maxResults=1000";
+                if (!options.prefix.empty())
+                    query += "&prefix=" + detail::encode(options.prefix);
+                if (!options.delimiter.empty())
+                    query += "&delimiter=" + detail::encode(options.delimiter);
+                if (options.versions)
+                    query += "&versions=true";
+                if (!page.empty())
+                    query += "&pageToken=" + detail::encode(page);
+                return core_->json(detail::HttpRequest{
+                    .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o" + query),
+                });
+            },
+            detail::parse_object,
+            [&](const detail::Json& json) {
+                detail::for_each_json(json, "prefixes", [&](const detail::Json& prefix) {
+                    result.prefixes.push_back(prefix.text());
+                });
+            });
+        return result;
+    }
+
+    [[nodiscard]] Object put(std::string_view object, std::string_view bytes,
+                             PutOptions options = {}) const {
+        const std::string checksum = options.crc32c ? detail::crc32c(bytes) : std::string{};
+        Object result = detail::parse_object(core_->json(detail::HttpRequest{
+            .method = "POST",
+            .url = upload_url(object, options),
+            .headers = upload_headers(options, checksum),
+            .body = std::string(bytes),
+        }));
+        if (!checksum.empty() && checksum != result.crc32c)
+            throw Error("Cloud Storage upload checksum mismatch");
+        return result;
+    }
+
+    [[nodiscard]] Object put_file(std::string_view object, const std::filesystem::path& source,
+                                  PutOptions options = {}) const {
+        const auto upload = detail::prepare_upload(source, options.crc32c);
+        const std::string& checksum = upload->crc32c;
+        Object result = detail::parse_object(core_->json(detail::HttpRequest{
+            .method = "POST",
+            .url = upload_url(object, options),
+            .headers = upload_headers(options, checksum),
+            .upload_file = upload,
+            .timeout = core_->config.transfer_timeout,
+        }));
+        if (!checksum.empty() && checksum != result.crc32c)
+            throw Error("Cloud Storage upload checksum mismatch");
+        return result;
+    }
+
+    // Verified downloads first pin a generation and require CRC32C metadata, so
+    // bytes cannot silently come from a different object version.
+    [[nodiscard]] std::string get(std::string_view object, bool verify = true) const {
+        return download(object, verify, [](auto&, const auto&) {}).body;
+    }
+
+    void get_file(std::string_view object, const std::filesystem::path& destination,
+                  bool verify = true) const {
+        (void)download(object, verify, [&](auto& request, const Object& metadata) {
+            request.download_file = destination;
+            request.expected_crc32c =
+                verify ? std::optional<std::string>(metadata.crc32c) : std::nullopt;
+            request.timeout = core_->config.transfer_timeout;
+        });
+    }
+
+    void erase(std::string_view object,
+               std::optional<std::string> generation = std::nullopt) const {
+        std::string query;
+        if (generation) {
+            query = "?generation=" + detail::encode(*generation) +
+                    "&ifGenerationMatch=" + detail::encode(*generation);
+        }
+        core_->call(detail::HttpRequest{
+            .method = "DELETE",
+            .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o/" +
+                           detail::encode(object) + query),
+        });
+    }
+
+private:
+    friend class Cloud;
+    Bucket(std::shared_ptr<detail::Core> core, std::string name)
+        : core_(std::move(core)), name_(std::move(name)) {
+        if (name_.empty())
+            throw Error("Bucket name must not be empty");
+    }
+
+    [[nodiscard]] std::string storage(std::string path) const {
+        return core_->config.storage_endpoint + std::move(path);
+    }
+
+    [[nodiscard]] std::string upload_url(std::string_view object, const PutOptions& options) const {
+        std::string url = storage("/upload/storage/v1/b/" + detail::encode(name_) +
+                                  "/o?uploadType=media&name=" + detail::encode(object));
+        if (options.if_generation_match)
+            url += "&ifGenerationMatch=" + detail::encode(*options.if_generation_match);
+        return url;
+    }
+
+    [[nodiscard]] static std::vector<std::string> upload_headers(const PutOptions& options,
+                                                                 const std::string& checksum) {
+        std::vector<std::string> headers{detail::header("Content-Type", options.content_type)};
+        if (!checksum.empty())
+            headers.push_back(detail::header("X-Goog-Hash", "crc32c=" + checksum));
+        return headers;
+    }
+
+    template <typename Configure>
+    [[nodiscard]] detail::HttpResponse download(std::string_view object, bool verify,
+                                                Configure configure) const {
+        Object metadata;
+        if (verify)
+            metadata = stat(object);
+        require_verification_metadata(metadata, verify);
+        std::string query = "?alt=media";
+        if (verify)
+            query += "&generation=" + detail::encode(metadata.generation);
+        detail::HttpRequest request{
+            .url = storage("/download/storage/v1/b/" + detail::encode(name_) + "/o/" +
+                           detail::encode(object) + query),
+            .headers = {"Accept-Encoding: gzip"},
+            .calculate_crc32c = verify,
+            .accept_json = false,
+        };
+        configure(request, metadata);
+        auto response = core_->call(std::move(request));
+        if (verify && response.crc32c != metadata.crc32c)
+            throw Error("Cloud Storage download checksum mismatch");
+        return response;
+    }
+
+    static void require_verification_metadata(const Object& metadata, bool verify) {
+        if (!verify)
+            return;
+        if (metadata.generation.empty() || metadata.crc32c.empty())
+            throw Error("Cloud Storage object lacks generation/CRC32C metadata; "
+                        "verified download is unavailable");
+    }
+
+    std::shared_ptr<detail::Core> core_;
+    std::string name_;
+};
+
+// A zonal GCE long-running operation. Mutating methods return immediately with
+// this handle; wait() performs bounded polling and surfaces operation errors.
+class Operation {
+public:
+    [[nodiscard]] const std::string& name() const noexcept { return name_; }
+    [[nodiscard]] const std::string& zone() const noexcept { return zone_; }
+
+    // Waits until Compute Engine says DONE and then verifies operation.error.
+    void wait(std::chrono::milliseconds timeout = std::chrono::minutes(10),
+              std::chrono::milliseconds poll_interval = std::chrono::seconds(1)) const {
+        if (timeout <= std::chrono::milliseconds::zero())
+            throw Error("Compute operation wait timeout must be positive");
+        if (poll_interval <= std::chrono::milliseconds::zero())
+            throw Error("Compute operation poll interval must be positive");
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        while (true) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                throw Error("Timed out waiting for Compute operation '" + name_ + "'");
+            const auto remaining =
+                std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            const detail::Json json = core_->json(detail::HttpRequest{
+                .url = core_->compute_url(zone_, "/operations/" + detail::encode(name_)),
+                .timeout = std::max(std::chrono::milliseconds(1),
+                                    std::min(core_->config.timeout, remaining)),
+            });
+            if (detail::field(json, "status") == "DONE") {
+                const std::string failure = detail::operation_error(json);
+                if (!failure.empty())
+                    throw Error("Compute operation failed: " + failure);
+                return;
+            }
+            if (std::chrono::steady_clock::now() >= deadline)
+                throw Error("Timed out waiting for Compute operation '" + name_ + "'");
+            std::this_thread::sleep_for(
+                std::min(poll_interval, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            deadline - std::chrono::steady_clock::now())));
+        }
+    }
+
+private:
+    friend class Vm;
+    friend class Cloud;
+    Operation(std::shared_ptr<detail::Core> core, std::string name, std::string zone)
+        : core_(std::move(core)), name_(std::move(name)), zone_(std::move(zone)) {
+        if (name_.empty())
+            throw Error("Malformed Compute operation response: missing name");
+    }
+
+    std::shared_ptr<detail::Core> core_;
+    std::string name_;
+    std::string zone_;
+};
+
+// One named VM in Config::zone. start/stop/erase carry idempotency request IDs
+// and return an Operation rather than hiding an unbounded wait.
+class Vm {
+public:
+    [[nodiscard]] const std::string& name() const noexcept { return name_; }
+
+    [[nodiscard]] Instance get() const {
+        return detail::parse_instance(core_->json(detail::HttpRequest{.url = instance_url()}));
+    }
+
+    [[nodiscard]] std::string status() const { return get().status; }
+
+    [[nodiscard]] Operation start() const { return action("start"); }
+    [[nodiscard]] Operation stop(bool discard_local_ssd = false) const {
+        return action(std::string("stop?discardLocalSsd=") +
+                          (discard_local_ssd ? "true" : "false") +
+                          "&requestId=" + detail::random_uuid(),
+                      false);
+    }
+    [[nodiscard]] Operation erase() const { return action("", true); }
+
+private:
+    friend class Cloud;
+    Vm(std::shared_ptr<detail::Core> core, std::string name)
+        : core_(std::move(core)), name_(std::move(name)) {
+        if (name_.empty())
+            throw Error("VM name must not be empty");
+    }
+
+    [[nodiscard]] std::string instance_url() const {
+        return core_->compute_url(core_->zone(), "/instances/" + detail::encode(name_));
+    }
+
+    [[nodiscard]] Operation action(std::string action, bool deleting = false) const {
+        std::string url = instance_url();
+        if (deleting) {
+            url += "?requestId=" + detail::random_uuid();
+        } else if (action.starts_with("stop?")) {
+            url += "/" + action;
+        } else {
+            url += "/" + action + "?requestId=" + detail::random_uuid();
+        }
+        const detail::Json json = core_->json(detail::HttpRequest{
+            .method = deleting ? "DELETE" : "POST",
+            .url = std::move(url),
+        });
+        return Operation(core_, detail::field(json, "name"), core_->zone());
+    }
+
+    std::shared_ptr<detail::Core> core_;
+    std::string name_;
+};
+
+// Root of the low-level GCP API. Handles copied from Cloud share credentials,
+// discovery caches, and endpoint configuration.
+class Cloud {
+public:
+    explicit Cloud(Config config = {}) : core_(std::make_shared<detail::Core>(std::move(config))) {}
+
+    [[nodiscard]] Bucket bucket(std::string name) const { return Bucket(core_, std::move(name)); }
+
+    [[nodiscard]] Vm vm(std::string name) const { return Vm(core_, std::move(name)); }
+
+    [[nodiscard]] Operation create_from_template(std::string name,
+                                                 std::string instance_template) const {
+        if (name.empty() || instance_template.empty())
+            throw Error("VM name and instance template must not be empty");
+        if (!instance_template.starts_with("projects/") &&
+            !instance_template.starts_with("global/"))
+            instance_template = "global/instanceTemplates/" + instance_template;
+        const std::string request_id = detail::random_uuid();
+        const detail::Json json = core_->json(detail::HttpRequest{
+            .method = "POST",
+            .url = core_->compute_url(core_->zone(), "/instances?sourceInstanceTemplate=" +
+                                                         detail::encode(instance_template) +
+                                                         "&requestId=" + request_id),
+            .headers = {"Content-Type: application/json"},
+            .body = "{\"name\":" + detail::json_quote(name) + "}",
+        });
+        return Operation(core_, detail::field(json, "name"), core_->zone());
+    }
+
+    [[nodiscard]] std::vector<Instance> vms(std::size_t limit = 0) const {
+        return detail::paginate<Instance>(
+            limit,
+            [&](const std::string& page) {
+                std::string query = "?maxResults=500";
+                if (!page.empty())
+                    query += "&pageToken=" + detail::encode(page);
+                return core_->json(detail::HttpRequest{
+                    .url = core_->compute_url(core_->zone(), "/instances" + query),
+                });
+            },
+            detail::parse_instance, [](const detail::Json&) {});
+    }
+
+    [[nodiscard]] std::string project() const { return core_->project(); }
+    [[nodiscard]] std::string zone() const { return core_->zone(); }
+
+private:
+    friend struct ::cloud::detail::client_state;
+    std::shared_ptr<detail::Core> core_;
+};
+
+} // namespace cloud::gcp
+
+// Public API: portable jobs plus GCP storage/compute aliases ------------------
+
+namespace cloud {
+
+// Storage, object, instance, and operation aliases intentionally expose the
+// low-level GCP representations. Portable Batch jobs use the types below.
+using error = gcp::Error;
+using access_token = gcp::AccessToken;
+using token_provider = std::function<access_token()>;
+using scoped_token_provider = std::function<access_token(std::string_view)>;
+using object = gcp::Object;
+using object_list = gcp::ObjectList;
+using list_options = gcp::ListOptions;
+using put_options = gcp::PutOptions;
+using instance = gcp::Instance;
+using operation = gcp::Operation;
+
+using provider = std::string;
+
+// ordered selects the first configured provider that can plan the request.
+// lowest_cost requires comparable hourly prices and at least two candidates.
+enum class selection { ordered, lowest_cost };
+
+// Catalog pricing is opt-in because it adds read-only network requests during
+// plan(). Caller callbacks below take precedence over this setting.
+enum class price_source { none, public_catalog };
+
+// Capability flags describe implemented library behavior only. They do not
+// imply credentials, quota, regional availability, or configured AWS queues.
+enum class feature {
+    object_storage,
+    containers,
+    spot_instances,
+    storage_mounts,
+    log_streaming,
+    raw_instances,
+    accelerators,
+    cost_estimates,
+};
+
+// Lazy bearer authentication for GCP and Azure. AWS uses aws_config because it
+// signs each request rather than sending a bearer token. A scoped callback is
+// invoked with the GCP OAuth scope or Azure Batch audience and cached per scope.
+class auth {
+public:
+    auth() : credentials_(gcp::Credentials::automatic()) {}
+    static auth default_chain() { return {}; }
+    static auth bearer(std::string token) {
+        return auth(gcp::Credentials::bearer(std::move(token)));
+    }
+    static auth from(token_provider callback) {
+        return auth(gcp::Credentials::from(std::move(callback)));
+    }
+    static auth from(scoped_token_provider callback) {
+        if (!callback)
+            throw error("Scoped token provider must not be empty");
+        return auth(std::make_shared<scoped_token_provider>(std::move(callback)));
+    }
+
+private:
+    friend struct detail::client_state;
+    explicit auth(gcp::Credentials credentials) : credentials_(std::move(credentials)) {}
+    explicit auth(std::shared_ptr<scoped_token_provider> callback)
+        : credentials_(gcp::Credentials::from([callback] {
+              return (*callback)("https://www.googleapis.com/auth/cloud-platform");
+          })),
+          scoped_(std::move(callback)) {}
+
+    [[nodiscard]] gcp::Credentials for_scope(std::string scope) const {
+        if (!scoped_)
+            return credentials_;
+        const auto callback = scoped_;
+        return gcp::Credentials::from(
+            [callback, scope = std::move(scope)] { return (*callback)(scope); });
+    }
+    gcp::Credentials credentials_;
+    std::shared_ptr<scoped_token_provider> scoped_;
+};
+
+// Portable minimum resources. Planning rounds CPU/RAM up to a supported native
+// shape; it never silently substitutes a different accelerator model or count.
+struct resources {
+    unsigned cpus = 1;
+    double memory_gb = 1;
+    // Canonical values are "t4", "l4", "a10", "a100", and "h100".
+    // The selected backend resolves the model to a native machine/accelerator.
+    std::string gpu;
+    unsigned gpu_count = 1;
+    bool spot = false;
+    std::optional<double> max_price_per_hour;
+};
+
+// A GCP-only GCS FUSE mount. source is cloud://bucket or a slash-terminated
+// prefix; target is an absolute path inside the container.
+struct mount {
+    std::string source;
+    std::string target;
+    bool read_only = false;
+};
+
+struct job_spec {
+    std::string name = "job";
+    std::string image;
+
+    // Shell-free tokens. GCP uses element zero as the container entrypoint. AWS
+    // and Azure preserve the image ENTRYPOINT and pass every token as arguments;
+    // Azure therefore accepts only its documented portable token characters.
+    std::vector<std::string> command;
+    std::string workdir;
+
+    // GCP interprets this as the VM service-account email, AWS as jobRoleArn,
+    // and Azure rejects it because its auto-pool has no equivalent job field.
+    std::string service_account;
+    std::vector<mount> mounts;
+    cloud::resources resources;
+
+    // retries counts retries after the first attempt. Provider APIs express the
+    // same policy as total attempts or maximum retry count as appropriate.
+    unsigned retries = 0;
+
+    // GCP deletes the Batch job; AWS keeps the terminal record but deregisters
+    // its temporary definition. Azure always terminates the job to release its
+    // job-lifetime pool and deletes the record only when auto_delete is true.
+    bool auto_delete = true;
+
+    // Total controller deadline. It is also mapped to GCP/AWS per-attempt caps
+    // and Azure task wall-clock time; retries can outlive those provider caps if
+    // the controller that enforces this total deadline disappears.
+    std::chrono::milliseconds timeout{std::chrono::hours(1)};
+};
+
+struct plan {
+    // Native location/shape selected without allocating compute. Estimates are
+    // advisory; a maximum price fails closed unless an estimate is available.
+    cloud::provider provider = "gcp";
+    std::string region;
+    std::string machine_type;
+    std::string accelerator;
+    unsigned accelerator_count = 0;
+    std::optional<double> estimated_hourly_cost;
+    // Reserved for a future comparable egress model; currently always empty.
+    std::optional<double> estimated_egress_cost;
+    std::vector<std::string> warnings;
+};
+
+// Provider lifecycle states are normalized to this small common state machine.
+// unknown means the response was valid but did not map to a recognized state.
+#define CLOUD_H_JOB_STATES(X)                                                                      \
+    X(queued, "QUEUED")                                                                            \
+    X(scheduled, "SCHEDULED")                                                                      \
+    X(running, "RUNNING")                                                                          \
+    X(succeeded, "SUCCEEDED")                                                                      \
+    X(failed, "FAILED")                                                                            \
+    X(cancelling, "CANCELLATION_IN_PROGRESS")                                                      \
+    X(cancelled, "CANCELLED")                                                                      \
+    X(deleting, "DELETION_IN_PROGRESS")
+#define CLOUD_H_JOB_STATE_ENUM(name, unused) name,
+enum class job_state {
+    CLOUD_H_JOB_STATES(CLOUD_H_JOB_STATE_ENUM) unknown,
+};
+#undef CLOUD_H_JOB_STATE_ENUM
+
+struct log_entry {
+    // timestamp is provider-native: RFC3339 on GCP, epoch-millisecond text on
+    // AWS, and a synthetic sortable generation/stream/offset key on Azure.
+    std::string timestamp;
+    // receive_timestamp and id are best-effort provider metadata and may be
+    // empty. text is one complete line; polling is not a byte stream.
+    std::string receive_timestamp;
+    std::string id;
+    std::string text;
+    std::string severity;
+};
+
+struct result {
+    job_state state = job_state::unknown;
+    // Exit status is best effort because some terminal provider records expose
+    // no task/container status by the time the controller inspects them.
+    std::optional<int> exit_code;
+    std::string message;
+    std::vector<std::string> warnings;
+    [[nodiscard]] bool success() const noexcept { return state == job_state::succeeded; }
+    [[nodiscard]] const std::string& error() const noexcept { return message; }
+};
+
+struct price_request {
+    // Exact native plan sent to a trusted caller callback. Returning nullopt
+    // means no quote is available; max_price_per_hour then fails closed.
+    cloud::provider provider;
+    std::string region;
+    std::string zone;
+    std::string machine_type;
+    std::string accelerator;
+    unsigned accelerator_count = 0;
+    bool spot = false;
+};
+using price_lookup = std::function<std::optional<double>(const price_request&)>;
+// Compatibility callback. New code should use lookup_hourly_cost so attached
+// accelerators and an Availability Zone cannot be accidentally omitted.
+using price_estimator = std::function<std::optional<double>(std::string_view, std::string_view,
+                                                            std::string_view, bool)>;
+using log_sink = std::function<void(const log_entry&)>;
+
+struct aws_credentials {
+    std::string access_key_id;
+    std::string secret_access_key;
+    std::string session_token;
+};
+using aws_credential_provider = std::function<aws_credentials()>;
+
+struct aws_gpu_target {
+    // AWS Batch cannot choose a GPU model per job. Each entry declares queues
+    // constrained to one instance type and the capacity that planner may trust.
+    std::string job_queue;
+    std::string spot_job_queue;
+    std::string machine_type;
+    unsigned cpus = 0;
+    double memory_gb = 0;
+    unsigned gpus = 0;
+};
+
+struct aws_config {
+    // The refresh callback wins, followed by explicit values, then
+    // AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optional AWS_SESSION_TOKEN.
+    std::string access_key_id;
+    std::string secret_access_key;
+    std::string session_token;
+    aws_credential_provider credentials;
+    // AWS Batch queues own capacity and networking. A separate Spot queue is
+    // required when resources::spot is true.
+    std::string job_queue;
+    std::string spot_job_queue;
+    // Batch cannot select an EC2 GPU model per job. Map a canonical GPU name to
+    // queues backed only by one exact instance type and declare that type's
+    // capacity; planning fails rather than overcommitting it.
+    std::map<std::string, aws_gpu_target, std::less<>> gpu_targets;
+    // Optional exact types for dedicated CPU queues. Without these, Batch still
+    // runs jobs but no exact EC2 catalog price is claimed.
+    std::string machine_type;
+    std::string spot_machine_type;
+    std::string log_group = "/aws/batch/job";
+    // Empty regional endpoints are derived from the selected AWS region.
+    std::string batch_endpoint;
+    std::string logs_endpoint;
+    std::string ec2_endpoint;
+    std::string pricing_endpoint = "https://api.pricing.us-east-1.amazonaws.com";
+    std::string pricing_region = "us-east-1";
+};
+
+struct azure_config {
+    // For example: https://account.westeurope.batch.azure.com
+    std::string batch_endpoint;
+    // When absent, config::auth supplies the Batch bearer token. This override
+    // lets a multi-provider client use an Azure-scoped token independently.
+    std::optional<cloud::auth> auth;
+    // Image fields describe the auto-pool node image, not the submitted
+    // container. Each job receives a one-node job-lifetime pool.
+    std::string image_publisher = "microsoft-dsvm";
+    std::string image_offer = "ubuntu-hpc";
+    std::string image_sku = "2204";
+    std::string node_agent_sku = "batch.node.ubuntu 22.04";
+    std::string api_version = "2025-06-01";
+    std::string pricing_endpoint = "https://prices.azure.com/api/retail/prices";
+};
+
+struct config {
+    // provider forces exactly one backend. Otherwise providers is considered in
+    // order. ordered returns the first runnable plan; lowest_cost requires priced
+    // comparable candidates and at least two runnable providers.
+    std::optional<cloud::provider> provider;
+    std::vector<cloud::provider> providers{"gcp"};
+    cloud::selection selection = cloud::selection::ordered;
+
+    // project is GCP-specific. Per-provider maps override the shared region/zone
+    // fallbacks, allowing one multi-provider client to carry native locations.
+    std::string project;
+    std::string region = "europe";
+    std::string zone;
+    std::map<cloud::provider, std::string, std::less<>> regions;
+    std::map<cloud::provider, std::string, std::less<>> zones;
+
+    // GCP and Azure bearer authentication; AWS credentials live in aws_config.
+    cloud::auth auth = cloud::auth::default_chain();
+    cloud::aws_config aws;
+    cloud::azure_config azure;
+
+    // Price precedence is lookup_hourly_cost, compatibility estimator, then the
+    // opt-in public catalog. Supplying either callback suppresses catalog lookup.
+    cloud::price_source prices = cloud::price_source::none;
+    price_lookup lookup_hourly_cost;
+    price_estimator estimate_hourly_cost;
+    std::chrono::milliseconds price_cache_ttl{std::chrono::hours(1)};
+    std::chrono::milliseconds spot_price_cache_ttl{std::chrono::minutes(5)};
+
+    // request_timeout bounds ordinary control-plane HTTP calls; transfer_timeout
+    // applies to files. poll_interval controls job/LRO polling. Final log drain
+    // waits at least final_log_delay for quiet but never beyond final_log_timeout.
+    // cleanup_timeout bounds provider cleanup and ambiguous-mutation recovery.
+    std::chrono::milliseconds request_timeout{std::chrono::minutes(1)};
+    std::chrono::milliseconds transfer_timeout{std::chrono::hours(1)};
+    std::chrono::milliseconds poll_interval{std::chrono::seconds(2)};
+    std::chrono::milliseconds final_log_delay{std::chrono::seconds(2)};
+    std::chrono::milliseconds final_log_timeout{std::chrono::seconds(30)};
+    std::chrono::milliseconds cleanup_timeout{std::chrono::minutes(5)};
+
+    // Endpoint overrides support emulators, tests, and private proxies. They are
+    // GCP endpoints; AWS/Azure endpoints live in their nested configurations.
+    // Plain HTTP always requires this explicit test-only escape hatch.
+    bool allow_insecure_http = false;
+    std::string storage_endpoint = "https://storage.googleapis.com";
+    std::string compute_endpoint = "https://compute.googleapis.com";
+    std::string batch_endpoint = "https://batch.googleapis.com";
+    std::string logging_endpoint = "https://logging.googleapis.com";
+    std::string billing_endpoint = "https://cloudbilling.googleapis.com";
+};
+
+// Planning and provider validation --------------------------------------------
+
+namespace detail {
+
+struct uri {
+    std::string bucket;
+    std::string key;
+};
+
+inline uri parse_uri(std::string_view value, std::string_view operation = {}) {
+    // cloud:// is deliberately provider-neutral at the facade, but only the GCP
+    // storage implementation currently consumes it. Object operations require a
+    // key; list and mount operations may address the bucket root.
+    constexpr std::string_view prefix = "cloud://";
+    if (!value.starts_with(prefix))
+        throw error("Cloud URI must start with cloud://");
+    value.remove_prefix(prefix.size());
+    const auto slash = value.find('/');
+    uri out{std::string(value.substr(0, slash)),
+            slash == std::string_view::npos ? std::string{} : std::string(value.substr(slash + 1))};
+    if (out.bucket.empty())
+        throw error("Cloud URI must contain a bucket");
+    if (!operation.empty() && out.key.empty())
+        throw error(std::string(operation) + "() requires an object path");
+    return out;
+}
+
+inline bool implemented(std::string_view value) {
+    return value == "gcp" || value == "aws" || value == "azure";
+}
+
+inline bool supports(std::string_view value, feature requested) {
+    if (!implemented(value))
+        return false;
+    if (value == "gcp")
+        return true;
+    return requested == feature::containers || requested == feature::spot_instances ||
+           requested == feature::log_streaming || requested == feature::accelerators ||
+           requested == feature::cost_estimates;
+}
+
+inline std::string configured_region(const config& cfg, std::string_view provider) {
+    const auto it = cfg.regions.find(provider);
+    return it == cfg.regions.end() ? cfg.region : it->second;
+}
+
+inline std::string configured_zone(const config& cfg, std::string_view provider) {
+    const auto it = cfg.zones.find(provider);
+    return it == cfg.zones.end() ? cfg.zone : it->second;
+}
+
+inline std::string region(std::string value, std::string_view provider) {
+    // Friendly continental aliases are deterministic conveniences, not latency,
+    // carbon, quota, or capacity optimizers.
+    if (value == "europe")
+        value = provider == "gcp" ? "europe-west4" : provider == "aws" ? "eu-west-1" : "westeurope";
+    if (value == "us")
+        value = provider == "gcp" ? "us-central1" : provider == "aws" ? "us-east-1" : "eastus";
+    if (value == "asia")
+        value = provider == "gcp"   ? "asia-east1"
+                : provider == "aws" ? "ap-southeast-1"
+                                    : "southeastasia";
+    if (value.empty() || !gcp::detail::is_ascii_alpha(value.front()) ||
+        !gcp::detail::is_ascii_alnum(value.back()))
+        throw error("Invalid " + std::string(provider) + " region");
+    for (const char c : value)
+        if (!gcp::detail::is_ascii_lower(c) && !gcp::detail::is_ascii_digit(c) && c != '-')
+            throw error("Invalid " + std::string(provider) + " region");
+    return value;
+}
+
+inline void validate_project(std::string_view value) {
+    if (value.empty())
+        throw error("GCP project must not be empty");
+    for (const char c : value)
+        if (!gcp::detail::is_ascii_alnum(c) && c != '-' && c != '.' && c != ':')
+            throw error("Invalid GCP project identifier");
+}
+
+inline provider selected_provider(const config& cfg, std::vector<std::string>* warnings = nullptr) {
+    // This helper resolves configuration only; multi-provider planning happens
+    // in make_plan(), where validation and price availability are also known.
+    const std::vector<provider> choices =
+        cfg.provider ? std::vector<provider>{*cfg.provider} : cfg.providers;
+    if (choices.empty())
+        throw error("No cloud provider configured");
+    for (const auto& value : choices) {
+        if (implemented(value))
+            return value;
+        if (warnings)
+            warnings->push_back(value + " backend is not implemented; skipped");
+        if (cfg.provider)
+            throw error(value + " backend is not implemented");
+    }
+    throw error("None of the configured cloud providers is implemented");
+}
+
+inline std::string canonical_gpu(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), gcp::detail::ascii_lower);
+    for (const std::string_view prefix : {std::string_view("nvidia-"), std::string_view("tesla-")})
+        if (value.starts_with(prefix))
+            value.erase(0, prefix.size());
+    if (value == "t4" || value == "l4" || value == "a10" || value == "a100" || value == "h100")
+        return value;
+    throw error("Unsupported accelerator \"" + value + "\"; use t4, l4, a10, a100, or h100");
+}
+
+struct machine_choice {
+    std::string name;
+    std::string accelerator;
+    unsigned accelerator_count = 0;
+};
+
+struct shape {
+    const char* name;
+    unsigned cpus;
+    double memory;
+};
+
+template <std::size_t Size>
+inline std::string smallest_shape(const resources& requested, const shape (&shapes)[Size],
+                                  std::string_view provider) {
+    for (const auto& candidate : shapes)
+        if (requested.cpus <= candidate.cpus && requested.memory_gb <= candidate.memory)
+            return candidate.name;
+    throw error("No built-in " + std::string(provider) + " machine mapping satisfies the request");
+}
+
+inline machine_choice machine(std::string_view provider, const config& cfg,
+                              const resources& requested, std::vector<std::string>& warnings) {
+    // Built-in tables select the smallest shape satisfying CPU/RAM while keeping
+    // the requested accelerator exact. AWS delegates capacity to preconfigured
+    // queues, so GPU entries must declare one trustworthy native instance type.
+    if (!requested.cpus || !(requested.memory_gb > 0) || !std::isfinite(requested.memory_gb))
+        throw error("Resources require positive CPU and memory values");
+    if (requested.gpu.empty()) {
+        if (provider == "gcp") {
+            static constexpr shape shapes[] = {
+                {"e2-standard-2", 2, 8},    {"e2-standard-4", 4, 16},    {"e2-standard-8", 8, 32},
+                {"e2-standard-16", 16, 64}, {"e2-standard-32", 32, 128},
+            };
+            return {smallest_shape(requested, shapes, provider), {}, 0};
+        }
+        if (provider == "azure") {
+            static constexpr shape shapes[] = {
+                {"Standard_D2s_v5", 2, 8},     {"Standard_D4s_v5", 4, 16},
+                {"Standard_D8s_v5", 8, 32},    {"Standard_D16s_v5", 16, 64},
+                {"Standard_D32s_v5", 32, 128},
+            };
+            return {smallest_shape(requested, shapes, provider), {}, 0};
+        }
+        const std::string exact = requested.spot ? cfg.aws.spot_machine_type : cfg.aws.machine_type;
+        if (exact.empty()) {
+            warnings.push_back("AWS Batch queue may choose several EC2 types; exact catalog "
+                               "pricing is unavailable");
+            return {"batch-managed", {}, 0};
+        }
+        return {exact, {}, 0};
+    }
+
+    if (!requested.gpu_count)
+        throw error("Accelerator count must be positive");
+    const std::string gpu = canonical_gpu(requested.gpu);
+    if (provider == "gcp") {
+        if (gpu == "t4" &&
+            (requested.gpu_count == 1 || requested.gpu_count == 2 || requested.gpu_count == 4)) {
+            static constexpr shape small[] = {
+                {"n1-standard-4", 4, 15},
+                {"n1-standard-8", 8, 30},
+                {"n1-standard-16", 16, 60},
+                {"n1-standard-32", 32, 120},
+            };
+            static constexpr shape large[] = {
+                {"n1-standard-4", 4, 15},    {"n1-standard-8", 8, 30},
+                {"n1-standard-16", 16, 60},  {"n1-standard-32", 32, 120},
+                {"n1-standard-64", 64, 240}, {"n1-standard-96", 96, 360},
+            };
+            const std::string name = requested.gpu_count < 4
+                                         ? smallest_shape(requested, small, provider)
+                                         : smallest_shape(requested, large, provider);
+            return {name, gpu, requested.gpu_count};
+        }
+        if (gpu == "l4" && requested.gpu_count == 1) {
+            static constexpr shape one_gpu[] = {
+                {"g2-standard-4", 4, 16},   {"g2-standard-8", 8, 32},    {"g2-standard-12", 12, 48},
+                {"g2-standard-16", 16, 64}, {"g2-standard-32", 32, 128},
+            };
+            return {smallest_shape(requested, one_gpu, provider), gpu, 1};
+        }
+        if (gpu == "l4") {
+            struct fixed {
+                unsigned count;
+                const char* name;
+                unsigned cpus;
+                double memory;
+            };
+            static constexpr fixed shapes[] = {
+                {2, "g2-standard-24", 24, 96},
+                {4, "g2-standard-48", 48, 192},
+                {8, "g2-standard-96", 96, 384},
+            };
+            for (const auto& candidate : shapes)
+                if (requested.gpu_count == candidate.count && requested.cpus <= candidate.cpus &&
+                    requested.memory_gb <= candidate.memory)
+                    return {candidate.name, gpu, candidate.count};
+        }
+        if (gpu == "a100") {
+            struct fixed {
+                unsigned count;
+                const char* name;
+                unsigned cpus;
+                double memory;
+            };
+            static constexpr fixed shapes[] = {
+                {1, "a2-ultragpu-1g", 12, 170},
+                {2, "a2-ultragpu-2g", 24, 340},
+                {4, "a2-ultragpu-4g", 48, 680},
+                {8, "a2-ultragpu-8g", 96, 1360},
+            };
+            for (const auto& candidate : shapes)
+                if (requested.gpu_count == candidate.count && requested.cpus <= candidate.cpus &&
+                    requested.memory_gb <= candidate.memory)
+                    return {candidate.name, gpu, candidate.count};
+        }
+        if (gpu == "h100") {
+            struct fixed {
+                unsigned count;
+                const char* name;
+                unsigned cpus;
+                double memory;
+            };
+            static constexpr fixed shapes[] = {
+                {1, "a3-highgpu-1g", 26, 234},
+                {2, "a3-highgpu-2g", 52, 468},
+                {4, "a3-highgpu-4g", 104, 936},
+                {8, "a3-highgpu-8g", 208, 1872},
+            };
+            for (const auto& candidate : shapes)
+                if (requested.gpu_count == candidate.count && requested.cpus <= candidate.cpus &&
+                    requested.memory_gb <= candidate.memory) {
+                    if (candidate.count < 8 && !requested.spot)
+                        throw error(
+                            "GCP A3 High shapes with fewer than eight H100 GPUs require Spot");
+                    return {candidate.name, gpu, candidate.count};
+                }
+        }
+        throw error(
+            "No built-in GCP machine has the requested accelerator model, count, CPU, and memory");
+    }
+    if (provider == "azure") {
+        if (requested.gpu_count != 1)
+            throw error("Built-in Azure accelerator mappings currently require gpu_count == 1");
+        struct gpu_shape {
+            const char* gpu;
+            const char* name;
+            unsigned cpus;
+            double memory;
+        };
+        static constexpr gpu_shape shapes[] = {
+            {"t4", "Standard_NC4as_T4_v3", 4, 28},
+            {"a10", "Standard_NV36ads_A10_v5", 36, 440},
+            {"a100", "Standard_NC24ads_A100_v4", 24, 220},
+            {"h100", "Standard_NC40ads_H100_v5", 40, 320},
+        };
+        for (const auto& candidate : shapes)
+            if (gpu == candidate.gpu && requested.cpus <= candidate.cpus &&
+                requested.memory_gb <= candidate.memory)
+                return {candidate.name, gpu, 1};
+        throw error("No built-in Azure machine has the requested accelerator model, count, CPU, "
+                    "and memory");
+    }
+
+    const auto target = cfg.aws.gpu_targets.find(gpu);
+    if (target == cfg.aws.gpu_targets.end() || target->second.machine_type.empty() ||
+        (requested.spot ? target->second.spot_job_queue : target->second.job_queue).empty())
+        throw error("AWS accelerator \"" + gpu +
+                    "\" requires a dedicated queue and exact instance type in config::aws");
+    if (!target->second.cpus || !(target->second.memory_gb > 0) ||
+        !std::isfinite(target->second.memory_gb) || !target->second.gpus)
+        throw error("AWS accelerator target \"" + gpu + "\" has incomplete capacity metadata");
+    if (requested.cpus > target->second.cpus || requested.memory_gb > target->second.memory_gb ||
+        requested.gpu_count > target->second.gpus)
+        throw error("AWS accelerator target \"" + gpu +
+                    "\" cannot satisfy the requested resources");
+    warnings.push_back("AWS GPU model relies on the configured queue containing only " + gpu +
+                       " instances");
+    return {target->second.machine_type, gpu, requested.gpu_count};
+}
+
+inline void validate_spec(const job_spec& spec);
+inline void validate_provider_spec(std::string_view provider, const config& cfg,
+                                   const job_spec& spec);
+
+inline cloud::plan make_provider_plan(const config& cfg, const job_spec& spec,
+                                      std::string provider) {
+    // Provider planning is deterministic and mutation-free. It validates both
+    // portable and backend-specific contracts before exposing a native shape.
+    validate_spec(spec);
+    cloud::plan out;
+    out.provider = std::move(provider);
+    if (!implemented(out.provider))
+        throw error(out.provider + " backend is not implemented");
+    validate_provider_spec(out.provider, cfg, spec);
+    out.region = detail::region(configured_region(cfg, out.provider), out.provider);
+    const auto selected_machine = machine(out.provider, cfg, spec.resources, out.warnings);
+    out.machine_type = selected_machine.name;
+    out.accelerator = selected_machine.accelerator;
+    out.accelerator_count = selected_machine.accelerator_count;
+    if (spec.resources.max_price_per_hour) {
+        if (!std::isfinite(*spec.resources.max_price_per_hour) ||
+            *spec.resources.max_price_per_hour < 0)
+            throw error("Maximum hourly price must be finite and nonnegative");
+    }
+    out.warnings.push_back("egress cost is not estimated");
+    if (out.provider == "gcp" && spec.service_account.empty())
+        out.warnings.push_back("Batch VM uses the default Compute Engine service account");
+    if (out.provider == "aws")
+        out.warnings.push_back("AWS Batch retains terminal job records; auto_delete removes only "
+                               "the temporary job definition");
+    if (out.provider == "aws")
+        out.warnings.push_back(
+            "AWS Batch command replaces image CMD but preserves the image ENTRYPOINT");
+    if (out.provider == "azure")
+        out.warnings.push_back(
+            "Azure task-file logs are grouped by stdout/stderr rather than globally ordered");
+    return out;
+}
+
+inline std::string strings(const std::vector<std::string>& values, std::size_t begin = 0) {
+    std::string out = "[";
+    for (std::size_t i = begin; i < values.size(); ++i) {
+        if (i != begin)
+            out += ',';
+        out += gcp::detail::json_quote(values[i]);
+    }
+    return out + ']';
+}
+
+inline void validate_workdir(std::string_view path) {
+    for (const char c : path)
+        if (!gcp::detail::is_ascii_alnum(c) && c != '/' && c != '.' && c != '_' && c != '-')
+            throw error("Container workdir contains an unsafe character");
+}
+
+inline std::uint64_t memory_mib(double memory_gb) {
+    const long double value = std::ceil(static_cast<long double>(memory_gb) * 1024.0L);
+    if (!std::isfinite(value) || value < 1 ||
+        value > static_cast<long double>(std::numeric_limits<std::uint64_t>::max()))
+        throw error("Requested memory cannot be represented in MiB");
+    return static_cast<std::uint64_t>(value);
+}
+
+inline void validate_spec(const job_spec& spec) {
+    if (spec.image.empty() || spec.command.empty() || spec.command.front().empty())
+        throw error("A job requires a container image and a non-empty command");
+    if (spec.retries > 10)
+        throw error("Cloud jobs allow at most 10 retries");
+    if (spec.timeout <= std::chrono::milliseconds::zero() ||
+        spec.timeout > std::chrono::hours(24 * 14))
+        throw error("Job timeout must be positive and at most 14 days");
+    validate_workdir(spec.workdir);
+    if (spec.service_account.find('\r') != std::string::npos ||
+        spec.service_account.find('\n') != std::string::npos)
+        throw error("Service account contains an invalid newline");
+    for (const auto& item : spec.mounts) {
+        const uri source = parse_uri(item.source);
+        if (!source.key.empty() && !source.key.ends_with('/'))
+            throw error("GCS job mounts require a bucket or directory prefix ending in '/'");
+        if (item.target.empty() || item.target.front() != '/' ||
+            item.target.find(':') != std::string::npos)
+            throw error("Mount targets must be absolute container paths without ':'");
+    }
+}
+
+inline void validate_provider_spec(std::string_view provider, const config& cfg,
+                                   const job_spec& spec) {
+    if (provider == "gcp")
+        return;
+    if (!spec.mounts.empty())
+        throw error(std::string(provider) + " Batch storage mounts are not implemented");
+    if (provider == "aws") {
+        if (!spec.workdir.empty())
+            throw error("AWS Batch has no portable per-job container working-directory field");
+        if (spec.retries > 9)
+            throw error("AWS Batch permits at most 10 total attempts");
+        if (spec.timeout < std::chrono::seconds(60))
+            throw error("AWS Batch job timeout must be at least 60 seconds");
+        if (memory_mib(spec.resources.memory_gb) < 4)
+            throw error("AWS Batch EC2 jobs require at least 4 MiB of memory");
+        const std::string gpu =
+            spec.resources.gpu.empty() ? std::string{} : canonical_gpu(spec.resources.gpu);
+        if (gpu.empty()) {
+            const auto& queue = spec.resources.spot ? cfg.aws.spot_job_queue : cfg.aws.job_queue;
+            if (queue.empty())
+                throw error(std::string("AWS ") + (spec.resources.spot ? "Spot" : "on-demand") +
+                            " jobs require a configured Batch queue");
+        } else {
+            const auto it = cfg.aws.gpu_targets.find(gpu);
+            if (it == cfg.aws.gpu_targets.end() ||
+                (spec.resources.spot ? it->second.spot_job_queue : it->second.job_queue).empty())
+                throw error("AWS accelerator \"" + gpu +
+                            "\" requires a configured dedicated queue");
+        }
+        return;
+    }
+    if (!spec.service_account.empty())
+        throw error("Azure Batch auto-pools do not support job_spec::service_account");
+    if (cfg.azure.batch_endpoint.empty())
+        throw error("Azure jobs require config::azure.batch_endpoint");
+    if (!cfg.azure.batch_endpoint.starts_with("https://") &&
+        !(cfg.allow_insecure_http && cfg.azure.batch_endpoint.starts_with("http://")))
+        throw error("Azure batch_endpoint must use HTTPS (or explicitly allow insecure HTTP)");
+    std::string endpoint = cfg.azure.batch_endpoint;
+    std::transform(endpoint.begin(), endpoint.end(), endpoint.begin(), gcp::detail::ascii_lower);
+    const std::string azure_region = region(configured_region(cfg, "azure"), "azure");
+    if (endpoint.find(".batch.") != std::string::npos &&
+        endpoint.find(std::string(".") + azure_region + ".batch.") == std::string::npos)
+        throw error("Azure batch_endpoint region does not match the selected Azure region");
+    for (const auto& argument : spec.command) {
+        if (argument.empty())
+            throw error("Azure Batch command arguments must not be empty");
+        for (const char c : argument)
+            if (!gcp::detail::is_ascii_alnum(c) && c != '/' && c != '.' && c != '_' && c != '-' &&
+                c != ':' && c != '=' && c != '+' && c != '@' && c != '%' && c != ',')
+                throw error(
+                    "Azure Batch direct arguments currently allow only portable token characters");
+    }
+}
+
+inline std::string batch_body(const job_spec& spec, const cloud::plan& chosen) {
+    // GCP Batch owns queueing and temporary VM lifecycle. The request creates one
+    // task, blocks inherited project SSH keys, mounts GCS prefixes through GCS
+    // FUSE, and lets Batch install GPU drivers when an accelerator is present.
+    std::string container = "{\"imageUri\":" + gcp::detail::json_quote(spec.image) +
+                            ",\"entrypoint\":" + gcp::detail::json_quote(spec.command.front()) +
+                            ",\"commands\":" + strings(spec.command, 1);
+    if (!spec.workdir.empty())
+        container += ",\"options\":" + gcp::detail::json_quote("--workdir=" + spec.workdir);
+
+    std::string task_volumes;
+    std::string container_volumes;
+    for (std::size_t i = 0; i < spec.mounts.size(); ++i) {
+        const auto& item = spec.mounts[i];
+        const uri source = parse_uri(item.source);
+        const std::string host = "/mnt/disks/cloud-" + std::to_string(i);
+        const std::string remote = source.bucket + (source.key.empty() ? "" : "/" + source.key);
+        if (!task_volumes.empty()) {
+            task_volumes += ',';
+            container_volumes += ',';
+        }
+        task_volumes += "{\"gcs\":{\"remotePath\":" + gcp::detail::json_quote(remote) +
+                        "},\"mountPath\":" + gcp::detail::json_quote(host) + '}';
+        container_volumes +=
+            gcp::detail::json_quote(host + ":" + item.target + (item.read_only ? ":ro" : ""));
+    }
+    if (!container_volumes.empty())
+        container += ",\"volumes\":[" + container_volumes + ']';
+    container += '}';
+
+    const auto milliseconds = spec.timeout.count();
+    const auto seconds = milliseconds / 1000 + (milliseconds % 1000 != 0);
+    const auto memory = memory_mib(spec.resources.memory_gb);
+    std::string task =
+        "{\"runnables\":[{\"container\":" + container + "}],\"computeResource\":{\"cpuMilli\":" +
+        gcp::detail::json_quote(std::to_string(spec.resources.cpus * 1000ULL)) +
+        ",\"memoryMib\":" + gcp::detail::json_quote(std::to_string(memory)) +
+        "},\"maxRunDuration\":" + gcp::detail::json_quote(std::to_string(seconds) + "s") +
+        ",\"maxRetryCount\":" + std::to_string(spec.retries);
+    if (!task_volumes.empty())
+        task += ",\"volumes\":[" + task_volumes + ']';
+    task += '}';
+
+    const std::string service_account =
+        spec.service_account.empty()
+            ? std::string{}
+            : ",\"serviceAccount\":{\"email\":" + gcp::detail::json_quote(spec.service_account) +
+                  '}';
+
+    std::string instance_policy =
+        "{\"machineType\":" + gcp::detail::json_quote(chosen.machine_type) +
+        ",\"provisioningModel\":\"" + std::string(spec.resources.spot ? "SPOT" : "STANDARD") + '"';
+    if (chosen.accelerator == "t4")
+        instance_policy += ",\"accelerators\":[{\"type\":\"nvidia-tesla-t4\",\"count\":" +
+                           std::to_string(chosen.accelerator_count) + "}]";
+    instance_policy += '}';
+    const std::string gpu_driver =
+        chosen.accelerator.empty() ? std::string{} : ",\"installGpuDrivers\":true";
+
+    // Keep the historical cloud-hpp label keys stable: external cleanup and
+    // inventory policies may already select them even though the header is now cloud.h.
+    return "{\"taskGroups\":[{\"taskSpec\":" + task +
+           ",\"taskCount\":\"1\",\"parallelism\":\"1\"}],"
+           "\"allocationPolicy\":{\"location\":{\"allowedLocations\":[" +
+           gcp::detail::json_quote("regions/" + chosen.region) +
+           "]},\"instances\":[{\"policy\":" + instance_policy + ",\"blockProjectSshKeys\":true" +
+           gpu_driver + "}]" + service_account +
+           "},"
+           "\"logsPolicy\":{\"destination\":\"CLOUD_LOGGING\"},"
+           "\"labels\":{\"cloud-hpp\":\"temporary\",\"cloud-hpp-ttl-seconds\":" +
+           gcp::detail::json_quote(std::to_string(seconds)) + "}}";
+}
+
+inline std::string job_id(std::string value) {
+    // Reserve space below provider length limits for a random suffix. The suffix
+    // makes names unique audit/recovery handles for ambiguous submissions.
+    for (char& c : value) {
+        c = gcp::detail::ascii_lower(c);
+        if (!gcp::detail::is_ascii_alnum(c))
+            c = '-';
+    }
+    while (!value.empty() && value.back() == '-')
+        value.pop_back();
+    if (value.empty() || !gcp::detail::is_ascii_alpha(value.front()))
+        value = "job-" + value;
+    if (value.size() > 46)
+        value.resize(46);
+    std::string suffix = gcp::detail::random_uuid();
+    suffix.erase(std::remove(suffix.begin(), suffix.end(), '-'), suffix.end());
+    return value + '-' + suffix.substr(0, 16);
+}
+
+// Provider transports and public catalog pricing ------------------------------
+
+// Shared immutable configuration plus the few synchronized caches. Handles keep
+// this state alive, so callbacks and credential caches outlive the client object
+// from which a job/storage/compute handle was copied.
+struct client_state {
+    cloud::config config;
+    gcp::Cloud raw;
+    gcp::Credentials azure_auth;
+    mutable std::mutex price_mutex;
+    mutable std::map<std::string, std::pair<std::chrono::steady_clock::time_point, double>,
+                     std::less<>>
+        price_cache;
+
+    static gcp::Config low_level(const cloud::config& value) {
+        gcp::Config out;
+        out.project = value.project;
+        out.zone = configured_zone(value, "gcp");
+        out.credentials = value.auth.for_scope("https://www.googleapis.com/auth/cloud-platform");
+        out.timeout = value.request_timeout;
+        out.transfer_timeout = value.transfer_timeout;
+        out.allow_insecure_http = value.allow_insecure_http;
+        out.storage_endpoint = value.storage_endpoint;
+        out.compute_endpoint = value.compute_endpoint;
+        out.batch_endpoint = value.batch_endpoint;
+        out.logging_endpoint = value.logging_endpoint;
+        return out;
+    }
+
+    explicit client_state(cloud::config value)
+        : config(std::move(value)), raw(low_level(config)),
+          azure_auth((config.azure.auth ? *config.azure.auth : config.auth)
+                         .for_scope("https://batch.core.windows.net/.default")) {
+        if (config.poll_interval <= std::chrono::milliseconds::zero() ||
+            config.final_log_delay < std::chrono::milliseconds::zero() ||
+            config.final_log_timeout < config.final_log_delay ||
+            config.cleanup_timeout <= std::chrono::milliseconds::zero() ||
+            config.price_cache_ttl <= std::chrono::milliseconds::zero() ||
+            config.spot_price_cache_ttl <= std::chrono::milliseconds::zero())
+            throw error("Polling and cleanup durations must be valid");
+    }
+
+    [[nodiscard]] std::shared_ptr<gcp::detail::Core> core() const { return raw.core_; }
+
+    [[nodiscard]] const gcp::Credentials& azure_credentials() const { return azure_auth; }
+};
+
+inline bool retryable(long status) {
+    return status == 0 || status == 408 || status == 429 || (status >= 500 && status < 600);
+}
+
+inline void validate_endpoint(const client_state& client, std::string_view value,
+                              std::string_view name) {
+    if (value.starts_with("https://"))
+        return;
+    if (value.starts_with("http://") && client.config.allow_insecure_http)
+        return;
+    throw error(std::string(name) + " must use HTTPS (or set allow_insecure_http explicitly)");
+}
+
+inline std::string aws_endpoint(const client_state& client, std::string_view configured,
+                                std::string_view service, std::string_view region) {
+    std::string value =
+        configured.empty()
+            ? "https://" + std::string(service) + '.' + std::string(region) +
+                  (region.starts_with("cn-") ? ".amazonaws.com.cn" : ".amazonaws.com")
+            : gcp::detail::base_url(std::string(configured));
+    validate_endpoint(client, value, "AWS endpoint");
+    return value;
+}
+
+inline gcp::detail::HttpRequest::AwsSignature
+aws_signature(const client_state& client, std::string region, std::string service) {
+    // A refresh callback wins over explicit fields, which win over the standard
+    // environment variables. Profiles, SSO, ECS, and EC2 metadata are outside
+    // this small header and can be adapted through the callback.
+    cloud::aws_credentials supplied;
+    if (client.config.aws.credentials) {
+        supplied = client.config.aws.credentials();
+    } else if (!client.config.aws.access_key_id.empty() ||
+               !client.config.aws.secret_access_key.empty() ||
+               !client.config.aws.session_token.empty()) {
+        supplied = {client.config.aws.access_key_id, client.config.aws.secret_access_key,
+                    client.config.aws.session_token};
+    } else {
+        supplied = {gcp::detail::env("AWS_ACCESS_KEY_ID"),
+                    gcp::detail::env("AWS_SECRET_ACCESS_KEY"),
+                    gcp::detail::env("AWS_SESSION_TOKEN")};
+    }
+    auto access = std::move(supplied.access_key_id);
+    auto secret = std::move(supplied.secret_access_key);
+    auto token = std::move(supplied.session_token);
+    if (access.empty() || secret.empty())
+        throw error("AWS credentials require an access key ID and secret access key");
+    return {.access_key_id = std::move(access),
+            .secret_access_key = std::move(secret),
+            .session_token = std::move(token),
+            .region = std::move(region),
+            .service = std::move(service)};
+}
+
+inline void check_response(std::string_view provider, const gcp::detail::HttpResponse& response) {
+    if (response.status >= 200 && response.status < 300)
+        return;
+    const std::string body = gcp::detail::compact_error_body(response.body);
+    std::string message =
+        std::string(provider) + " request failed with HTTP " + std::to_string(response.status);
+    if (!body.empty())
+        message += ": " + body;
+    throw error(std::move(message), response.status, body);
+}
+
+inline gcp::detail::HttpResponse aws_call(
+    const client_state& client, gcp::detail::HttpRequest request, std::string region,
+    std::string service, bool retry = true,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    // Each attempt is freshly SigV4-signed because credentials may be temporary.
+    // Callers disable automatic replay for mutations whose acceptance is ambiguous.
+    request.aws_signature = aws_signature(client, std::move(region), std::move(service));
+    const auto base_timeout = request.timeout.value_or(client.config.request_timeout);
+    for (int attempt = 0;; ++attempt) {
+        auto current = request;
+        current.timeout = base_timeout;
+        if (deadline != std::chrono::steady_clock::time_point::max()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                throw error("Cloud operation deadline exceeded");
+            current.timeout = std::max(
+                std::chrono::milliseconds(1),
+                std::min(base_timeout,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+        }
+        try {
+            auto response = gcp::detail::http(std::move(current));
+            check_response("AWS", response);
+            return response;
+        } catch (const error& failure) {
+            if (!retry || attempt == 3 || !retryable(failure.http_status()))
+                throw;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
+    }
+}
+
+inline std::string http_date() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+#ifdef _WIN32
+    if (gmtime_s(&utc, &now) != 0)
+        throw error("Cannot create Azure request date");
+#else
+    if (!gmtime_r(&now, &utc))
+        throw error("Cannot create Azure request date");
+#endif
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::put_time(&utc, "%a, %d %b %Y %H:%M:%S GMT");
+    return out.str();
+}
+
+inline std::string iso_time() {
+    const std::time_t now = std::time(nullptr);
+    std::tm utc{};
+#ifdef _WIN32
+    if (gmtime_s(&utc, &now) != 0)
+        throw error("Cannot create UTC request time");
+#else
+    if (!gmtime_r(&now, &utc))
+        throw error("Cannot create UTC request time");
+#endif
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::put_time(&utc, "%Y-%m-%dT%H:%M:%SZ");
+    return out.str();
+}
+
+inline gcp::detail::HttpResponse azure_call(
+    const client_state& client, gcp::detail::HttpRequest request, bool retry = true,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    // Azure receives a fresh client-request-id and bearer token per attempt. One
+    // 401 invalidates the shared token cache before normal retry classification.
+    if (request.url.empty())
+        throw error("Azure request URL must not be empty");
+    validate_endpoint(client, request.url, "Azure endpoint");
+    const auto base_timeout = request.timeout.value_or(client.config.request_timeout);
+    for (int attempt = 0;; ++attempt) {
+        auto current = request;
+        current.timeout = base_timeout;
+        if (deadline != std::chrono::steady_clock::time_point::max()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                throw error("Cloud operation deadline exceeded");
+            current.timeout = std::max(
+                std::chrono::milliseconds(1),
+                std::min(base_timeout,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+        }
+        const auto token = client.azure_credentials().access_token();
+        current.headers.push_back(gcp::detail::header("Authorization", "Bearer " + token.value));
+        current.headers.push_back(gcp::detail::header("ocp-date", http_date()));
+        current.headers.push_back(
+            gcp::detail::header("client-request-id", gcp::detail::random_uuid()));
+        current.headers.push_back("return-client-request-id: true");
+        if (current.accept_json)
+            current.headers.push_back("Accept: application/json");
+        try {
+            auto response = gcp::detail::http(std::move(current));
+            if (response.status == 401 && attempt == 0) {
+                client.azure_credentials().invalidate();
+                continue;
+            }
+            check_response("Azure", response);
+            return response;
+        } catch (const error& failure) {
+            if (!retry || attempt == 3 || !retryable(failure.http_status()))
+                throw;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
+    }
+}
+
+inline gcp::detail::HttpResponse call(
+    const client_state& client, const gcp::detail::HttpRequest& request,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    // Status-less failures plus HTTP 408, 429, and 5xx are retried. Mutation
+    // callers also use provider idempotency keys for ambiguous responses.
+    const auto base_timeout = request.timeout.value_or(client.config.request_timeout);
+    for (int attempt = 0;; ++attempt) {
+        auto current = request;
+        if (deadline != std::chrono::steady_clock::time_point::max()) {
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline)
+                throw error("Cloud operation deadline exceeded");
+            current.timeout = std::max(
+                std::chrono::milliseconds(1),
+                std::min(base_timeout,
+                         std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+        }
+        try {
+            return client.core()->call(std::move(current));
+        } catch (const error& failure) {
+            if (attempt == 3 || !retryable(failure.http_status()))
+                throw;
+        }
+        auto backoff = std::chrono::milliseconds(100 * (1 << attempt));
+        if (deadline != std::chrono::steady_clock::time_point::max())
+            backoff =
+                std::min(backoff, std::max(std::chrono::milliseconds::zero(),
+                                           std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               deadline - std::chrono::steady_clock::now())));
+        if (backoff <= std::chrono::milliseconds::zero())
+            throw error("Cloud operation deadline exceeded");
+        std::this_thread::sleep_for(backoff);
+    }
+}
+
+inline gcp::detail::HttpResponse public_call(const client_state& client,
+                                             gcp::detail::HttpRequest request) {
+    validate_endpoint(client, request.url, "Public pricing endpoint");
+    const auto base_timeout = request.timeout.value_or(client.config.request_timeout);
+    for (int attempt = 0;; ++attempt) {
+        request.timeout = base_timeout;
+        try {
+            auto response = gcp::detail::http(request);
+            check_response("Public pricing API", response);
+            return response;
+        } catch (const error& failure) {
+            if (attempt == 3 || !retryable(failure.http_status()))
+                throw;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
+    }
+}
+
+inline double decimal(std::string text, std::string_view field_name) {
+    if (text.empty())
+        throw error("Missing decimal " + std::string(field_name));
+    double value = 0;
+    const auto [end, code] =
+        std::from_chars(text.data(), text.data() + text.size(), value, std::chars_format::general);
+    if (code != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
+        value < 0)
+        throw error("Invalid decimal " + std::string(field_name));
+    return value;
+}
+
+inline std::string lowercase(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(), gcp::detail::ascii_lower);
+    return value;
+}
+
+inline bool contains(std::string_view value, std::string_view needle) {
+    return value.find(needle) != std::string_view::npos;
+}
+
+inline bool json_array_contains(const gcp::detail::Json& value, std::string_view key,
+                                std::string_view wanted) {
+    const auto* array = value.get(key);
+    if (!array)
+        return false;
+    return std::any_of(array->array().begin(), array->array().end(),
+                       [&](const auto& item) { return item.text() == wanted; });
+}
+
+inline std::optional<double> gcp_sku_unit_price(const gcp::detail::Json& sku) {
+    const auto* info = sku.get("pricingInfo");
+    if (!info || info->array().empty())
+        return std::nullopt;
+    const auto& latest = info->array().back();
+    const auto* expression = latest.get("pricingExpression");
+    const auto* rates = expression ? expression->get("tieredRates") : nullptr;
+    if (!rates || rates->array().empty())
+        return std::nullopt;
+    const auto* price = rates->array().front().get("unitPrice");
+    if (!price || gcp::detail::field(*price, "currencyCode") != "USD")
+        return std::nullopt;
+    const std::string units = gcp::detail::field(*price, "units");
+    const std::string nanos = gcp::detail::field(*price, "nanos");
+    const double whole = units.empty() ? 0.0 : decimal(units, "GCP price units");
+    const double fractional = nanos.empty() ? 0.0 : decimal(nanos, "GCP price nanos") / 1e9;
+    return whole + fractional;
+}
+
+inline std::pair<double, double> gcp_machine_resources(const cloud::plan& chosen) {
+    const auto suffix = [&](std::string_view marker) -> std::optional<unsigned> {
+        if (!chosen.machine_type.starts_with(marker))
+            return std::nullopt;
+        try {
+            return static_cast<unsigned>(std::stoul(chosen.machine_type.substr(marker.size())));
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    };
+    if (const auto n = suffix("e2-standard-"))
+        return {*n, *n * 4.0};
+    if (const auto n = suffix("n1-standard-"))
+        return {*n, *n * 3.75};
+    if (const auto n = suffix("g2-standard-"))
+        return {*n, *n * 4.0};
+    if (chosen.machine_type.starts_with("a2-ultragpu-"))
+        return {12.0 * chosen.accelerator_count, 170.0 * chosen.accelerator_count};
+    if (chosen.machine_type.starts_with("a3-highgpu-"))
+        return {26.0 * chosen.accelerator_count, 234.0 * chosen.accelerator_count};
+    throw error("No GCP pricing composition for machine type " + chosen.machine_type);
+}
+
+inline std::optional<double> gcp_catalog_price(const client_state& client,
+                                               const cloud::plan& chosen, bool spot) {
+    // Compose hourly CPU, RAM, and optional GPU component SKUs. Filters reject
+    // custom/sole-tenant/commitment variants and conflicting component matches.
+    // A2 Ultra and A3 High shapes also carry mandatory billed Local SSD. Until
+    // that inseparable component can be quoted on the same hourly basis, leave
+    // the whole estimate unavailable so a configured price ceiling fails closed.
+    if (chosen.machine_type.starts_with("a2-ultragpu-") ||
+        chosen.machine_type.starts_with("a3-highgpu-"))
+        return std::nullopt;
+    const std::string endpoint = gcp::detail::base_url(client.config.billing_endpoint);
+    validate_endpoint(client, endpoint, "GCP billing_endpoint");
+    struct component {
+        std::vector<std::string> needles;
+        std::string label;
+        double quantity;
+        std::optional<double> unit;
+    };
+    const auto [cpus, memory] = gcp_machine_resources(chosen);
+    std::string family = chosen.machine_type.substr(0, chosen.machine_type.find('-'));
+    std::vector<component> components{
+        {{family, "instance core"}, family + " core", cpus, std::nullopt},
+        {{family, "instance ram"}, family + " ram", memory, std::nullopt}};
+    if (!chosen.accelerator.empty())
+        components.push_back({{chosen.accelerator, "gpu"},
+                              chosen.accelerator + " gpu",
+                              static_cast<double>(chosen.accelerator_count),
+                              std::nullopt});
+
+    std::string page;
+    do {
+        std::string url = endpoint + "/v1/services/6F81-5844-456A/skus?pageSize=5000";
+        if (!page.empty())
+            url += "&pageToken=" + gcp::detail::encode(page);
+        const auto json = gcp::detail::parse_json(
+            call(client, gcp::detail::HttpRequest{.url = std::move(url)}).body);
+        gcp::detail::for_each_json(json, "skus", [&](const gcp::detail::Json& sku) {
+            if (!json_array_contains(sku, "serviceRegions", chosen.region))
+                return;
+            const std::string description = lowercase(gcp::detail::field(sku, "description"));
+            const auto* category = sku.get("category");
+            const std::string usage =
+                category ? lowercase(gcp::detail::field(*category, "usageType")) : std::string{};
+            if (spot ? (usage != "preemptible" && usage != "spot") : usage != "ondemand")
+                return;
+            if ((family == "e2" || family == "g2") && contains(description, "custom"))
+                return;
+            if (contains(description, "sole tenancy"))
+                return;
+            if (family == "n1" &&
+                (contains(description, "instance core") || contains(description, "instance ram")) &&
+                !contains(description, "predefined"))
+                return;
+            if ((chosen.accelerator == "a100" || chosen.accelerator == "h100") &&
+                contains(description, chosen.accelerator) && contains(description, "gpu") &&
+                !contains(description, "80gb"))
+                return;
+            if (family == "a3" && contains(description, "mega"))
+                return;
+            for (auto& component : components) {
+                if (!std::all_of(component.needles.begin(), component.needles.end(),
+                                 [&](const auto& needle) { return contains(description, needle); }))
+                    continue;
+                const auto price = gcp_sku_unit_price(sku);
+                if (!price)
+                    continue;
+                if (component.unit && std::fabs(*component.unit - *price) > 1e-12)
+                    throw error("GCP catalog returned ambiguous prices for " + component.label);
+                component.unit = price;
+            }
+        });
+        page = gcp::detail::field(json, "nextPageToken");
+    } while (!page.empty());
+
+    double total = 0;
+    for (const auto& component : components) {
+        if (!component.unit)
+            return std::nullopt;
+        total += *component.unit * component.quantity;
+    }
+    return total;
+}
+
+inline std::optional<double> aws_catalog_price(const client_state& client,
+                                               const cloud::plan& chosen, bool spot) {
+    // Spot is the newest Linux/UNIX observation for one exact Availability Zone.
+    // On-demand requires one unique Linux/shared/no-software hourly price term.
+    if (chosen.machine_type == "batch-managed")
+        return std::nullopt;
+    if (spot) {
+        const std::string zone = configured_zone(client.config, "aws");
+        if (zone.empty())
+            return std::nullopt;
+        const std::string endpoint =
+            aws_endpoint(client, client.config.aws.ec2_endpoint, "ec2", chosen.region);
+        const std::string body =
+            "Action=DescribeSpotPriceHistory&Version=2016-11-15&MaxResults=1&InstanceType.1=" +
+            gcp::detail::encode(chosen.machine_type) +
+            "&ProductDescription.1=Linux%2FUNIX&AvailabilityZone=" + gcp::detail::encode(zone) +
+            "&StartTime=" + gcp::detail::encode(iso_time());
+        const auto response = aws_call(
+            client,
+            gcp::detail::HttpRequest{.method = "POST",
+                                     .url = endpoint + '/',
+                                     .headers = {"Content-Type: application/x-www-form-urlencoded"},
+                                     .body = body,
+                                     .accept_json = false},
+            chosen.region, "ec2");
+        const std::string open = "<spotPrice>";
+        const std::string close = "</spotPrice>";
+        const auto begin = response.body.find(open);
+        const auto end = begin == std::string::npos
+                             ? std::string::npos
+                             : response.body.find(close, begin + open.size());
+        if (begin == std::string::npos || end == std::string::npos)
+            return std::nullopt;
+        return decimal(response.body.substr(begin + open.size(), end - begin - open.size()),
+                       "AWS Spot price");
+    }
+
+    const std::string endpoint = gcp::detail::base_url(client.config.aws.pricing_endpoint);
+    validate_endpoint(client, endpoint, "AWS pricing_endpoint");
+    const auto filter = [](std::string_view field, std::string_view value) {
+        return "{\"Type\":\"TERM_MATCH\",\"Field\":" + gcp::detail::json_quote(field) +
+               ",\"Value\":" + gcp::detail::json_quote(value) + '}';
+    };
+    std::optional<double> found;
+    std::string token;
+    do {
+        std::string body = "{\"ServiceCode\":\"AmazonEC2\",\"FormatVersion\":\"aws_v1\","
+                           "\"MaxResults\":100,\"Filters\":[" +
+                           filter("instanceType", chosen.machine_type) + ',' +
+                           filter("regionCode", chosen.region) + ',' +
+                           filter("operatingSystem", "Linux") + ',' + filter("tenancy", "Shared") +
+                           ',' + filter("preInstalledSw", "NA") + ',' +
+                           filter("capacitystatus", "Used") + ']';
+        if (!token.empty())
+            body += ",\"NextToken\":" + gcp::detail::json_quote(token);
+        body += '}';
+        const auto outer = gcp::detail::parse_json(
+            aws_call(client,
+                     gcp::detail::HttpRequest{
+                         .method = "POST",
+                         .url = endpoint + '/',
+                         .headers = {"Content-Type: application/x-amz-json-1.1",
+                                     "X-Amz-Target: AWSPriceListService.GetProducts"},
+                         .body = body,
+                     },
+                     client.config.aws.pricing_region, "pricing")
+                .body);
+        const auto* products = outer.get("PriceList");
+        if (products)
+            for (const auto& encoded_product : products->array()) {
+                const auto product = gcp::detail::parse_json(encoded_product.text());
+                const auto* terms = product.get("terms");
+                const auto* on_demand = terms ? terms->get("OnDemand") : nullptr;
+                if (!on_demand)
+                    continue;
+                for (const auto& [unused_term, term] : on_demand->object()) {
+                    (void)unused_term;
+                    const auto* dimensions = term.get("priceDimensions");
+                    if (!dimensions)
+                        continue;
+                    for (const auto& [unused_dimension, dimension] : dimensions->object()) {
+                        (void)unused_dimension;
+                        if (gcp::detail::field(dimension, "unit") != "Hrs")
+                            continue;
+                        const auto* per_unit = dimension.get("pricePerUnit");
+                        if (!per_unit)
+                            continue;
+                        const std::string usd = gcp::detail::field(*per_unit, "USD");
+                        if (usd.empty())
+                            continue;
+                        const double price = decimal(usd, "AWS on-demand price");
+                        if (found && std::fabs(*found - price) > 1e-12)
+                            throw error("AWS catalog returned ambiguous hourly prices");
+                        found = price;
+                    }
+                }
+            }
+        token = gcp::detail::field(outer, "NextToken");
+    } while (!token.empty());
+    return found;
+}
+
+inline std::optional<double> azure_catalog_price(const client_state& client,
+                                                 const cloud::plan& chosen, bool spot) {
+    // Select the latest effective primary-region USD consumption row. Windows,
+    // low-priority, wrong-market, and conflicting same-date rows are rejected.
+    const std::string endpoint = gcp::detail::base_url(client.config.azure.pricing_endpoint);
+    validate_endpoint(client, endpoint, "Azure pricing_endpoint");
+    const std::string filter = "serviceName eq 'Virtual Machines' and armRegionName eq '" +
+                               chosen.region + "' and armSkuName eq '" + chosen.machine_type +
+                               "' and priceType eq 'Consumption'";
+    std::string url = endpoint + "?$filter=" + gcp::detail::encode(filter);
+    std::optional<double> found;
+    std::string effective;
+    const std::string now = iso_time();
+    while (!url.empty()) {
+        const auto json =
+            gcp::detail::parse_json(public_call(client, gcp::detail::HttpRequest{.url = url}).body);
+        gcp::detail::for_each_json(json, "Items", [&](const gcp::detail::Json& item) {
+            const std::string arm_sku = gcp::detail::field(item, "armSkuName");
+            if (gcp::detail::field(item, "currencyCode") != "USD" ||
+                gcp::detail::field(item, "armRegionName") != chosen.region ||
+                (arm_sku != chosen.machine_type &&
+                 (!spot || arm_sku != chosen.machine_type + " Spot")) ||
+                gcp::detail::field(item, "type") != "Consumption" ||
+                gcp::detail::field(item, "unitOfMeasure") != "1 Hour" ||
+                !item.get("isPrimaryMeterRegion") || !item.get("isPrimaryMeterRegion")->boolean())
+                return;
+            const std::string product = lowercase(gcp::detail::field(item, "productName"));
+            const std::string meter = lowercase(gcp::detail::field(item, "meterName"));
+            const std::string sku = lowercase(gcp::detail::field(item, "skuName"));
+            if (contains(product, "windows"))
+                return;
+            if (contains(meter, "low priority") || contains(sku, "low priority"))
+                return;
+            const bool item_spot = contains(meter, "spot") || contains(sku, "spot");
+            if (item_spot != spot)
+                return;
+            const std::string item_effective = gcp::detail::field(item, "effectiveStartDate");
+            if (item_effective.empty() || item_effective > now)
+                return;
+            const std::string value = gcp::detail::field(item, "retailPrice");
+            if (value.empty())
+                return;
+            const double price = decimal(value, "Azure retail price");
+            if (effective.empty() || item_effective > effective) {
+                effective = item_effective;
+                found = price;
+            } else if (item_effective == effective && found && std::fabs(*found - price) > 1e-12) {
+                throw error(
+                    "Azure retail API returned conflicting prices with the same effective date");
+            }
+        });
+        url = gcp::detail::field(json, "NextPageLink");
+    }
+    return found;
+}
+
+inline std::optional<double> catalog_price(const client_state& client, const cloud::plan& chosen,
+                                           bool spot) {
+    // Cache keys include provider, region, zone, native shape, accelerator, and
+    // market. Only successful quotes are cached; unavailable prices are retried.
+    const std::string key = chosen.provider + '\n' + chosen.region + '\n' +
+                            configured_zone(client.config, chosen.provider) + '\n' +
+                            chosen.machine_type + '\n' + chosen.accelerator + '\n' +
+                            std::to_string(chosen.accelerator_count) +
+                            (spot ? "\nspot" : "\nondemand");
+    const auto now = std::chrono::steady_clock::now();
+    const auto ttl = spot ? client.config.spot_price_cache_ttl : client.config.price_cache_ttl;
+    {
+        std::lock_guard lock(client.price_mutex);
+        const auto it = client.price_cache.find(key);
+        if (it != client.price_cache.end() && now - it->second.first < ttl)
+            return it->second.second;
+    }
+    std::optional<double> price;
+    if (chosen.provider == "gcp")
+        price = gcp_catalog_price(client, chosen, spot);
+    if (chosen.provider == "aws")
+        price = aws_catalog_price(client, chosen, spot);
+    if (chosen.provider == "azure")
+        price = azure_catalog_price(client, chosen, spot);
+    if (price) {
+        std::lock_guard lock(client.price_mutex);
+        client.price_cache[key] = {now, *price};
+    }
+    return price;
+}
+
+inline cloud::plan priced_plan(const client_state& client, const job_spec& spec,
+                               std::string provider) {
+    // Enforce a single pricing source and fail closed for a configured ceiling.
+    // The compatibility callback cannot price accelerators because its signature
+    // predates model/count fields, so those plans require the rich callback.
+    auto out = make_provider_plan(client.config, spec, std::move(provider));
+    const bool custom = static_cast<bool>(client.config.lookup_hourly_cost) ||
+                        static_cast<bool>(client.config.estimate_hourly_cost);
+    if (client.config.lookup_hourly_cost)
+        out.estimated_hourly_cost =
+            client.config.lookup_hourly_cost({.provider = out.provider,
+                                              .region = out.region,
+                                              .zone = configured_zone(client.config, out.provider),
+                                              .machine_type = out.machine_type,
+                                              .accelerator = out.accelerator,
+                                              .accelerator_count = out.accelerator_count,
+                                              .spot = spec.resources.spot});
+    else if (client.config.estimate_hourly_cost) {
+        if (!out.accelerator.empty())
+            throw error(
+                "Accelerator pricing requires config::lookup_hourly_cost; the compatibility "
+                "estimator omits the accelerator and count");
+        out.estimated_hourly_cost = client.config.estimate_hourly_cost(
+            out.provider, out.region, out.machine_type, spec.resources.spot);
+    } else if (client.config.prices == price_source::public_catalog) {
+        out.estimated_hourly_cost = catalog_price(client, out, spec.resources.spot);
+    }
+    if (out.estimated_hourly_cost &&
+        (!std::isfinite(*out.estimated_hourly_cost) || *out.estimated_hourly_cost < 0))
+        throw error("Price lookup returned an invalid hourly price");
+    if (!out.estimated_hourly_cost)
+        out.warnings.push_back("hourly cost unavailable; estimates are never guarantees");
+    else if (custom)
+        out.warnings.push_back(
+            "hourly estimate came from the caller-supplied callback and remains advisory");
+    else
+        out.warnings.push_back("hourly estimate is public USD compute list price; disks, network, "
+                               "taxes, and discounts are excluded");
+    if (spec.resources.max_price_per_hour) {
+        if (!out.estimated_hourly_cost)
+            throw error("A maximum hourly price requires an available price lookup");
+        const double estimate = *out.estimated_hourly_cost;
+        const double maximum = *spec.resources.max_price_per_hour;
+        const double roundoff = 8 * std::numeric_limits<double>::epsilon() *
+                                std::max(std::fabs(estimate), std::fabs(maximum));
+        if (estimate > maximum && estimate - maximum > roundoff)
+            throw error("Estimated hourly price exceeds the configured maximum");
+    }
+    return out;
+}
+
+inline cloud::plan make_plan(const client_state& client, const job_spec& spec) {
+    // ordered tolerates an unrunnable provider and records why it was skipped.
+    // lowest_cost instead requires comparable successful quotes before choosing;
+    // stable provider order breaks equal-price ties.
+    const std::vector<provider> choices = client.config.provider
+                                              ? std::vector<provider>{*client.config.provider}
+                                              : client.config.providers;
+    if (choices.empty())
+        throw error("No cloud provider configured");
+    std::vector<cloud::plan> candidates;
+    std::vector<std::string> skipped;
+    for (const auto& provider : choices) {
+        if (!implemented(provider)) {
+            skipped.push_back(provider + " backend is not implemented; skipped");
+            if (client.config.provider)
+                throw error(provider + " backend is not implemented");
+            continue;
+        }
+        try {
+            auto candidate = priced_plan(client, spec, provider);
+            candidate.warnings.insert(candidate.warnings.begin(), skipped.begin(), skipped.end());
+            if (client.config.selection == selection::ordered)
+                return candidate;
+            if (!candidate.estimated_hourly_cost)
+                throw error("lowest_cost requires an hourly price for " + provider);
+            candidates.push_back(std::move(candidate));
+        } catch (const error& failure) {
+            if (client.config.provider || client.config.selection == selection::lowest_cost)
+                throw;
+            skipped.push_back(provider + " skipped: " + failure.what());
+        }
+    }
+    if (candidates.empty())
+        throw error("None of the configured cloud providers can run the job");
+    if (client.config.selection == selection::lowest_cost && candidates.size() < 2)
+        throw error("lowest_cost requires at least two runnable providers with hourly prices");
+    const auto best =
+        std::min_element(candidates.begin(), candidates.end(), [](const auto& a, const auto& b) {
+            return *a.estimated_hourly_cost < *b.estimated_hourly_cost;
+        });
+    return *best;
+}
+
+// Job state, logs, cancellation, and cleanup ----------------------------------
+
+inline void pause(const client_state& client, std::chrono::steady_clock::time_point deadline) {
+    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+        deadline - std::chrono::steady_clock::now());
+    if (remaining > std::chrono::milliseconds::zero())
+        std::this_thread::sleep_for(std::min(client.config.poll_interval, remaining));
+}
+
+struct job_data {
+    // Every public job copy shares this mutable controller state. id is the
+    // public provider ID, name is the provider lookup/audit name, and auxiliary
+    // is the AWS definition ARN or Azure task ID (unused by GCP).
+    std::shared_ptr<client_state> client;
+    job_spec spec;
+    cloud::plan chosen;
+    std::string id;
+    std::string name;
+    std::string auxiliary;
+    mutable std::string uid;
+    mutable bool cancel_requested = false;
+    mutable std::optional<result> cached;
+    mutable std::vector<log_entry> log_cache;
+    mutable std::unordered_set<std::string> log_ids;
+
+    // GCP tracks a receive-time overlap/high-water pair; AWS tracks one token per
+    // CloudWatch stream; Azure tracks epoch-keyed byte offsets and incomplete
+    // line tails. These checkpoints are committed only after a successful poll.
+    mutable std::string log_cursor;
+    mutable std::string log_high_water;
+    mutable std::map<std::string, std::string, std::less<>> log_cursors;
+    mutable std::map<std::string, std::uint64_t, std::less<>> log_offsets;
+    mutable std::map<std::string, std::string, std::less<>> log_tails;
+    mutable std::map<std::string, std::uint64_t, std::less<>> log_tail_offsets;
+    mutable std::string azure_log_epoch;
+    mutable std::uint64_t azure_log_generation = 0;
+    std::chrono::steady_clock::time_point submitted = std::chrono::steady_clock::now();
+};
+
+inline job_state parse_state(std::string_view state) {
+#define CLOUD_H_PARSE_JOB_STATE(name, value)                                                       \
+    if (state == value)                                                                            \
+        return job_state::name;
+    CLOUD_H_JOB_STATES(CLOUD_H_PARSE_JOB_STATE)
+#undef CLOUD_H_PARSE_JOB_STATE
+    return job_state::unknown;
+}
+
+#undef CLOUD_H_JOB_STATES
+
+inline bool terminal(job_state state) {
+    return state == job_state::succeeded || state == job_state::failed ||
+           state == job_state::cancelled;
+}
+
+inline std::string aws_batch_endpoint(const client_state& client, std::string_view region) {
+    return aws_endpoint(client, client.config.aws.batch_endpoint, "batch", region);
+}
+
+inline std::string aws_logs_endpoint(const client_state& client, std::string_view region) {
+    return aws_endpoint(client, client.config.aws.logs_endpoint, "logs", region);
+}
+
+inline std::string azure_batch_url(const client_state& client, std::string path) {
+    if (client.config.azure.batch_endpoint.empty())
+        throw error("Azure jobs require config::azure.batch_endpoint");
+    const char separator = path.find('?') == std::string::npos ? '?' : '&';
+    return gcp::detail::base_url(client.config.azure.batch_endpoint) + std::move(path) + separator +
+           "api-version=" + gcp::detail::encode(client.config.azure.api_version);
+}
+
+inline const gcp::detail::Json* aws_job_object(const gcp::detail::Json& json) {
+    const auto* jobs = json.get("jobs");
+    return jobs && !jobs->array().empty() ? &jobs->array().front() : nullptr;
+}
+
+inline gcp::detail::Json get_job(
+    const job_data& job,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    if (job.chosen.provider == "gcp") {
+        auto response =
+            call(*job.client,
+                 gcp::detail::HttpRequest{
+                     .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name,
+                 },
+                 deadline);
+        return gcp::detail::parse_json(response.body);
+    }
+    if (job.chosen.provider == "aws") {
+        const auto response = aws_call(
+            *job.client,
+            gcp::detail::HttpRequest{
+                .method = "POST",
+                .url = aws_batch_endpoint(*job.client, job.chosen.region) + "/v1/describejobs",
+                .headers = {"Content-Type: application/json"},
+                .body = "{\"jobs\":[" + gcp::detail::json_quote(job.id) + "]}",
+            },
+            job.chosen.region, "batch", true, deadline);
+        const auto outer = gcp::detail::parse_json(response.body);
+        const auto* value = aws_job_object(outer);
+        if (!value)
+            throw error("AWS Batch no longer returned job " + job.id);
+        return *value;
+    }
+    const auto response = azure_call(
+        *job.client,
+        gcp::detail::HttpRequest{
+            .url = azure_batch_url(*job.client, "/jobs/" + gcp::detail::encode(job.name) +
+                                                    "/tasks/" + gcp::detail::encode(job.auxiliary)),
+        },
+        true, deadline);
+    return gcp::detail::parse_json(response.body);
+}
+
+inline job_state update(const job_data& job, const gcp::detail::Json& json) {
+    if (job.chosen.provider == "gcp") {
+        if (job.uid.empty())
+            job.uid = gcp::detail::field(json, "uid");
+        const auto* status = json.get("status");
+        return status ? parse_state(gcp::detail::field(*status, "state")) : job_state::unknown;
+    }
+    if (job.chosen.provider == "aws") {
+        const std::string state = gcp::detail::field(json, "status");
+        if (state == "SUBMITTED" || state == "PENDING")
+            return job_state::queued;
+        if (state == "RUNNABLE" || state == "STARTING")
+            return job_state::scheduled;
+        if (state == "RUNNING")
+            return job_state::running;
+        if (state == "SUCCEEDED")
+            return job_state::succeeded;
+        if (state == "FAILED") {
+            const std::string reason = gcp::detail::field(json, "statusReason");
+            return contains(reason, "cloud.h cancellation") ? job_state::cancelled
+                                                            : job_state::failed;
+        }
+        return job_state::unknown;
+    }
+    const std::string state = lowercase(gcp::detail::field(json, "state"));
+    if (state == "active")
+        return job_state::queued;
+    if (state == "preparing")
+        return job_state::scheduled;
+    if (state == "running")
+        return job_state::running;
+    if (state == "completed") {
+        const auto* execution = json.get("executionInfo");
+        if (execution && lowercase(gcp::detail::field(*execution, "result")) == "success")
+            return job_state::succeeded;
+        return job.cancel_requested ? job_state::cancelled : job_state::failed;
+    }
+    return job_state::unknown;
+}
+
+inline std::string status_error(const job_data& job, const gcp::detail::Json& json) {
+    if (job.chosen.provider == "aws") {
+        std::string message = gcp::detail::field(json, "statusReason");
+        if (const auto* container = json.get("container")) {
+            const std::string reason = gcp::detail::field(*container, "reason");
+            if (!reason.empty())
+                message = reason;
+        }
+        return message.empty() ? "AWS Batch job failed" : message;
+    }
+    if (job.chosen.provider == "azure") {
+        const auto* execution = json.get("executionInfo");
+        const auto* failure = execution ? execution->get("failureInfo") : nullptr;
+        std::string message = failure ? gcp::detail::field(*failure, "message") : std::string{};
+        return message.empty() ? "Azure Batch task failed" : message;
+    }
+    const auto* status = json.get("status");
+    std::string message;
+    if (status)
+        gcp::detail::for_each_json(*status, "statusEvents", [&](const gcp::detail::Json& event) {
+            const std::string value = gcp::detail::field(event, "description");
+            if (!value.empty())
+                message = value;
+        });
+    return message.empty() ? "Batch job failed" : message;
+}
+
+inline std::optional<int> task_exit_code(const job_data& job) {
+    if (job.chosen.provider != "gcp") {
+        try {
+            const auto json = get_job(job);
+            const auto* source =
+                job.chosen.provider == "aws" ? json.get("container") : json.get("executionInfo");
+            const std::string value =
+                source ? gcp::detail::field(*source, "exitCode") : std::string{};
+            if (value.empty())
+                return std::nullopt;
+            return std::stoi(value);
+        } catch (const std::exception&) {
+            return std::nullopt;
+        }
+    }
+    try {
+        const auto deadline = std::chrono::steady_clock::now() + job.client->config.request_timeout;
+        auto response = call(*job.client,
+                             gcp::detail::HttpRequest{
+                                 .url = job.client->core()->config.batch_endpoint + "/v1/" +
+                                        job.name + "/taskGroups/group0/tasks/0",
+                             },
+                             deadline);
+        const auto json = gcp::detail::parse_json(response.body);
+        const auto* status = json.get("status");
+        const auto* events = status ? status->get("statusEvents") : nullptr;
+        std::optional<int> code;
+        if (events)
+            for (const auto& event : events->array())
+                if (const auto* execution = event.get("taskExecution")) {
+                    const std::string value = gcp::detail::field(*execution, "exitCode");
+                    if (!value.empty()) {
+                        try {
+                            code = std::stoi(value);
+                        } catch (const std::exception&) {
+                            return std::nullopt;
+                        }
+                    }
+                }
+        return code;
+    } catch (const error&) {
+        return std::nullopt;
+    }
+}
+
+inline std::vector<log_entry> logs(
+    const job_data& job,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    if (job.chosen.provider == "aws") {
+        // A retry can create one CloudWatch stream per attempt. Work on copied
+        // cursors and commit them only after every stream converges so a partial
+        // polling failure remains retryable without gaps.
+        const auto current = get_job(job, deadline);
+        std::vector<std::string> streams;
+        const auto add_stream = [&](const gcp::detail::Json& value) {
+            const auto* container = value.get("container");
+            const std::string stream =
+                container ? gcp::detail::field(*container, "logStreamName") : std::string{};
+            if (!stream.empty() &&
+                std::find(streams.begin(), streams.end(), stream) == streams.end())
+                streams.push_back(stream);
+        };
+        gcp::detail::for_each_json(current, "attempts", add_stream);
+        add_stream(current);
+        std::vector<log_entry> out;
+        auto next_cursors = job.log_cursors;
+        for (const auto& stream : streams) {
+            std::string token = next_cursors[stream];
+            bool converged = false;
+            for (int page = 0; page < 100; ++page) {
+                std::string body = "{\"logGroupName\":" +
+                                   gcp::detail::json_quote(job.client->config.aws.log_group) +
+                                   ",\"logStreamName\":" + gcp::detail::json_quote(stream) +
+                                   ",\"startFromHead\":true";
+                if (!token.empty())
+                    body += ",\"nextToken\":" + gcp::detail::json_quote(token);
+                body += '}';
+                const auto response =
+                    aws_call(*job.client,
+                             gcp::detail::HttpRequest{
+                                 .method = "POST",
+                                 .url = aws_logs_endpoint(*job.client, job.chosen.region) + '/',
+                                 .headers = {"Content-Type: application/x-amz-json-1.1",
+                                             "X-Amz-Target: Logs_20140328.GetLogEvents"},
+                                 .body = std::move(body),
+                             },
+                             job.chosen.region, "logs", true, deadline);
+                const auto json = gcp::detail::parse_json(response.body);
+                std::size_t index = 0;
+                gcp::detail::for_each_json(json, "events", [&](const gcp::detail::Json& event) {
+                    const std::string timestamp = gcp::detail::field(event, "timestamp");
+                    const std::string received = gcp::detail::field(event, "ingestionTime");
+                    const std::string text = gcp::detail::field(event, "message");
+                    out.push_back({.timestamp = timestamp,
+                                   .receive_timestamp = received,
+                                   .id = stream + ':' + token + ':' + timestamp + ':' + received +
+                                         ':' + std::to_string(index++),
+                                   .text = text,
+                                   .severity = "DEFAULT"});
+                });
+                const std::string next = gcp::detail::field(json, "nextForwardToken");
+                if (next.empty() || next == token) {
+                    converged = true;
+                    break;
+                }
+                token = next;
+                next_cursors[stream] = token;
+            }
+            if (!converged)
+                throw error("AWS CloudWatch Logs pagination did not converge within 100 pages");
+        }
+        job.log_cursors = std::move(next_cursors);
+        return out;
+    }
+    if (job.chosen.provider == "azure") {
+        // Azure exposes append-only stdout/stderr files rather than log events.
+        // An execution epoch distinguishes retries/requeues; range offsets resume
+        // reads and tails retain incomplete lines until newline or terminal state.
+        const auto task = get_job(job, deadline);
+        const bool final = terminal(update(job, task));
+        const auto* execution = task.get("executionInfo");
+        const auto execution_field = [&](std::string_view name, std::string fallback = {}) {
+            if (!execution)
+                return fallback;
+            std::string value = gcp::detail::field(*execution, name);
+            return value.empty() ? fallback : value;
+        };
+        const std::string start_time = execution_field("startTime");
+        const std::string retry_count = execution_field("retryCount", "0");
+        const std::string requeue_count = execution_field("requeueCount", "0");
+        const std::string epoch = std::to_string(start_time.size()) + ':' + start_time + ':' +
+                                  retry_count + ':' + requeue_count;
+        std::vector<log_entry> out;
+        auto offsets = job.log_offsets;
+        auto tails = job.log_tails;
+        auto tail_offsets = job.log_tail_offsets;
+        std::string active_epoch = job.azure_log_epoch;
+        std::uint64_t active_generation = job.azure_log_generation;
+        const auto order = [](std::uint64_t generation, std::string_view stream,
+                              std::uint64_t offset) {
+            std::ostringstream value;
+            value << std::setw(20) << std::setfill('0') << generation << ':'
+                  << (stream == "stdout.txt" ? '0' : '1') << ':' << std::setw(20)
+                  << std::setfill('0') << offset;
+            return value.str();
+        };
+        if (active_epoch.empty()) {
+            active_epoch = epoch;
+        } else if (active_epoch != epoch) {
+            for (const std::string_view stream :
+                 {std::string_view("stdout.txt"), std::string_view("stderr.txt")}) {
+                const std::string old_key = active_epoch + ':' + std::string(stream);
+                auto tail = tails.find(old_key);
+                if (tail == tails.end() || tail->second.empty())
+                    continue;
+                std::string text = std::move(tail->second);
+                tail->second.clear();
+                if (!text.empty() && text.back() == '\r')
+                    text.pop_back();
+                const std::uint64_t offset = tail_offsets[old_key];
+                out.push_back({.timestamp = order(active_generation, stream, offset),
+                               .id = old_key + ':' + std::to_string(offset),
+                               .text = std::move(text),
+                               .severity = stream == "stderr.txt" ? "ERROR" : "DEFAULT"});
+                tail_offsets[old_key] = offsets[old_key];
+            }
+            active_epoch = epoch;
+            ++active_generation;
+        }
+        for (const std::string_view stream :
+             {std::string_view("stdout.txt"), std::string_view("stderr.txt")}) {
+            const std::string key = epoch + ':' + std::string(stream);
+            const std::string path = "/jobs/" + gcp::detail::encode(job.name) + "/tasks/" +
+                                     gcp::detail::encode(job.auxiliary) + "/files/" +
+                                     gcp::detail::encode(stream);
+            gcp::detail::HttpResponse properties;
+            try {
+                properties = azure_call(*job.client,
+                                        gcp::detail::HttpRequest{
+                                            .method = "HEAD",
+                                            .url = azure_batch_url(*job.client, path),
+                                            .accept_json = false,
+                                        },
+                                        true, deadline);
+            } catch (const error& failure) {
+                if (failure.http_status() == 404)
+                    continue;
+                throw;
+            }
+            const auto length_header = properties.headers.find("content-length");
+            if (length_header == properties.headers.end())
+                throw error("Azure Batch task-file response omitted Content-Length");
+            std::uint64_t length = 0;
+            try {
+                std::size_t used = 0;
+                length = std::stoull(length_header->second, &used);
+                if (used != length_header->second.size())
+                    throw std::invalid_argument("suffix");
+            } catch (const std::exception&) {
+                throw error("Azure Batch task-file response had invalid Content-Length");
+            }
+            if (length < offsets[key]) {
+                offsets[key] = 0;
+                tails[key].clear();
+                tail_offsets[key] = 0;
+            }
+            const std::uint64_t start = offsets[key];
+            std::string bytes;
+            if (length > start) {
+                const auto response =
+                    azure_call(*job.client,
+                               gcp::detail::HttpRequest{
+                                   .url = azure_batch_url(*job.client, path),
+                                   .headers = {gcp::detail::header(
+                                       "ocp-range", "bytes=" + std::to_string(start) + '-' +
+                                                        std::to_string(length - 1))},
+                                   .accept_json = false,
+                               },
+                               true, deadline);
+                bytes = response.body;
+                const auto expected = length - start;
+                if (bytes.size() != expected) {
+                    if (response.status == 200 && bytes.size() == length && start <= bytes.size())
+                        bytes.erase(0, static_cast<std::size_t>(start));
+                    else
+                        throw error(
+                            "Azure Batch task-file range returned an unexpected byte count");
+                }
+                offsets[key] = length;
+            }
+            std::uint64_t base = start;
+            if (!tails[key].empty()) {
+                base = tail_offsets[key];
+                bytes.insert(0, tails[key]);
+            }
+            std::size_t position = 0;
+            while (position < bytes.size()) {
+                const auto end = bytes.find('\n', position);
+                if (end == std::string::npos && !final)
+                    break;
+                const auto line_length = (end == std::string::npos ? bytes.size() : end) - position;
+                std::string text = bytes.substr(position, line_length);
+                if (!text.empty() && text.back() == '\r')
+                    text.pop_back();
+                out.push_back({.timestamp = order(active_generation, stream, base + position),
+                               .id = key + ':' + std::to_string(base + position),
+                               .text = std::move(text),
+                               .severity = stream == "stderr.txt" ? "ERROR" : "DEFAULT"});
+                if (end == std::string::npos)
+                    break;
+                position = end + 1;
+            }
+            if (position < bytes.size() && !final) {
+                tails[key] = bytes.substr(position);
+                tail_offsets[key] = base + position;
+            } else {
+                tails[key].clear();
+                tail_offsets[key] = offsets[key];
+            }
+        }
+        job.log_offsets = std::move(offsets);
+        job.log_tails = std::move(tails);
+        job.log_tail_offsets = std::move(tail_offsets);
+        job.azure_log_epoch = std::move(active_epoch);
+        job.azure_log_generation = active_generation;
+        return out;
+    }
+    if (job.uid.empty())
+        update(job, get_job(job, deadline));
+    std::vector<log_entry> out;
+    std::string page;
+    // Query from the previous high-water receive time, then deduplicate by
+    // stable log identity. The overlap avoids gaps when Logging exposes entries
+    // with equal or delayed timestamps on different polls.
+    do {
+        const std::string project = job.client->core()->project();
+        validate_project(project);
+        const std::string filter =
+            "logName = \"projects/" + project +
+            "/logs/batch_task_logs\" AND labels.job_uid=" + job.uid +
+            (job.log_cursor.empty() ? std::string{}
+                                    : " AND receiveTimestamp >= \"" + job.log_cursor + "\"");
+        std::string body = "{\"resourceNames\":[" + gcp::detail::json_quote("projects/" + project) +
+                           "],\"filter\":" + gcp::detail::json_quote(filter) +
+                           ",\"orderBy\":\"timestamp desc\"";
+        if (!page.empty())
+            body += ",\"pageToken\":" + gcp::detail::json_quote(page);
+        body += '}';
+        auto response =
+            call(*job.client,
+                 gcp::detail::HttpRequest{
+                     .method = "POST",
+                     .url = job.client->core()->config.logging_endpoint + "/v2/entries:list",
+                     .headers = {"Content-Type: application/json"},
+                     .body = std::move(body),
+                 },
+                 deadline);
+        const auto json = gcp::detail::parse_json(response.body);
+        gcp::detail::for_each_json(json, "entries", [&](const gcp::detail::Json& entry) {
+            log_entry line{
+                .timestamp = gcp::detail::field(entry, "timestamp"),
+                .receive_timestamp = gcp::detail::field(entry, "receiveTimestamp"),
+                .id = gcp::detail::field(entry, "insertId"),
+                .text = gcp::detail::field(entry, "textPayload"),
+                .severity = gcp::detail::field(entry, "severity"),
+            };
+            if (line.text.empty())
+                if (const auto* payload = entry.get("jsonPayload"))
+                    line.text = gcp::detail::field(*payload, "message");
+            if (line.text.empty())
+                line.text = "[structured log entry]";
+            if (line.id.empty())
+                line.id = line.timestamp + '\n' + line.text;
+            out.push_back(std::move(line));
+        });
+        page = gcp::detail::field(json, "nextPageToken");
+    } while (!page.empty());
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.timestamp, a.id) < std::tie(b.timestamp, b.id);
+    });
+    for (const auto& line : out) {
+        std::string received = line.receive_timestamp;
+        if (received.size() == 20 && received.back() == 'Z')
+            received.insert(19, ".000000000");
+        else if (received.size() > 21 && received[19] == '.' && received.back() == 'Z' &&
+                 received.size() <= 29 &&
+                 std::all_of(received.begin() + 20, received.end() - 1,
+                             [](char c) { return c >= '0' && c <= '9'; }))
+            received.insert(received.size() - 1, 9 - (received.size() - 21), '0');
+        if (received.empty())
+            continue;
+        if (job.log_high_water.empty() || received > job.log_high_water) {
+            job.log_cursor = job.log_high_water;
+            job.log_high_water = std::move(received);
+        } else if (received < job.log_high_water &&
+                   (job.log_cursor.empty() || received > job.log_cursor)) {
+            job.log_cursor = std::move(received);
+        }
+    }
+    return out;
+}
+
+inline std::vector<log_entry> merge_logs(
+    const job_data& job,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    // All provider readers may overlap prior data. This single identity set makes
+    // repeated status/log polling idempotent and retains a stable cached snapshot.
+    std::vector<log_entry> added;
+    for (auto& line : logs(job, deadline)) {
+        const std::string identity = line.timestamp + '\n' + line.id;
+        if (job.log_ids.insert(identity).second) {
+            added.push_back(line);
+            job.log_cache.push_back(std::move(line));
+        }
+    }
+    std::sort(job.log_cache.begin(), job.log_cache.end(), [](const auto& a, const auto& b) {
+        return std::tie(a.timestamp, a.id) < std::tie(b.timestamp, b.id);
+    });
+    return added;
+}
+
+template <typename Poll> inline void drain_logs(const job_data& job, Poll poll) {
+    // Terminal state can become visible before final log entries. Stop after a
+    // configurable quiet period, but always cap the best-effort drain duration.
+    const auto stop = std::chrono::steady_clock::now() + job.client->config.final_log_timeout;
+    auto quiet_since = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() < stop) {
+        if (poll(stop))
+            quiet_since = std::chrono::steady_clock::now();
+        if (std::chrono::steady_clock::now() - quiet_since >= job.client->config.final_log_delay)
+            break;
+        pause(*job.client, stop);
+    }
+}
+
+inline void wait_operation(const client_state& client, const std::string& name,
+                           std::chrono::steady_clock::time_point deadline) {
+    if (name.empty())
+        throw error("Malformed Batch operation: missing name");
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto response = call(client,
+                             gcp::detail::HttpRequest{
+                                 .url = client.core()->config.batch_endpoint + "/v1/" + name,
+                             },
+                             deadline);
+        const auto json = gcp::detail::parse_json(response.body);
+        if (const auto* done = json.get("done"); done && done->boolean()) {
+            if (const auto* failure = json.get("error")) {
+                std::string message = gcp::detail::field(*failure, "message");
+                throw error("Batch cleanup failed" +
+                            (message.empty() ? std::string{} : ": " + message));
+            }
+            return;
+        }
+        pause(client, deadline);
+    }
+    throw error("Timed out waiting for Batch operation");
+}
+
+inline void delete_job(const job_data& job, std::string_view reason) {
+    // "Delete" is provider-specific cleanup: AWS can only deregister the
+    // temporary definition; Azure must terminate the job to release its lifetime
+    // auto-pool and deletes the record only when requested; GCP deletes the job
+    // and waits for the returned long-running operation.
+    const auto deadline = std::chrono::steady_clock::now() + job.client->config.cleanup_timeout;
+    if (job.chosen.provider == "aws") {
+        if (job.auxiliary.empty())
+            return;
+        (void)aws_call(
+            *job.client,
+            gcp::detail::HttpRequest{
+                .method = "POST",
+                .url = aws_batch_endpoint(*job.client, job.chosen.region) +
+                       "/v1/deregisterjobdefinition",
+                .headers = {"Content-Type: application/json"},
+                .body = "{\"jobDefinition\":" + gcp::detail::json_quote(job.auxiliary) + "}",
+            },
+            job.chosen.region, "batch", false, deadline);
+        return;
+    }
+    if (job.chosen.provider == "azure") {
+        bool termination_uncertain = false;
+        const auto request_termination = [&] {
+            try {
+                (void)azure_call(
+                    *job.client,
+                    gcp::detail::HttpRequest{
+                        .method = "POST",
+                        .url = azure_batch_url(
+                            *job.client, "/jobs/" + gcp::detail::encode(job.name) + "/terminate"),
+                        .headers = {"Content-Type: application/json"},
+                        .body = "{\"terminateReason\":" + gcp::detail::json_quote(reason) + "}",
+                    },
+                    false, deadline);
+                termination_uncertain = false;
+                return true;
+            } catch (const error& failure) {
+                if (failure.http_status() == 404)
+                    return false;
+                if (failure.http_status() == 409) {
+                    termination_uncertain = false;
+                    return true;
+                }
+                if (retryable(failure.http_status())) {
+                    termination_uncertain = true;
+                    return true;
+                }
+                throw;
+            }
+        };
+        if (!request_termination())
+            return;
+        bool completed = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            try {
+                const auto response =
+                    azure_call(*job.client,
+                               gcp::detail::HttpRequest{
+                                   .url = azure_batch_url(*job.client,
+                                                          "/jobs/" + gcp::detail::encode(job.name)),
+                               },
+                               true, deadline);
+                const auto json = gcp::detail::parse_json(response.body);
+                if (lowercase(gcp::detail::field(json, "state")) == "completed") {
+                    completed = true;
+                    break;
+                }
+            } catch (const error& failure) {
+                if (failure.http_status() == 404)
+                    return;
+                throw;
+            }
+            if (termination_uncertain && !request_termination())
+                return;
+            pause(*job.client, deadline);
+        }
+        if (!completed)
+            throw error("Timed out waiting for Azure Batch job termination");
+        if (!job.spec.auto_delete)
+            return;
+        const auto request_delete = [&] {
+            try {
+                (void)azure_call(*job.client,
+                                 gcp::detail::HttpRequest{
+                                     .method = "DELETE",
+                                     .url = azure_batch_url(
+                                         *job.client, "/jobs/" + gcp::detail::encode(job.name)),
+                                 },
+                                 false, deadline);
+                return true;
+            } catch (const error& failure) {
+                if (failure.http_status() == 404)
+                    return false;
+                if (failure.http_status() == 409 || retryable(failure.http_status()))
+                    return true;
+                throw;
+            }
+        };
+        if (!request_delete())
+            return;
+        while (std::chrono::steady_clock::now() < deadline) {
+            try {
+                const auto response =
+                    azure_call(*job.client,
+                               gcp::detail::HttpRequest{
+                                   .url = azure_batch_url(*job.client,
+                                                          "/jobs/" + gcp::detail::encode(job.name)),
+                               },
+                               true, deadline);
+                const auto state =
+                    lowercase(gcp::detail::field(gcp::detail::parse_json(response.body), "state"));
+                // A status-less DELETE can fail before reaching Azure. Once existence
+                // is confirmed, safely repeat the fixed-resource deletion request.
+                if (state != "deleting" && !request_delete())
+                    return;
+            } catch (const error& failure) {
+                if (failure.http_status() == 404)
+                    return;
+                throw;
+            }
+            pause(*job.client, deadline);
+        }
+        throw error("Timed out waiting for Azure Batch job deletion");
+    }
+    gcp::detail::HttpResponse response;
+    try {
+        response = call(*job.client,
+                        gcp::detail::HttpRequest{
+                            .method = "DELETE",
+                            .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name +
+                                   "?reason=" + gcp::detail::encode(reason) +
+                                   "&requestId=" + gcp::detail::random_uuid(),
+                        },
+                        deadline);
+    } catch (const error& failure) {
+        if (failure.http_status() == 404)
+            return;
+        throw;
+    }
+    wait_operation(*job.client, gcp::detail::field(gcp::detail::parse_json(response.body), "name"),
+                   deadline);
+}
+
+inline gcp::detail::Json wait_terminal(const job_data& job,
+                                       std::chrono::steady_clock::time_point deadline) {
+    while (std::chrono::steady_clock::now() < deadline) {
+        auto json = get_job(job, deadline);
+        if (terminal(update(job, json)))
+            return json;
+        pause(*job.client, deadline);
+    }
+    throw error("Timed out waiting for Batch job to become terminal");
+}
+
+inline gcp::detail::Json cancel_job(const job_data& job) {
+    // Cancellation first observes current state. AWS escalates CancelJob to
+    // TerminateJob after a job starts; Azure terminates the task; GCP sends an
+    // idempotent cancel request. Ambiguous mutations are repeated only after a
+    // subsequent read confirms that the resource is still live.
+    const auto deadline = std::chrono::steady_clock::now() + job.client->config.cleanup_timeout;
+    auto current = get_job(job, deadline);
+    if (terminal(update(job, current)))
+        return current;
+    if (job.chosen.provider == "aws") {
+        const std::string status = gcp::detail::field(current, "status");
+        std::string action = status == "SUBMITTED" || status == "PENDING" || status == "RUNNABLE"
+                                 ? "canceljob"
+                                 : "terminatejob";
+        bool mutation_uncertain = false;
+        const auto request = [&](std::string_view operation) {
+            try {
+                (void)aws_call(*job.client,
+                               gcp::detail::HttpRequest{
+                                   .method = "POST",
+                                   .url = aws_batch_endpoint(*job.client, job.chosen.region) +
+                                          "/v1/" + std::string(operation),
+                                   .headers = {"Content-Type: application/json"},
+                                   .body = "{\"jobId\":" + gcp::detail::json_quote(job.id) +
+                                           ",\"reason\":\"cloud.h cancellation\"}",
+                               },
+                               job.chosen.region, "batch", false, deadline);
+                mutation_uncertain = false;
+            } catch (const error& failure) {
+                if (!retryable(failure.http_status()))
+                    throw;
+                mutation_uncertain = true;
+            }
+            job.cancel_requested = true;
+        };
+        request(action);
+        while (std::chrono::steady_clock::now() < deadline) {
+            current = get_job(job, deadline);
+            if (terminal(update(job, current)))
+                return current;
+            const std::string observed = gcp::detail::field(current, "status");
+            if (action != "terminatejob" && (observed == "STARTING" || observed == "RUNNING")) {
+                action = "terminatejob";
+                mutation_uncertain = true;
+            }
+            if (mutation_uncertain)
+                request(action);
+            pause(*job.client, deadline);
+        }
+        throw error("Timed out waiting for AWS Batch cancellation");
+    }
+    if (job.chosen.provider == "azure") {
+        bool termination_uncertain = false;
+        const auto request_termination = [&] {
+            try {
+                (void)azure_call(
+                    *job.client,
+                    gcp::detail::HttpRequest{
+                        .method = "POST",
+                        .url = azure_batch_url(
+                            *job.client, "/jobs/" + gcp::detail::encode(job.name) + "/tasks/" +
+                                             gcp::detail::encode(job.auxiliary) + "/terminate"),
+                        .headers = {"Content-Type: application/json"},
+                        .body = "{}",
+                    },
+                    false, deadline);
+                termination_uncertain = false;
+            } catch (const error& failure) {
+                if (failure.http_status() == 409) {
+                    termination_uncertain = false;
+                } else if (retryable(failure.http_status())) {
+                    termination_uncertain = true;
+                } else {
+                    throw;
+                }
+            }
+            job.cancel_requested = true;
+        };
+        request_termination();
+        while (std::chrono::steady_clock::now() < deadline) {
+            current = get_job(job, deadline);
+            if (terminal(update(job, current)))
+                return current;
+            if (termination_uncertain)
+                request_termination();
+            pause(*job.client, deadline);
+        }
+        throw error("Timed out waiting for Azure Batch cancellation");
+    }
+    const std::string request_id = gcp::detail::random_uuid();
+    gcp::detail::HttpResponse response;
+    try {
+        response = call(
+            *job.client,
+            gcp::detail::HttpRequest{
+                .method = "POST",
+                .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name + ":cancel",
+                .headers = {"Content-Type: application/json"},
+                .body = "{\"requestId\":" + gcp::detail::json_quote(request_id) + "}",
+            },
+            deadline);
+    } catch (const error& failure) {
+        current = get_job(job, deadline);
+        const job_state state = update(job, current);
+        if (terminal(state))
+            return current;
+        if (state == job_state::cancelling || retryable(failure.http_status()))
+            return wait_terminal(job, deadline);
+        throw;
+    }
+    wait_operation(*job.client, gcp::detail::field(gcp::detail::parse_json(response.body), "name"),
+                   deadline);
+    return wait_terminal(job, deadline);
+}
+
+inline result make_result(const job_data& job, const gcp::detail::Json& json) {
+    const job_state state = update(job, json);
+    result out{.state = state};
+    out.warnings = job.chosen.warnings;
+    if (state == job_state::succeeded) {
+        out.exit_code = 0;
+    } else if (state == job_state::failed) {
+        out.exit_code = task_exit_code(job);
+        out.message = status_error(job, json);
+    } else if (state == job_state::cancelled) {
+        out.message = "Batch job was cancelled";
+    }
+    return out;
+}
+
+// AWS and Azure submission -----------------------------------------------------
+
+inline std::uint64_t duration_seconds(std::chrono::milliseconds value) {
+    const auto milliseconds = value.count();
+    return static_cast<std::uint64_t>(milliseconds / 1000 + (milliseconds % 1000 != 0));
+}
+
+inline std::string aws_queue(const config& cfg, const job_spec& spec) {
+    if (spec.resources.gpu.empty())
+        return spec.resources.spot ? cfg.aws.spot_job_queue : cfg.aws.job_queue;
+    const std::string gpu = canonical_gpu(spec.resources.gpu);
+    const auto it = cfg.aws.gpu_targets.find(gpu);
+    if (it == cfg.aws.gpu_targets.end())
+        throw error("Missing AWS queue for accelerator " + gpu);
+    return spec.resources.spot ? it->second.spot_job_queue : it->second.job_queue;
+}
+
+inline std::vector<std::string>
+find_aws_definitions(const client_state& client, std::string_view endpoint, std::string_view region,
+                     std::string_view name, std::chrono::steady_clock::time_point deadline) {
+    std::vector<std::string> found;
+    std::string token;
+    for (int page = 0; page < 100; ++page) {
+        std::string body = "{\"jobDefinitionName\":" + gcp::detail::json_quote(name) +
+                           ",\"status\":\"ACTIVE\",\"maxResults\":100";
+        if (!token.empty())
+            body += ",\"nextToken\":" + gcp::detail::json_quote(token);
+        body += '}';
+        const auto json = gcp::detail::parse_json(
+            aws_call(client,
+                     gcp::detail::HttpRequest{
+                         .method = "POST",
+                         .url = std::string(endpoint) + "/v1/describejobdefinitions",
+                         .headers = {"Content-Type: application/json"},
+                         .body = std::move(body),
+                     },
+                     std::string(region), "batch", true, deadline)
+                .body);
+        if (const auto* definitions = json.get("jobDefinitions"))
+            for (const auto& item : definitions->array()) {
+                if (gcp::detail::field(item, "jobDefinitionName") != name ||
+                    gcp::detail::field(item, "status") != "ACTIVE")
+                    continue;
+                const std::string arn = gcp::detail::field(item, "jobDefinitionArn");
+                if (arn.empty())
+                    throw error("Malformed AWS Batch definition response for unique name " +
+                                std::string(name));
+                if (std::find(found.begin(), found.end(), arn) == found.end())
+                    found.push_back(arn);
+            }
+        const std::string next = gcp::detail::field(json, "nextToken");
+        if (next.empty())
+            return found;
+        if (next == token)
+            throw error("AWS Batch definition pagination did not advance for unique name " +
+                        std::string(name));
+        token = next;
+    }
+    throw error("AWS Batch definition pagination exceeded 100 pages for unique name " +
+                std::string(name));
+}
+
+inline std::optional<std::string> find_aws_job(const client_state& client,
+                                               std::string_view endpoint, std::string_view region,
+                                               std::string_view queue, std::string_view name,
+                                               std::chrono::steady_clock::time_point deadline) {
+    const std::string body = "{\"jobQueue\":" + gcp::detail::json_quote(queue) +
+                             ",\"filters\":[{\"name\":\"JOB_NAME\",\"values\":[" +
+                             gcp::detail::json_quote(name) + "]}],\"maxResults\":100}";
+    const auto json =
+        gcp::detail::parse_json(aws_call(client,
+                                         gcp::detail::HttpRequest{
+                                             .method = "POST",
+                                             .url = std::string(endpoint) + "/v1/listjobs",
+                                             .headers = {"Content-Type: application/json"},
+                                             .body = body,
+                                         },
+                                         std::string(region), "batch", true, deadline)
+                                    .body);
+    const auto* jobs = json.get("jobSummaryList");
+    std::optional<std::string> found;
+    if (jobs)
+        for (const auto& item : jobs->array()) {
+            if (gcp::detail::field(item, "jobName") != name)
+                continue;
+            const std::string id = gcp::detail::field(item, "jobId");
+            if (id.empty())
+                continue;
+            if (found && *found != id)
+                throw error("AWS Batch returned several jobs for unique name " + std::string(name));
+            found = id;
+        }
+    return found;
+}
+
+inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client,
+                                            const job_spec& spec, const cloud::plan& chosen,
+                                            const std::string& name) {
+    // Register a uniquely named temporary definition, then submit a uniquely
+    // named job. A lost registration response is reconciled by exact-name lookup;
+    // a lost submission response is reconciled by queue/name lookup. If submission
+    // remains unknown, keep the definition active for a possibly accepted job.
+    const auto memory = memory_mib(spec.resources.memory_gb);
+    std::string requirements =
+        "[{\"type\":\"VCPU\",\"value\":" +
+        gcp::detail::json_quote(std::to_string(spec.resources.cpus)) +
+        "},{\"type\":\"MEMORY\",\"value\":" + gcp::detail::json_quote(std::to_string(memory)) + '}';
+    if (!chosen.accelerator.empty())
+        requirements += ",{\"type\":\"GPU\",\"value\":" +
+                        gcp::detail::json_quote(std::to_string(chosen.accelerator_count)) + '}';
+    requirements += ']';
+    std::string container = "{\"image\":" + gcp::detail::json_quote(spec.image) +
+                            ",\"command\":" + strings(spec.command) +
+                            ",\"resourceRequirements\":" + requirements;
+    if (!spec.service_account.empty())
+        container += ",\"jobRoleArn\":" + gcp::detail::json_quote(spec.service_account);
+    container += ",\"logConfiguration\":{\"logDriver\":\"awslogs\",\"options\":{"
+                 "\"awslogs-group\":" +
+                 gcp::detail::json_quote(client->config.aws.log_group) +
+                 ",\"awslogs-region\":" + gcp::detail::json_quote(chosen.region) +
+                 ",\"awslogs-stream-prefix\":\"cloud\"}}}";
+    const std::string definition_body =
+        "{\"jobDefinitionName\":" + gcp::detail::json_quote(name) +
+        ",\"type\":\"container\",\"platformCapabilities\":[\"EC2\"],"
+        "\"containerProperties\":" +
+        container + '}';
+    const std::string endpoint = aws_batch_endpoint(*client, chosen.region);
+    std::string definition;
+    std::string registration_failure;
+    try {
+        const auto registered =
+            gcp::detail::parse_json(aws_call(*client,
+                                             gcp::detail::HttpRequest{
+                                                 .method = "POST",
+                                                 .url = endpoint + "/v1/registerjobdefinition",
+                                                 .headers = {"Content-Type: application/json"},
+                                                 .body = definition_body,
+                                             },
+                                             chosen.region, "batch", false)
+                                        .body);
+        definition = gcp::detail::field(registered, "jobDefinitionArn");
+        if (definition.empty())
+            registration_failure =
+                "AWS Batch returned a successful response without jobDefinitionArn";
+    } catch (const error& failure) {
+        if (!retryable(failure.http_status()))
+            throw;
+        registration_failure = failure.what();
+    }
+    if (definition.empty()) {
+        const auto recovery =
+            std::min(client->config.cleanup_timeout, std::chrono::milliseconds(30'000));
+        const auto deadline = std::chrono::steady_clock::now() + recovery;
+        while (std::chrono::steady_clock::now() < deadline) {
+            std::vector<std::string> found;
+            try {
+                found = find_aws_definitions(*client, endpoint, chosen.region, name, deadline);
+            } catch (const error&) {
+                pause(*client, deadline);
+                continue;
+            }
+            if (found.size() == 1) {
+                definition = std::move(found.front());
+                break;
+            }
+            if (found.size() > 1) {
+                bool cleanup_complete = true;
+                for (const auto& arn : found)
+                    try {
+                        (void)aws_call(
+                            *client,
+                            gcp::detail::HttpRequest{
+                                .method = "POST",
+                                .url = endpoint + "/v1/deregisterjobdefinition",
+                                .headers = {"Content-Type: application/json"},
+                                .body = "{\"jobDefinition\":" + gcp::detail::json_quote(arn) + "}",
+                            },
+                            chosen.region, "batch", false, deadline);
+                    } catch (...) {
+                        cleanup_complete = false;
+                    }
+                throw error(
+                    "AWS Batch registration produced several active definitions for job "
+                    "definition name " +
+                    name +
+                    (cleanup_complete ? "; all were deregistered" : "; cleanup was incomplete"));
+            }
+            pause(*client, deadline);
+        }
+    }
+    if (definition.empty())
+        throw error("AWS Batch registration outcome is unknown for job definition name " + name +
+                    (registration_failure.empty() ? std::string{} : ": " + registration_failure));
+    // Keep the historical cloud-hpp tag stable for external inventory policies.
+    const std::string submit_body =
+        "{\"jobName\":" + gcp::detail::json_quote(name) +
+        ",\"jobQueue\":" + gcp::detail::json_quote(aws_queue(client->config, spec)) +
+        ",\"jobDefinition\":" + gcp::detail::json_quote(definition) +
+        ",\"retryStrategy\":{\"attempts\":" + std::to_string(spec.retries + 1) +
+        "},\"timeout\":{\"attemptDurationSeconds\":" +
+        std::to_string(duration_seconds(spec.timeout)) +
+        "},\"tags\":{\"cloud-hpp\":\"temporary\"}}";
+    const std::string queue = aws_queue(client->config, spec);
+    std::string id;
+    std::string ambiguous_failure;
+    try {
+        const auto submitted =
+            gcp::detail::parse_json(aws_call(*client,
+                                             gcp::detail::HttpRequest{
+                                                 .method = "POST",
+                                                 .url = endpoint + "/v1/submitjob",
+                                                 .headers = {"Content-Type: application/json"},
+                                                 .body = submit_body,
+                                             },
+                                             chosen.region, "batch", false)
+                                        .body);
+        id = gcp::detail::field(submitted, "jobId");
+        if (id.empty())
+            ambiguous_failure = "AWS Batch returned a successful response without jobId";
+    } catch (const error& failure) {
+        if (retryable(failure.http_status())) {
+            ambiguous_failure = failure.what();
+        } else {
+            try {
+                (void)aws_call(
+                    *client,
+                    gcp::detail::HttpRequest{
+                        .method = "POST",
+                        .url = endpoint + "/v1/deregisterjobdefinition",
+                        .headers = {"Content-Type: application/json"},
+                        .body = "{\"jobDefinition\":" + gcp::detail::json_quote(definition) + "}",
+                    },
+                    chosen.region, "batch", false);
+            } catch (...) {
+            }
+            throw;
+        }
+    }
+    if (id.empty()) {
+        const auto recovery =
+            std::min(client->config.cleanup_timeout, std::chrono::milliseconds(30'000));
+        const auto deadline = std::chrono::steady_clock::now() + recovery;
+        while (std::chrono::steady_clock::now() < deadline) {
+            try {
+                if (const auto found =
+                        find_aws_job(*client, endpoint, chosen.region, queue, name, deadline)) {
+                    id = *found;
+                    break;
+                }
+            } catch (const error&) {
+            }
+            pause(*client, deadline);
+        }
+    }
+    if (id.empty()) {
+        // The randomized job name is an audit handle. Keep the definition active:
+        // an accepted but not-yet-visible job can still depend on it.
+        throw error("AWS Batch submission outcome is unknown for job name " + name +
+                    (ambiguous_failure.empty() ? std::string{} : ": " + ambiguous_failure));
+    }
+    auto data = std::make_shared<job_data>();
+    data->client = std::move(client);
+    data->spec = spec;
+    data->chosen = chosen;
+    data->id = id;
+    data->name = name;
+    data->auxiliary = definition;
+    return data;
+}
+
+inline std::string azure_command(const std::vector<std::string>& command) {
+    std::string out;
+    for (const auto& argument : command) {
+        if (!out.empty())
+            out.push_back(' ');
+        out += argument;
+    }
+    return out;
+}
+
+inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> client,
+                                              const job_spec& spec, const cloud::plan& chosen,
+                                              const std::string& id) {
+    // Create fixed-ID job and task resources around a one-node, job-lifetime
+    // auto-pool. After conflicts or transport ambiguity, inspect the fixed resource
+    // before repeating POST. Task-creation failure triggers best-effort job cleanup.
+    const auto& azure = client->config.azure;
+    const std::string endpoint = gcp::detail::base_url(azure.batch_endpoint);
+    if (endpoint.empty())
+        throw error("Azure jobs require config::azure.batch_endpoint");
+    const bool spot = spec.resources.spot;
+    const std::uint64_t watchdog_seconds = duration_seconds(spec.timeout) +
+                                           duration_seconds(client->config.cleanup_timeout) +
+                                           duration_seconds(client->config.final_log_timeout) +
+                                           duration_seconds(client->config.request_timeout);
+    const std::string job_body =
+        "{\"id\":" + gcp::detail::json_quote(id) +
+        ",\"onAllTasksComplete\":\"noaction\",\"constraints\":{\"maxWallClockTime\":" +
+        gcp::detail::json_quote("PT" + std::to_string(watchdog_seconds) + "S") +
+        "},\"poolInfo\":{"
+        "\"autoPoolSpecification\":{\"autoPoolIdPrefix\":\"cloud\","
+        "\"poolLifetimeOption\":\"job\",\"keepAlive\":false,\"pool\":{"
+        "\"vmSize\":" +
+        gcp::detail::json_quote(chosen.machine_type) +
+        ",\"targetDedicatedNodes\":" + (spot ? "0" : "1") +
+        ",\"targetLowPriorityNodes\":" + (spot ? "1" : "0") +
+        ",\"taskSlotsPerNode\":1,\"virtualMachineConfiguration\":{"
+        "\"imageReference\":{\"publisher\":" +
+        gcp::detail::json_quote(azure.image_publisher) +
+        ",\"offer\":" + gcp::detail::json_quote(azure.image_offer) +
+        ",\"sku\":" + gcp::detail::json_quote(azure.image_sku) +
+        ",\"version\":\"latest\"},\"nodeAgentSKUId\":" +
+        gcp::detail::json_quote(azure.node_agent_sku) +
+        ",\"containerConfiguration\":{\"type\":\"dockerCompatible\"}}}}}}";
+    const auto create_fixed = [&](std::string collection_url, std::string resource_url,
+                                  const std::string& body, std::string_view kind) {
+        const auto recovery =
+            std::min(client->config.cleanup_timeout, std::chrono::milliseconds(30'000));
+        const auto deadline = std::chrono::steady_clock::now() + recovery;
+        std::string last_failure;
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            try {
+                (void)azure_call(*client,
+                                 gcp::detail::HttpRequest{
+                                     .method = "POST",
+                                     .url = collection_url,
+                                     .headers = {"Content-Type: application/json"},
+                                     .body = body,
+                                 },
+                                 false, deadline);
+                return;
+            } catch (const error& failure) {
+                if (failure.http_status() != 409 && !retryable(failure.http_status()))
+                    throw;
+                last_failure = failure.what();
+            }
+            try {
+                (void)azure_call(*client, gcp::detail::HttpRequest{.url = resource_url}, true,
+                                 deadline);
+                return;
+            } catch (const error& inspection) {
+                if (inspection.http_status() != 404 && !retryable(inspection.http_status()))
+                    throw;
+            }
+            if (attempt != 2)
+                pause(*client, deadline);
+        }
+        throw error("Azure Batch " + std::string(kind) +
+                    " creation outcome is unknown for fixed id " + id +
+                    (last_failure.empty() ? std::string{} : ": " + last_failure));
+    };
+    create_fixed(azure_batch_url(*client, "/jobs"),
+                 azure_batch_url(*client, "/jobs/" + gcp::detail::encode(id)), job_body, "job");
+
+    const std::string task_id = "task";
+    std::string run_options = "--rm";
+    if (!spec.workdir.empty())
+        run_options += " --workdir=" + spec.workdir;
+    const std::string task_body =
+        "{\"id\":\"task\",\"commandLine\":" + gcp::detail::json_quote(azure_command(spec.command)) +
+        ",\"constraints\":{\"maxWallClockTime\":" +
+        gcp::detail::json_quote("PT" + std::to_string(duration_seconds(spec.timeout)) + "S") +
+        ",\"maxTaskRetryCount\":" + std::to_string(spec.retries) +
+        ",\"retentionTime\":\"PT1H\"},\"containerSettings\":{\"imageName\":" +
+        gcp::detail::json_quote(spec.image) +
+        ",\"containerRunOptions\":" + gcp::detail::json_quote(run_options) + "}}";
+    try {
+        create_fixed(azure_batch_url(*client, "/jobs/" + gcp::detail::encode(id) + "/tasks"),
+                     azure_batch_url(*client, "/jobs/" + gcp::detail::encode(id) + "/tasks/" +
+                                                  gcp::detail::encode(task_id)),
+                     task_body, "task");
+    } catch (...) {
+        try {
+            (void)azure_call(
+                *client,
+                gcp::detail::HttpRequest{
+                    .method = "DELETE",
+                    .url = azure_batch_url(*client, "/jobs/" + gcp::detail::encode(id)),
+                },
+                false);
+        } catch (...) {
+        }
+        throw;
+    }
+    auto data = std::make_shared<job_data>();
+    data->client = std::move(client);
+    data->spec = spec;
+    data->chosen = chosen;
+    data->id = id;
+    data->name = id;
+    data->auxiliary = task_id;
+    return data;
+}
+
+} // namespace detail
+
+// Public storage, compute, job, and client handles -----------------------------
+
+// Provider-shaped facade for GCS. It deliberately fails on an AWS/Azure-selected
+// client rather than silently routing data to the wrong cloud account.
+class storage {
+public:
+    object put(std::string_view destination, std::string_view bytes,
+               put_options options = {}) const {
+        const auto uri = detail::parse_uri(destination, "put");
+        return raw().bucket(uri.bucket).put(uri.key, bytes, std::move(options));
+    }
+
+    object put_file(std::string_view destination, const std::filesystem::path& source,
+                    put_options options = {}) const {
+        const auto uri = detail::parse_uri(destination, "put_file");
+        return raw().bucket(uri.bucket).put_file(uri.key, source, std::move(options));
+    }
+
+    [[nodiscard]] std::string get(std::string_view source) const {
+        const auto uri = detail::parse_uri(source, "get");
+        return raw().bucket(uri.bucket).get(uri.key);
+    }
+
+    void get_file(std::string_view source, const std::filesystem::path& destination) const {
+        const auto uri = detail::parse_uri(source, "get_file");
+        raw().bucket(uri.bucket).get_file(uri.key, destination);
+    }
+
+    [[nodiscard]] object_list list(std::string_view source, list_options options = {}) const {
+        const auto uri = detail::parse_uri(source);
+        options.prefix = uri.key + options.prefix;
+        return raw().bucket(uri.bucket).list(std::move(options));
+    }
+
+    [[nodiscard]] object stat(std::string_view source) const {
+        const auto uri = detail::parse_uri(source, "stat");
+        return raw().bucket(uri.bucket).stat(uri.key);
+    }
+
+    void remove(std::string_view source) const {
+        const auto uri = detail::parse_uri(source, "remove");
+        raw().bucket(uri.bucket).erase(uri.key);
+    }
+
+private:
+    friend class client;
+    explicit storage(std::shared_ptr<detail::client_state> state) : state_(std::move(state)) {}
+    [[nodiscard]] gcp::Cloud& raw() const {
+        if (detail::selected_provider(state_->config) != "gcp")
+            throw error("Generic object storage is currently available only for GCP");
+        return state_->raw;
+    }
+    std::shared_ptr<detail::client_state> state_;
+};
+
+// Provider-shaped facade for raw GCE instances. Batch jobs do not use this path;
+// it remains an explicit escape hatch for long-lived/template-based VMs.
+class compute {
+public:
+    [[nodiscard]] std::vector<instance> instances(std::size_t limit = 0) const {
+        return raw().vms(limit);
+    }
+    [[nodiscard]] operation create(std::string name, std::string instance_template) const {
+        return raw().create_from_template(std::move(name), std::move(instance_template));
+    }
+    [[nodiscard]] operation start(std::string name) const {
+        return raw().vm(std::move(name)).start();
+    }
+    [[nodiscard]] operation stop(std::string name) const {
+        return raw().vm(std::move(name)).stop();
+    }
+    [[nodiscard]] operation destroy(std::string name) const {
+        return raw().vm(std::move(name)).erase();
+    }
+
+private:
+    friend class client;
+    explicit compute(std::shared_ptr<detail::client_state> state) : state_(std::move(state)) {}
+    [[nodiscard]] gcp::Cloud& raw() const {
+        if (detail::selected_provider(state_->config) != "gcp")
+            throw error("Generic raw instance control is currently available only for GCP");
+        return state_->raw;
+    }
+    std::shared_ptr<detail::client_state> state_;
+};
+
+class job {
+public:
+    // Copies share this controller state. status(), logs(), wait(), and cancel()
+    // must therefore be serialized by the caller. Provider log backends can expose
+    // final entries late, so terminal draining is bounded and best effort. Once a
+    // result is cached, status() and logs() return that terminal snapshot.
+    [[nodiscard]] const std::string& id() const noexcept { return data_->id; }
+
+    [[nodiscard]] job_state status() const {
+        if (data_->cached)
+            return data_->cached->state;
+        return detail::update(*data_, detail::get_job(*data_));
+    }
+
+    [[nodiscard]] std::vector<log_entry> logs() const {
+        if (!data_->cached)
+            (void)detail::merge_logs(*data_);
+        return data_->log_cache;
+    }
+
+    [[nodiscard]] result wait(log_sink sink = {}) const {
+        // Poll incremental logs and normalized state until terminal or the total
+        // controller deadline. Terminal state triggers a quiet-period log drain,
+        // result caching, and provider-specific cleanup. At deadline, cancel first.
+        // Sink/control exceptions trigger best-effort cancellation and cleanup when
+        // enabled, then rethrow the original exception unchanged.
+        if (data_->cached)
+            return *data_->cached;
+        std::string log_warning;
+        const auto cleanup = [&](result& out, std::string_view reason) {
+            data_->cached = out;
+            if (!data_->spec.auto_delete && data_->chosen.provider != "azure")
+                return;
+            try {
+                detail::delete_job(*data_, reason);
+            } catch (const std::exception& failure) {
+                out.warnings.push_back(std::string("automatic cleanup failed: ") + failure.what());
+                data_->cached = out;
+            }
+        };
+        const auto emit = [&](std::chrono::steady_clock::time_point deadline) {
+            std::vector<log_entry> added;
+            try {
+                added = detail::merge_logs(*data_, deadline);
+            } catch (const std::exception& failure) {
+                log_warning = std::string("log polling failed: ") + failure.what();
+                return std::size_t{0};
+            }
+            for (const auto& line : added)
+                if (sink) {
+                    try {
+                        sink(line);
+                    } catch (...) {
+                        const auto original = std::current_exception();
+                        if (data_->spec.auto_delete || data_->chosen.provider == "azure") {
+                            try {
+                                const auto json = detail::cancel_job(*data_);
+                                result out = detail::make_result(*data_, json);
+                                data_->cached = out;
+                                detail::delete_job(*data_, "cloud.h log callback failure");
+                            } catch (...) {
+                            }
+                        }
+                        std::rethrow_exception(original);
+                    }
+                }
+            return added.size();
+        };
+        const auto drain = [&] { detail::drain_logs(*data_, emit); };
+        const auto deadline = data_->submitted + data_->spec.timeout;
+        try {
+            while (true) {
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    const auto json = detail::cancel_job(*data_);
+                    drain();
+                    result out = detail::make_result(*data_, json);
+                    if (out.state == job_state::cancelled)
+                        out.message = "Cloud job exceeded its total timeout";
+                    if (!log_warning.empty())
+                        out.warnings.push_back(log_warning);
+                    cleanup(out, "cloud.h timeout");
+                    return out;
+                }
+                (void)emit(deadline);
+                if (std::chrono::steady_clock::now() >= deadline)
+                    continue;
+                gcp::detail::Json json;
+                try {
+                    json = detail::get_job(*data_, deadline);
+                } catch (const error&) {
+                    if (std::chrono::steady_clock::now() >= deadline)
+                        continue;
+                    throw;
+                }
+                const job_state state = detail::update(*data_, json);
+                if (detail::terminal(state)) {
+                    drain();
+                    result out = detail::make_result(*data_, json);
+                    if (!log_warning.empty())
+                        out.warnings.push_back(log_warning);
+                    cleanup(out, "cloud.h automatic cleanup");
+                    return out;
+                }
+                detail::pause(*data_->client, deadline);
+            }
+        } catch (...) {
+            const auto original = std::current_exception();
+            if ((data_->spec.auto_delete || data_->chosen.provider == "azure") && !data_->cached) {
+                try {
+                    const auto json = detail::cancel_job(*data_);
+                    result out = detail::make_result(*data_, json);
+                    cleanup(out, "cloud.h control failure");
+                } catch (...) {
+                }
+            }
+            std::rethrow_exception(original);
+        }
+    }
+
+    void cancel() const {
+        // Explicit cancellation is idempotent after a terminal result is cached.
+        // It still drains delayed logs before performing configured cleanup.
+        if (data_->cached)
+            return;
+        const auto json = detail::cancel_job(*data_);
+        std::string warning;
+        try {
+            detail::drain_logs(*data_, [&](auto deadline) {
+                return !detail::merge_logs(*data_, deadline).empty();
+            });
+        } catch (const std::exception& failure) {
+            warning = std::string("final log polling failed: ") + failure.what();
+        }
+        data_->cached = detail::make_result(*data_, json);
+        if (!warning.empty())
+            data_->cached->warnings.push_back(std::move(warning));
+        if (data_->spec.auto_delete || data_->chosen.provider == "azure") {
+            try {
+                detail::delete_job(*data_, "cloud.h cancellation");
+            } catch (const std::exception& failure) {
+                data_->cached->warnings.push_back(std::string("automatic cleanup failed: ") +
+                                                  failure.what());
+            }
+        }
+    }
+
+private:
+    friend class client;
+    explicit job(std::shared_ptr<detail::job_data> data) : data_(std::move(data)) {}
+    std::shared_ptr<detail::job_data> data_;
+};
+
+// Cheap-copy handles originate from one client_state. Constructing a client
+// validates local timing configuration but performs no cloud mutation.
+class client {
+public:
+    explicit client(cloud::config value = {})
+        : state_(std::make_shared<detail::client_state>(std::move(value))), storage_(state_),
+          compute_(state_) {}
+
+    [[nodiscard]] cloud::plan plan(const job_spec& spec) const {
+        // Does not mutate provider resources; it may invoke a caller pricing
+        // callback or query a read-only public catalog API.
+        return detail::make_plan(*state_, spec);
+    }
+
+    [[nodiscard]] cloud::job run(const job_spec& spec) const {
+        // Replan immediately before submission so validation and price ceilings
+        // are current. GCP uses one randomized audit name plus requestId and, after
+        // an ambiguous create response, recovers with GET-by-name instead of replaying.
+        const cloud::plan chosen = plan(spec);
+        const std::string id = detail::job_id(spec.name);
+        if (chosen.provider == "aws")
+            return cloud::job(detail::submit_aws(state_, spec, chosen, id));
+        if (chosen.provider == "azure")
+            return cloud::job(detail::submit_azure(state_, spec, chosen, id));
+        const std::string project = state_->core()->project();
+        detail::validate_project(project);
+        const std::string parent = "projects/" + project + "/locations/" + chosen.region + "/jobs";
+        const std::string name = parent + '/' + id;
+        const std::string request_id = gcp::detail::random_uuid();
+        const std::string create_url =
+            state_->core()->config.batch_endpoint + "/v1/projects/" + gcp::detail::encode(project) +
+            "/locations/" + gcp::detail::encode(chosen.region) + "/jobs" +
+            "?jobId=" + gcp::detail::encode(id) + "&requestId=" + request_id;
+        const std::string body = detail::batch_body(spec, chosen);
+        gcp::detail::HttpResponse created_response;
+        try {
+            created_response =
+                detail::call(*state_, gcp::detail::HttpRequest{
+                                          .method = "POST",
+                                          .url = create_url,
+                                          .headers = {"Content-Type: application/json"},
+                                          .body = body,
+                                      });
+        } catch (const error& failure) {
+            if (!detail::retryable(failure.http_status()))
+                throw;
+            const auto submission = std::current_exception();
+            const auto recovery =
+                std::min(state_->config.cleanup_timeout, std::chrono::milliseconds(30'000));
+            const auto deadline = std::chrono::steady_clock::now() + recovery;
+            while (true) {
+                try {
+                    created_response = detail::call(
+                        *state_,
+                        gcp::detail::HttpRequest{
+                            .url = state_->core()->config.batch_endpoint + "/v1/" + name,
+                        },
+                        deadline);
+                    break;
+                } catch (const error& lookup) {
+                    if (lookup.http_status() != 404 || std::chrono::steady_clock::now() >= deadline)
+                        std::rethrow_exception(submission);
+                    detail::pause(*state_, deadline);
+                }
+            }
+        }
+        const auto created = gcp::detail::parse_json(created_response.body);
+        auto data = std::make_shared<detail::job_data>();
+        data->client = state_;
+        data->spec = spec;
+        data->chosen = chosen;
+        data->id = id;
+        data->name = gcp::detail::field(created, "name");
+        if (data->name.empty())
+            data->name = name;
+        data->uid = gcp::detail::field(created, "uid");
+        return cloud::job(std::move(data));
+    }
+
+    [[nodiscard]] bool supports(std::string_view value, feature requested) const {
+        // Capability is an implementation matrix, not a live account/quota probe.
+        return detail::supports(value, requested);
+    }
+
+    [[nodiscard]] bool supports(feature requested) const {
+        try {
+            return supports(detail::selected_provider(state_->config), requested);
+        } catch (const error&) {
+            return false;
+        }
+    }
+
+    [[nodiscard]] cloud::storage& storage() noexcept { return storage_; }
+    [[nodiscard]] const cloud::storage& storage() const noexcept { return storage_; }
+    [[nodiscard]] cloud::compute& compute() noexcept { return compute_; }
+    [[nodiscard]] const cloud::compute& compute() const noexcept { return compute_; }
+    [[nodiscard]] gcp::Cloud& gcp() noexcept { return state_->raw; }
+    [[nodiscard]] const gcp::Cloud& gcp() const noexcept { return state_->raw; }
+
+private:
+    std::shared_ptr<detail::client_state> state_;
+    cloud::storage storage_;
+    cloud::compute compute_;
+};
+
+} // namespace cloud
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
+
+#endif // NJLANE314_CLOUD_H_INCLUDED

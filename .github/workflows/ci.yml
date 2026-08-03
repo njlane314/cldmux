@@ -20,8 +20,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: njlane314/tst
+          ref: 5207356c975006aa20c5b70dc61a5e2f553e50ee
+          path: .deps/tst
       - if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev
-      - run: make check CXX=${{ matrix.cxx }}
+      - run: make check CXX=${{ matrix.cxx }} TST_DIR=.deps/tst
       - if: runner.os == 'Linux'
-        run: make sanitize CXX=${{ matrix.cxx }}
+        run: make sanitize CXX=${{ matrix.cxx }} TST_DIR=.deps/tst
