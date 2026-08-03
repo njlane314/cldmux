@@ -234,10 +234,49 @@ public:
     std::atomic<int> aws_price_reads{0};
     std::atomic<int> azure_price_reads{0};
     std::atomic<int> aws_spot_reads{0};
+    std::atomic<int> aws_storage_puts{0};
+    std::atomic<int> aws_storage_file_puts{0};
+    std::atomic<int> aws_storage_gets{0};
+    std::atomic<int> aws_storage_lists{0};
+    std::atomic<int> aws_storage_deletes{0};
+    std::atomic<int> aws_fargate_registers{0};
+    std::atomic<int> aws_fargate_submits{0};
+    std::atomic<int> azure_storage_puts{0};
+    std::atomic<int> azure_storage_file_puts{0};
+    std::atomic<int> azure_storage_gets{0};
+    std::atomic<int> azure_storage_lists{0};
+    std::atomic<int> azure_storage_deletes{0};
+    std::atomic<int> azure_mount_jobs{0};
+    std::atomic<int> azure_mount_tasks{0};
+    std::atomic<int> gcp_compute_creates{0};
+    std::atomic<int> aws_compute_lists{0};
+    std::atomic<int> aws_compute_create_attempts{0};
+    std::atomic<int> aws_compute_create_polls{0};
+    std::atomic<int> aws_compute_starts{0};
+    std::atomic<int> aws_compute_start_polls{0};
+    std::atomic<int> aws_compute_stops{0};
+    std::atomic<int> aws_compute_stop_polls{0};
+    std::atomic<int> aws_compute_destroys{0};
+    std::atomic<int> aws_compute_destroy_polls{0};
+    std::atomic<int> azure_compute_lists{0};
+    std::atomic<int> azure_compute_creates{0};
+    std::atomic<int> azure_compute_starts{0};
+    std::atomic<int> azure_compute_deallocates{0};
+    std::atomic<int> azure_compute_deletes{0};
+    std::atomic<int> azure_compute_operation_polls{0};
     std::atomic<bool> aws_body_valid{true};
+    std::atomic<bool> aws_storage_valid{true};
+    std::atomic<bool> aws_mount_body_valid{true};
+    std::atomic<bool> aws_compute_valid{true};
     std::atomic<bool> aws_ambiguous_register{false};
     std::atomic<bool> aws_endless_logs{false};
     std::atomic<bool> azure_body_valid{true};
+    std::atomic<bool> azure_storage_valid{true};
+    std::atomic<bool> azure_mount_body_valid{true};
+    std::atomic<bool> azure_compute_valid{true};
+    std::atomic<bool> gcp_compute_valid{true};
+    std::atomic<bool> azure_cross_origin_next{false};
+    std::atomic<bool> azure_cross_origin_operation{false};
     std::atomic<bool> corrupt_download{false};
     std::atomic<bool> request_id_changed{false};
 
@@ -245,7 +284,48 @@ private:
     struct reply {
         int status = 200;
         std::string body = "{}";
+        std::vector<std::string> headers;
+
+        reply() = default;
+        reply(int status_value, std::string body_value)
+            : status(status_value), body(std::move(body_value)) {}
+        reply(int status_value, std::string body_value, std::vector<std::string> header_values)
+            : status(status_value), body(std::move(body_value)),
+              headers(std::move(header_values)) {}
     };
+
+    static std::string request_header(std::string_view headers, std::string_view name) {
+        std::string wanted(name);
+        std::transform(wanted.begin(), wanted.end(), wanted.begin(), [](char c) {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        });
+        std::size_t cursor = 0;
+        while (cursor < headers.size()) {
+            const auto end = headers.find("\r\n", cursor);
+            const auto line = headers.substr(cursor, end - cursor);
+            const auto colon = line.find(':');
+            if (colon != std::string_view::npos) {
+                std::string field(line.substr(0, colon));
+                std::transform(field.begin(), field.end(), field.begin(), [](char c) {
+                    return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                });
+                if (field == wanted) {
+                    const auto begin = line.find_first_not_of(" \t", colon + 1);
+                    return begin == std::string_view::npos ? std::string{}
+                                                           : std::string(line.substr(begin));
+                }
+            }
+            if (end == std::string_view::npos)
+                break;
+            cursor = end + 2;
+        }
+        return {};
+    }
+
+    static bool has_header(std::string_view headers, std::string_view name,
+                           std::string_view value) {
+        return request_header(headers, name) == value;
+    }
 
     static std::string query(std::string_view target, std::string_view key) {
         const std::string needle = std::string(key) + '=';
@@ -277,18 +357,276 @@ private:
                std::to_string(nanos) + "}}]}}]}";
     }
 
-    reply route(std::string_view method, std::string_view target, std::string_view body) {
+    static std::string aws_instance_xml(std::string_view id, std::string_view name,
+                                        std::string_view state) {
+        return "<item><instanceId>" + std::string(id) +
+               "</instanceId><instanceType>m7i.large</instanceType>"
+               "<instanceState><name>" +
+               std::string(state) +
+               "</name></instanceState><placement><availabilityZone>eu-west-1a"
+               "</availabilityZone></placement><privateIpAddress>10.0.0.4</privateIpAddress>"
+               "<ipAddress>198.51.100.4</ipAddress>"
+               "<launchTime>2026-08-03T10:00:00Z</launchTime>"
+               "<tagSet><item><key>Name</key><value>" +
+               std::string(name) + "</value></item></tagSet></item>";
+    }
+
+    static std::string aws_instances_xml(std::string instances, std::string next = {}) {
+        return "<DescribeInstancesResponse><reservationSet><item><instancesSet>" + instances +
+               "</instancesSet></item></reservationSet>" +
+               (next.empty() ? std::string{} : "<nextToken>" + next + "</nextToken>") +
+               "</DescribeInstancesResponse>";
+    }
+
+    static std::string azure_vm_json(std::string_view name, std::string_view state) {
+        return "{\"id\":\"/subscriptions/subscription/resourceGroups/workers/providers/"
+               "Microsoft.Compute/virtualMachines/" +
+               std::string(name) + "\",\"name\":" + cloud::gcp::detail::json_quote(name) +
+               ",\"location\":\"westeurope\",\"properties\":{\"hardwareProfile\":{"
+               "\"vmSize\":\"Standard_D4s_v5\"},\"timeCreated\":"
+               "\"2026-08-03T10:00:00Z\",\"provisioningState\":" +
+               cloud::gcp::detail::json_quote(state) + "}}";
+    }
+
+    reply route(std::string_view method, std::string_view target, std::string_view headers,
+                std::string_view body) {
+        if (method == "POST" && target == "/ec2/") {
+            const std::string authorisation = request_header(headers, "authorization");
+            if (!starts_with(authorisation, "AWS4-HMAC-SHA256") ||
+                authorisation.find("/eu-west-1/ec2/aws4_request") == std::string::npos ||
+                request_header(headers, "x-amz-date").empty())
+                aws_compute_valid = false;
+
+            if (body.find("Action=RunInstances") != std::string_view::npos) {
+                const int attempt = ++aws_compute_create_attempts;
+                const std::string token = query(body, "ClientToken");
+                if (token.empty() ||
+                    body.find("MinCount=1&MaxCount=1") == std::string_view::npos ||
+                    body.find("LaunchTemplate.LaunchTemplateId=lt-worker") ==
+                        std::string_view::npos ||
+                    body.find("LaunchTemplate.Version=7") == std::string_view::npos ||
+                    body.find("TagSpecification.1.Tag.1.Key=Name") == std::string_view::npos ||
+                    body.find("TagSpecification.1.Tag.1.Value=aws-created") ==
+                        std::string_view::npos ||
+                    body.find("TagSpecification.1.Tag.2.Key=cloud-hpp") ==
+                        std::string_view::npos)
+                    aws_compute_valid = false;
+                if (attempt == 1) {
+                    aws_compute_client_token_ = token;
+                    return {500, "<Error><Message>retry</Message></Error>"};
+                }
+                if (token != aws_compute_client_token_)
+                    aws_compute_valid = false;
+                return {200,
+                        "<RunInstancesResponse><instancesSet>" +
+                            aws_instance_xml("i-created", "aws-created", "pending") +
+                            "</instancesSet></RunInstancesResponse>"};
+            }
+
+            if (body.find("Action=DescribeInstances") != std::string_view::npos) {
+                if (body.find("Filter.1.Name=tag%3AName") != std::string_view::npos) {
+                    if (body.find("Filter.2.Name=tag%3Acloud-hpp&"
+                                  "Filter.2.Value.1=managed") == std::string_view::npos)
+                        aws_compute_valid = false;
+                    if (body.find("Filter.1.Value.1=aws-start") != std::string_view::npos)
+                        return {200, aws_instances_xml(
+                                         aws_instance_xml("i-start", "aws-start", "stopped"))};
+                    if (body.find("Filter.1.Value.1=aws-stop") != std::string_view::npos)
+                        return {200, aws_instances_xml(
+                                         aws_instance_xml("i-stop", "aws-stop", "running"))};
+                    if (body.find("Filter.1.Value.1=aws-destroy") != std::string_view::npos)
+                        return {200,
+                                aws_instances_xml(aws_instance_xml(
+                                    "i-destroy", "aws-destroy", "running"))};
+                    if (body.find("Filter.1.Value.1=aws-existing") != std::string_view::npos)
+                        return {200,
+                                aws_instances_xml(aws_instance_xml(
+                                    "i-existing", "aws-existing", "running"))};
+                    return {200, aws_instances_xml({})};
+                }
+                if (body.find("InstanceId.1=i-created") != std::string_view::npos) {
+                    const int read = ++aws_compute_create_polls;
+                    return {200,
+                            aws_instances_xml(aws_instance_xml(
+                                "i-created", "aws-created", read == 1 ? "pending" : "running"))};
+                }
+                if (body.find("InstanceId.1=i-start") != std::string_view::npos) {
+                    const int read = ++aws_compute_start_polls;
+                    return {200,
+                            aws_instances_xml(aws_instance_xml(
+                                "i-start", "aws-start", read == 1 ? "pending" : "running"))};
+                }
+                if (body.find("InstanceId.1=i-stop") != std::string_view::npos) {
+                    const int read = ++aws_compute_stop_polls;
+                    return {200,
+                            aws_instances_xml(aws_instance_xml(
+                                "i-stop", "aws-stop", read == 1 ? "stopping" : "stopped"))};
+                }
+                if (body.find("InstanceId.1=i-destroy") != std::string_view::npos) {
+                    const int read = ++aws_compute_destroy_polls;
+                    return {200, aws_instances_xml(aws_instance_xml(
+                                     "i-destroy", "aws-destroy",
+                                     read == 1 ? "shutting-down" : "terminated"))};
+                }
+                ++aws_compute_lists;
+                if (body.find("NextToken=page-2") != std::string_view::npos)
+                    return {200,
+                            aws_instances_xml(
+                                aws_instance_xml("i-list-b", "list-b", "running"))};
+                return {200,
+                        aws_instances_xml(aws_instance_xml("i-list-a", "list-a", "stopped"),
+                                          "page-2")};
+            }
+
+            if (body.find("Action=StartInstances") != std::string_view::npos) {
+                ++aws_compute_starts;
+                if (body.find("InstanceId.1=i-start") == std::string_view::npos)
+                    aws_compute_valid = false;
+                return {200, "<StartInstancesResponse/>"};
+            }
+            if (body.find("Action=StopInstances") != std::string_view::npos) {
+                ++aws_compute_stops;
+                if (body.find("InstanceId.1=i-stop") == std::string_view::npos)
+                    aws_compute_valid = false;
+                return {200, "<StopInstancesResponse/>"};
+            }
+            if (body.find("Action=TerminateInstances") != std::string_view::npos) {
+                ++aws_compute_destroys;
+                if (body.find("InstanceId.1=i-destroy") == std::string_view::npos)
+                    aws_compute_valid = false;
+                return {200, "<TerminateInstancesResponse/>"};
+            }
+            aws_compute_valid = false;
+            return {400, "<Error><Message>unknown EC2 action</Message></Error>"};
+        }
+
+        if (starts_with(target, "/arm/")) {
+            if (!has_header(headers, "authorization", "Bearer azure-management-token") ||
+                !request_header(headers, "ocp-date").empty())
+                azure_compute_valid = false;
+
+            constexpr std::string_view collection =
+                "/arm/subscriptions/subscription/resourceGroups/workers/providers/"
+                "Microsoft.Compute/virtualMachines";
+            if (method == "GET" && starts_with(target, collection) &&
+                target.find("/instanceView?") == std::string_view::npos) {
+                ++azure_compute_lists;
+                const std::string next = azure_cross_origin_next
+                                             ? "https://evil.example/virtualMachines?page=2"
+                                             : url() + "/arm/pages/vms-2?api-version=2025-04-01";
+                return {200, "{\"value\":[" + azure_vm_json("azure-list-a", "Succeeded") +
+                                 "],\"nextLink\":" +
+                                 cloud::gcp::detail::json_quote(next) + "}"};
+            }
+            if (method == "GET" && starts_with(target, "/arm/pages/vms-2?")) {
+                ++azure_compute_lists;
+                return {200, "{\"value\":[" +
+                                 azure_vm_json("azure-list-b", "Succeeded") + "]}"};
+            }
+            if (method == "GET" && target.find("/instanceView?") != std::string_view::npos) {
+                std::string state = "running";
+                if (target.find("azure-list-a") != std::string_view::npos)
+                    state = "stopped";
+                else if (target.find("azure-stop") != std::string_view::npos)
+                    state = "deallocated";
+                return {200, "{\"statuses\":[{\"code\":\"PowerState/" + state + "\"}]}"};
+            }
+            if (method == "PUT" && starts_with(target, collection) &&
+                target.find("/azure-") != std::string_view::npos) {
+                ++azure_compute_creates;
+                try {
+                    (void)cloud::gcp::detail::parse_json(body);
+                } catch (const cloud::error&) {
+                    azure_compute_valid = false;
+                }
+                if (!has_header(headers, "if-none-match", "*") ||
+                    body.find("\"location\":\"uksouth\"") == std::string_view::npos ||
+                    body.find("\"vmSize\":\"Standard_D4s_v5\"") ==
+                        std::string_view::npos ||
+                    body.find("\"imageReference\":{\"id\":\"/images/worker\"}") ==
+                        std::string_view::npos ||
+                    body.find("\"osDisk\":{\"name\":\"azure-") ==
+                        std::string_view::npos ||
+                    body.find("\"createOption\":\"FromImage\",\"deleteOption\":\"Delete\"") ==
+                        std::string_view::npos ||
+                    body.find("\"networkInterfaceConfigurations\":[{") ==
+                        std::string_view::npos ||
+                    body.find("\"primary\":true,\"deleteOption\":\"Delete\"") ==
+                        std::string_view::npos ||
+                    body.find("\"subnet\":{\"id\":\"/networks/subnets/workers\"}") ==
+                        std::string_view::npos)
+                    azure_compute_valid = false;
+                const std::string poll = azure_cross_origin_operation
+                                             ? "https://evil.example/operations/create"
+                                             : url() + "/arm/operations/create";
+                return {202, "{}", {"Azure-AsyncOperation: " + poll}};
+            }
+            if (method == "POST" && target.find("/azure-start/start?") !=
+                                        std::string_view::npos) {
+                ++azure_compute_starts;
+                return {202, "{}", {"Location: " + url() + "/arm/operations/start"}};
+            }
+            if (method == "POST" && target.find("/azure-stop/deallocate?") !=
+                                        std::string_view::npos) {
+                ++azure_compute_deallocates;
+                return {202, "{}", {"Azure-AsyncOperation: " +
+                                      url() + "/arm/operations/deallocate"}};
+            }
+            if (method == "DELETE" && target.find("/azure-destroy?") !=
+                                          std::string_view::npos) {
+                ++azure_compute_deletes;
+                return {202, "{}", {"Azure-AsyncOperation: " +
+                                      url() + "/arm/operations/delete"}};
+            }
+            if (method == "GET" && starts_with(target, "/arm/operations/")) {
+                const int read = ++azure_compute_operation_polls;
+                if (target == "/arm/operations/create" && read == 1)
+                    return {200, "{\"status\":\"InProgress\"}"};
+                return {200, "{\"status\":\"Succeeded\"}"};
+            }
+            azure_compute_valid = false;
+            return {404, "{\"error\":{\"message\":\"unknown ARM request\"}}"};
+        }
+
         if (method == "POST" && target == "/v1/registerjobdefinition") {
             ++aws_registers;
+            const bool fargate =
+                body.find("\"platformCapabilities\":[\"FARGATE\"]") != std::string_view::npos;
             try {
                 (void)cloud::gcp::detail::parse_json(body);
             } catch (const cloud::error&) {
+                if (fargate)
+                    aws_mount_body_valid = false;
+                else
+                    aws_body_valid = false;
+            }
+            if (fargate) {
+                ++aws_fargate_registers;
+                if (body.find("\"type\":\"VCPU\",\"value\":\"2\"") ==
+                        std::string_view::npos ||
+                    body.find("\"type\":\"MEMORY\",\"value\":\"4096\"") ==
+                        std::string_view::npos ||
+                    body.find("\"type\":\"GPU\"") != std::string_view::npos ||
+                    body.find("\"jobRoleArn\":\"arn:aws:iam::1:role/job\"") ==
+                        std::string_view::npos ||
+                    body.find("\"executionRoleArn\":\"arn:aws:iam::1:role/execution\"") ==
+                        std::string_view::npos ||
+                    body.find("\"fargatePlatformConfiguration\":{\"platformVersion\":"
+                              "\"LATEST\"}") == std::string_view::npos ||
+                    body.find("\"fileSystemArn\":\"arn:aws:s3files:eu-west-1:1:"
+                              "file-system/fs-test\"") == std::string_view::npos ||
+                    body.find("\"rootDirectory\":\"/prefix/\"") == std::string_view::npos ||
+                    body.find("\"containerPath\":\"/inputs\",\"readOnly\":true") ==
+                        std::string_view::npos)
+                    aws_mount_body_valid = false;
+            } else if (body.find("\"platformCapabilities\":[\"EC2\"]") ==
+                               std::string_view::npos ||
+                       body.find("\"type\":\"VCPU\",\"value\":\"4\"") ==
+                           std::string_view::npos ||
+                       body.find("\"type\":\"GPU\",\"value\":\"1\"") ==
+                           std::string_view::npos) {
                 aws_body_valid = false;
             }
-            if (body.find("\"platformCapabilities\":[\"EC2\"]") == std::string_view::npos ||
-                body.find("\"type\":\"VCPU\",\"value\":\"4\"") == std::string_view::npos ||
-                body.find("\"type\":\"GPU\",\"value\":\"1\"") == std::string_view::npos)
-                aws_body_valid = false;
             if (aws_ambiguous_register)
                 return {0, {}};
             return {200,
@@ -314,15 +652,27 @@ private:
         }
         if (method == "POST" && target == "/v1/submitjob") {
             ++aws_submits;
+            const bool fargate = aws_fargate_registers.load() > aws_fargate_submits.load();
             try {
                 (void)cloud::gcp::detail::parse_json(body);
             } catch (const cloud::error&) {
+                if (fargate)
+                    aws_mount_body_valid = false;
+                else
+                    aws_body_valid = false;
+            }
+            if (fargate) {
+                ++aws_fargate_submits;
+                if (body.find("\"jobQueue\":\"fargate-queue\"") == std::string_view::npos ||
+                    body.find("\"tags\":{\"cloud-hpp\":\"temporary\"}") ==
+                        std::string_view::npos)
+                    aws_mount_body_valid = false;
+            } else if (body.find("\"jobQueue\":\"gpu-queue\"") == std::string_view::npos ||
+                       body.find("\"attempts\":2") == std::string_view::npos ||
+                       body.find("\"tags\":{\"cloud-hpp\":\"temporary\"}") ==
+                           std::string_view::npos) {
                 aws_body_valid = false;
             }
-            if (body.find("\"jobQueue\":\"gpu-queue\"") == std::string_view::npos ||
-                body.find("\"attempts\":2") == std::string_view::npos ||
-                body.find("\"tags\":{\"cloud-hpp\":\"temporary\"}") == std::string_view::npos)
-                aws_body_valid = false;
             return {200, "{\"jobId\":\"aws-job-id\",\"jobName\":\"cloud-job\"}"};
         }
         if (method == "POST" && target == "/v1/describejobs" && aws_cancel_mode != 0) {
@@ -435,28 +785,60 @@ private:
 
         if (method == "POST" && starts_with(target, "/jobs?api-version=")) {
             const int writes = ++azure_jobs;
+            const bool mounted = body.find("\"mountConfiguration\"") != std::string_view::npos;
             try {
                 (void)cloud::gcp::detail::parse_json(body);
             } catch (const cloud::error&) {
+                if (mounted)
+                    azure_mount_body_valid = false;
+                else
+                    azure_body_valid = false;
+            }
+            if (mounted) {
+                ++azure_mount_jobs;
+                if (body.find("\"accountName\":\"storageaccount\"") ==
+                        std::string_view::npos ||
+                    body.find("\"containerName\":\"input-container\"") ==
+                        std::string_view::npos ||
+                    body.find("\"relativeMountPath\":\"cloud-0\"") ==
+                        std::string_view::npos ||
+                    body.find("\"sasKey\":\"sv=test&sig=secret\"") ==
+                        std::string_view::npos ||
+                    body.find("\"blobfuseOptions\":\"-o ro\"") == std::string_view::npos)
+                    azure_mount_body_valid = false;
+            } else if (body.find("\"vmSize\":\"Standard_NC24ads_A100_v4\"") ==
+                               std::string_view::npos ||
+                       body.find("\"targetLowPriorityNodes\":1") == std::string_view::npos) {
                 azure_body_valid = false;
             }
-            if (body.find("\"vmSize\":\"Standard_NC24ads_A100_v4\"") == std::string_view::npos ||
-                body.find("\"targetLowPriorityNodes\":1") == std::string_view::npos)
-                azure_body_valid = false;
             if (writes == 1)
                 return {500, "{\"code\":\"ambiguous\"}"};
             return {};
         }
         if (method == "POST" && target.find("/tasks?api-version=") != std::string_view::npos) {
             const int writes = ++azure_tasks;
+            const bool mounted =
+                body.find("/mnt/batch/tasks/fsmounts/cloud-0") != std::string_view::npos;
             try {
                 (void)cloud::gcp::detail::parse_json(body);
             } catch (const cloud::error&) {
+                if (mounted)
+                    azure_mount_body_valid = false;
+                else
+                    azure_body_valid = false;
+            }
+            if (mounted) {
+                ++azure_mount_tasks;
+                if (body.find("--volume=/mnt/batch/tasks/fsmounts/cloud-0:/inputs:ro") ==
+                        std::string_view::npos ||
+                    body.find("\"userIdentity\":{\"autoUser\":{\"scope\":\"task\","
+                              "\"elevationLevel\":\"admin\"}}") == std::string_view::npos)
+                    azure_mount_body_valid = false;
+            } else if (body.find("\"commandLine\":\"run --fast\"") ==
+                               std::string_view::npos ||
+                       body.find("\"imageName\":\"image\"") == std::string_view::npos) {
                 azure_body_valid = false;
             }
-            if (body.find("\"commandLine\":\"run --fast\"") == std::string_view::npos ||
-                body.find("\"imageName\":\"image\"") == std::string_view::npos)
-                azure_body_valid = false;
             if (writes == 1)
                 return {500, "{\"code\":\"ambiguous\"}"};
             return {};
@@ -512,6 +894,169 @@ private:
             return {202, "{}"};
         }
 
+        // The provider-neutral storage facade deliberately uses path-style
+        // endpoints for explicit test servers. This keeps the tests local while
+        // still exercising AWS SigV4 and Azure's storage-scoped bearer headers.
+        constexpr std::string_view aws_bucket = "/s3/test-bucket";
+        if (starts_with(target, aws_bucket)) {
+            const auto query_begin = target.find('?');
+            const auto path = target.substr(0, query_begin);
+            const bool authenticated = starts_with(request_header(headers, "authorization"),
+                                                   "AWS4-HMAC-SHA256") &&
+                                       !request_header(headers, "x-amz-date").empty();
+            if (!authenticated)
+                aws_storage_valid = false;
+
+            if (path == aws_bucket && method == "GET") {
+                const int page = ++aws_storage_lists;
+                if (query(target, "prefix") != "dir%2F" ||
+                    query(target, "delimiter") != "%2F")
+                    aws_storage_valid = false;
+                if (page == 1)
+                    return {200,
+                            "<ListBucketResult><Contents><Key>dir%2Ffirst%20file</Key>"
+                            "<ETag>&quot;aws-list-1&quot;</ETag><Size>7</Size>"
+                            "<LastModified>2026-08-03T10:00:00Z</LastModified></Contents>"
+                            "<CommonPrefixes><Prefix>dir%2Fsub%2F</Prefix></CommonPrefixes>"
+                            "<IsTruncated>true</IsTruncated>"
+                            "<NextContinuationToken>next</NextContinuationToken>"
+                            "</ListBucketResult>"};
+                if (query(target, "continuation-token") != "next")
+                    aws_storage_valid = false;
+                return {200,
+                        "<ListBucketResult><Contents><Key>dir%2Fsecond</Key>"
+                        "<ETag>&quot;aws-list-2&quot;</ETag><Size>4</Size>"
+                        "<LastModified>2026-08-03T10:01:00Z</LastModified></Contents>"
+                        "<IsTruncated>false</IsTruncated></ListBucketResult>"};
+            }
+
+            const std::string key(path.size() > aws_bucket.size() + 1
+                                      ? path.substr(aws_bucket.size() + 1)
+                                      : std::string_view{});
+            if (key.empty())
+                return {400, "missing S3 object key"};
+            if (method == "PUT") {
+                const std::string checksum = cloud::gcp::detail::crc32c(body);
+                const bool file = key == "file";
+                if (file)
+                    ++aws_storage_file_puts;
+                else
+                    ++aws_storage_puts;
+                if (!has_header(headers, "x-amz-checksum-crc32c", checksum) ||
+                    !has_header(headers, "x-amz-meta-cloud-crc32c", checksum) ||
+                    (file && !has_header(headers, "if-match", "\"aws-version\"")) ||
+                    (!file && !has_header(headers, "if-none-match", "*")))
+                    aws_storage_valid = false;
+                aws_objects_[key] = std::string(body);
+                return {};
+            }
+            const auto found = aws_objects_.find(key);
+            if (found == aws_objects_.end())
+                return {404, "missing S3 object"};
+            const std::string checksum = cloud::gcp::detail::crc32c(found->second);
+            if (method == "HEAD") {
+                return {200,
+                        "",
+                        {"ETag: \"aws-version\"",
+                         "Content-Length: " + std::to_string(found->second.size()),
+                         "Content-Type: application/octet-stream",
+                         "Last-Modified: Mon, 03 Aug 2026 10:00:00 GMT",
+                         "x-amz-meta-cloud-crc32c: " + checksum}};
+            }
+            if (method == "GET") {
+                ++aws_storage_gets;
+                if (!has_header(headers, "if-match", "\"aws-version\""))
+                    aws_storage_valid = false;
+                return {200, corrupt_download ? "corrupt" : found->second};
+            }
+            if (method == "DELETE") {
+                ++aws_storage_deletes;
+                aws_objects_.erase(found);
+                return {204, ""};
+            }
+        }
+
+        constexpr std::string_view azure_container = "/blob/test-container";
+        if (starts_with(target, azure_container)) {
+            const auto query_begin = target.find('?');
+            const auto path = target.substr(0, query_begin);
+            const bool authenticated =
+                has_header(headers, "authorization", "Bearer azure-storage-token") &&
+                has_header(headers, "x-ms-version", "2023-11-03") &&
+                !request_header(headers, "x-ms-date").empty();
+            if (!authenticated)
+                azure_storage_valid = false;
+
+            if (path == azure_container && method == "GET") {
+                const int page = ++azure_storage_lists;
+                if (query(target, "prefix") != "dir%2F" ||
+                    query(target, "delimiter") != "%2F")
+                    azure_storage_valid = false;
+                if (page == 1)
+                    return {200,
+                            "<EnumerationResults><Blobs><Blob><Name Encoded=\"true\">"
+                            "dir%2Ffirst%20%26%20data</Name>"
+                            "<Properties><Etag>&quot;azure-list-1&quot;</Etag>"
+                            "<Content-Length>7</Content-Length><Content-Type>text/plain</Content-Type>"
+                            "<Last-Modified>Mon, 03 Aug 2026 10:00:00 GMT</Last-Modified>"
+                            "</Properties><Metadata><cloudcrc32c>AAAAAA==</cloudcrc32c>"
+                            "</Metadata></Blob><BlobPrefix><Name Encoded=\"true\">"
+                            "dir%2Fsub%2F</Name></BlobPrefix>"
+                            "</Blobs><NextMarker>next</NextMarker></EnumerationResults>"};
+                if (query(target, "marker") != "next")
+                    azure_storage_valid = false;
+                return {200,
+                        "<EnumerationResults><Blobs><Blob><Name>dir/second</Name>"
+                        "<Properties><Etag>&quot;azure-list-2&quot;</Etag>"
+                        "<Content-Length>4</Content-Length></Properties>"
+                        "</Blob></Blobs><NextMarker></NextMarker></EnumerationResults>"};
+            }
+
+            const std::string key(path.size() > azure_container.size() + 1
+                                      ? path.substr(azure_container.size() + 1)
+                                      : std::string_view{});
+            if (key.empty())
+                return {400, "missing Azure Blob key"};
+            if (method == "PUT") {
+                const std::string checksum = cloud::gcp::detail::crc32c(body);
+                const bool file = key == "file";
+                if (file)
+                    ++azure_storage_file_puts;
+                else
+                    ++azure_storage_puts;
+                if (!has_header(headers, "x-ms-blob-type", "BlockBlob") ||
+                    !has_header(headers, "x-ms-meta-cloudcrc32c", checksum) ||
+                    (file && !has_header(headers, "if-match", "\"azure-version\"")) ||
+                    (!file && !has_header(headers, "if-none-match", "*")))
+                    azure_storage_valid = false;
+                azure_objects_[key] = std::string(body);
+                return {201, ""};
+            }
+            const auto found = azure_objects_.find(key);
+            if (found == azure_objects_.end())
+                return {404, "missing Azure Blob"};
+            const std::string checksum = cloud::gcp::detail::crc32c(found->second);
+            if (method == "HEAD")
+                return {200,
+                        "",
+                        {"ETag: \"azure-version\"",
+                         "Content-Length: " + std::to_string(found->second.size()),
+                         "Content-Type: application/octet-stream",
+                         "Last-Modified: Mon, 03 Aug 2026 10:00:00 GMT",
+                         "x-ms-meta-cloudcrc32c: " + checksum}};
+            if (method == "GET") {
+                ++azure_storage_gets;
+                if (!has_header(headers, "if-match", "\"azure-version\""))
+                    azure_storage_valid = false;
+                return {200, corrupt_download ? "corrupt" : found->second};
+            }
+            if (method == "DELETE") {
+                ++azure_storage_deletes;
+                azure_objects_.erase(found);
+                return {202, ""};
+            }
+        }
+
         constexpr std::string_view object_path = "/storage/v1/b/test-bucket/o/object";
         constexpr std::string_view download_path = "/download/storage/v1/b/test-bucket/o/object";
         if (method == "POST" && starts_with(target, "/upload/storage/v1/b/test-bucket/o?")) {
@@ -541,6 +1086,24 @@ private:
         }
         if (method == "DELETE" && starts_with(target, object_path))
             return {};
+
+        if (method == "POST" && target.find("/instances?sourceInstanceTemplate=") !=
+                                    std::string_view::npos) {
+            ++gcp_compute_creates;
+            if (!has_header(headers, "authorization", "Bearer test") ||
+                query(target, "sourceInstanceTemplate") !=
+                    "global%2FinstanceTemplates%2Fgcp-worker-template" ||
+                query(target, "requestId").empty())
+                gcp_compute_valid = false;
+            try {
+                const auto json = cloud::gcp::detail::parse_json(body);
+                if (cloud::gcp::detail::field(json, "name") != "gcp-created")
+                    gcp_compute_valid = false;
+            } catch (const cloud::error&) {
+                gcp_compute_valid = false;
+            }
+            return {200, "{\"name\":\"insert-gcp-created\",\"status\":\"PENDING\"}"};
+        }
 
         if (method == "GET" && target.find("/instances?") != std::string_view::npos) {
             if (query(target, "pageToken") == "next")
@@ -637,7 +1200,7 @@ private:
         if (method == "GET" && target.find("/operations/") != std::string_view::npos) {
             if (target.find("/cancel-") != std::string_view::npos)
                 ++cancel_operations;
-            return {200, "{\"done\":true,\"response\":{}}"};
+            return {200, "{\"done\":true,\"status\":\"DONE\",\"response\":{}}"};
         }
         if (method == "GET" && !id.empty()) {
             std::string state = "SUCCEEDED";
@@ -690,10 +1253,23 @@ private:
 
     static void write_reply(int socket, const reply& response) {
         const std::string reason = response.status == 200 ? "OK" : "Error";
-        const std::string text = "HTTP/1.1 " + std::to_string(response.status) + ' ' + reason +
-                                 "\r\nContent-Type: application/json\r\nContent-Length: " +
-                                 std::to_string(response.body.size()) +
-                                 "\r\nConnection: close\r\n\r\n" + response.body;
+        std::string text = "HTTP/1.1 " + std::to_string(response.status) + ' ' + reason + "\r\n";
+        bool has_content_type = false;
+        bool has_content_length = false;
+        for (const auto& field : response.headers) {
+            std::string lower = field;
+            std::transform(lower.begin(), lower.end(), lower.begin(), [](char c) {
+                return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            });
+            has_content_type = has_content_type || starts_with(lower, "content-type:");
+            has_content_length = has_content_length || starts_with(lower, "content-length:");
+            text += field + "\r\n";
+        }
+        if (!has_content_type)
+            text += "Content-Type: application/json\r\n";
+        if (!has_content_length)
+            text += "Content-Length: " + std::to_string(response.body.size()) + "\r\n";
+        text += "Connection: close\r\n\r\n" + response.body;
         std::size_t sent = 0;
         while (sent < text.size()) {
 #ifdef MSG_NOSIGNAL
@@ -720,10 +1296,14 @@ private:
             std::string target;
             line >> method >> target;
             const auto header_end = request.find("\r\n\r\n");
+            const std::string_view headers =
+                header_end == std::string::npos
+                    ? std::string_view{}
+                    : std::string_view(request).substr(line_end + 2, header_end - line_end - 2);
             const std::string_view body = header_end == std::string::npos
                                               ? std::string_view{}
                                               : std::string_view(request).substr(header_end + 4);
-            const auto response = route(method, target, body);
+            const auto response = route(method, target, headers, body);
             if (response.status != 0)
                 write_reply(socket, response);
             (void)::close(socket);
@@ -740,6 +1320,9 @@ private:
     std::map<std::string, int> cancellation_reads_;
     std::map<std::string, bool> cancelled_;
     std::map<std::string, std::string> request_ids_;
+    std::map<std::string, std::string> aws_objects_;
+    std::map<std::string, std::string> azure_objects_;
+    std::string aws_compute_client_token_;
 };
 
 void gcp_lifecycle_tests() {
@@ -754,6 +1337,7 @@ void gcp_lifecycle_tests() {
     config.compute_endpoint = server.url();
     config.batch_endpoint = server.url();
     config.logging_endpoint = server.url();
+    config.instance_templates["worker"].gcp_instance_template = "gcp-worker-template";
     config.request_timeout = std::chrono::milliseconds(100);
     config.poll_interval = std::chrono::milliseconds(1);
     config.final_log_delay = std::chrono::milliseconds(50);
@@ -874,6 +1458,452 @@ void gcp_lifecycle_tests() {
     const auto instances = client.compute().instances();
     tst::check(instances.size() == 2 && instances[0].name == "vm-a" && instances[1].name == "vm-b",
                "compute pagination");
+
+    const auto created = client.compute().create("gcp-created", "worker");
+    tst::check(created.name() == "insert-gcp-created" && created.zone() == "europe-west4-a",
+               "GCP logical template creates a portable operation");
+    created.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+    tst::check(server.gcp_compute_creates == 1 && server.gcp_compute_valid,
+               "GCP raw compute resolves the configured native template");
+    tst::throws<cloud::error>([&] { (void)client.compute().create("vm", "missing"); },
+                              "GCP raw compute rejects an unknown logical template");
+}
+
+cloud::config aws_storage_config(const fake_server& server) {
+    cloud::config config;
+    config.provider = "aws";
+    config.region = "eu-west-1";
+    config.allow_insecure_http = true;
+    config.aws.access_key_id = "AKIDEXAMPLE";
+    config.aws.secret_access_key = "secret";
+    config.aws.s3_endpoint = server.url() + "/s3";
+    config.request_timeout = std::chrono::seconds(2);
+    config.transfer_timeout = std::chrono::seconds(2);
+    return config;
+}
+
+cloud::config azure_storage_config(const fake_server& server) {
+    cloud::config config;
+    config.provider = "azure";
+    config.region = "westeurope";
+    config.allow_insecure_http = true;
+    config.azure.storage_endpoint = server.url() + "/blob";
+    config.azure.storage_auth = cloud::auth::bearer("azure-storage-token");
+    config.request_timeout = std::chrono::seconds(2);
+    config.transfer_timeout = std::chrono::seconds(2);
+    return config;
+}
+
+void aws_storage_tests() {
+    fake_server server;
+    cloud::client client(aws_storage_config(server));
+
+    cloud::put_options create_only;
+    create_only.content_type = "text/plain";
+    create_only.if_generation_match = "0";
+    const auto stored = client.storage().put("cloud://test-bucket/object", "payload", create_only);
+    tst::check(stored.name == "object" && stored.generation == "\"aws-version\"" &&
+                   stored.size == 7 && stored.crc32c == cloud::gcp::detail::crc32c("payload"),
+               "AWS S3 put returns portable metadata");
+    tst::check(client.storage().get("cloud://test-bucket/object") == "payload",
+               "AWS S3 get verifies the stored checksum");
+    const auto metadata = client.storage().stat("cloud://test-bucket/object");
+    tst::check(metadata.etag == "\"aws-version\"" && metadata.size == 7,
+               "AWS S3 stat maps ETag and size");
+
+    cloud::list_options listing;
+    listing.delimiter = "/";
+    const auto objects = client.storage().list("cloud://test-bucket/dir/", listing);
+    tst::check(objects.objects.size() == 2 && objects.objects[0].name == "dir/first file" &&
+                   objects.objects[1].name == "dir/second" &&
+                   objects.prefixes == std::vector<std::string>{"dir/sub/"} &&
+                   server.aws_storage_lists == 2,
+               "AWS S3 list decodes keys and follows continuation tokens");
+
+    const auto source = std::filesystem::temp_directory_path() /
+                        ("cloud-h-aws-source-" + cloud::gcp::detail::random_uuid());
+    const auto destination = std::filesystem::temp_directory_path() /
+                             ("cloud-h-aws-destination-" + cloud::gcp::detail::random_uuid());
+    cloud::gcp::detail::TemporaryPathGuard source_guard(source);
+    cloud::gcp::detail::TemporaryPathGuard destination_guard(destination);
+    {
+        std::ofstream output(source, std::ios::binary | std::ios::trunc);
+        output << "file-payload";
+    }
+    cloud::put_options replace;
+    replace.if_generation_match = "\"aws-version\"";
+    const auto file = client.storage().put_file("cloud://test-bucket/file", source, replace);
+    tst::check(file.size == 12 && server.aws_storage_file_puts == 1,
+               "AWS streamed file upload uses PUT");
+    client.storage().get_file("cloud://test-bucket/file", destination);
+    tst::check(cloud::gcp::detail::read_small_file(destination) == "file-payload",
+               "AWS S3 get_file streams a verified file");
+    {
+        std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+        output << "preserved";
+    }
+    server.corrupt_download = true;
+    tst::throws<cloud::error>(
+        [&] { client.storage().get_file("cloud://test-bucket/file", destination); },
+        "AWS S3 get_file rejects a corrupt checksum");
+    server.corrupt_download = false;
+    tst::check(cloud::gcp::detail::read_small_file(destination) == "preserved",
+               "AWS corrupt download preserves its destination");
+
+    client.storage().remove("cloud://test-bucket/object");
+    tst::throws<cloud::error>([&] { (void)client.storage().stat("cloud://test-bucket/object"); },
+                              "AWS S3 remove deletes the routed object");
+    tst::check(server.aws_storage_puts == 1 && server.aws_storage_deletes == 1 &&
+                   server.aws_storage_gets >= 3,
+               "AWS S3 facade issued the expected operations");
+    tst::check(server.aws_storage_valid,
+               "AWS S3 requests carry signing, conditions, and checksum metadata");
+}
+
+void azure_storage_tests() {
+    fake_server server;
+    cloud::client client(azure_storage_config(server));
+
+    cloud::put_options create_only;
+    create_only.content_type = "text/plain";
+    create_only.if_generation_match = "0";
+    const auto stored =
+        client.storage().put("cloud://test-container/object", "payload", create_only);
+    tst::check(stored.name == "object" && stored.generation == "\"azure-version\"" &&
+                   stored.size == 7 && stored.crc32c == cloud::gcp::detail::crc32c("payload"),
+               "Azure Blob put returns portable metadata");
+    tst::check(client.storage().get("cloud://test-container/object") == "payload",
+               "Azure Blob get verifies the stored checksum");
+    const auto metadata = client.storage().stat("cloud://test-container/object");
+    tst::check(metadata.etag == "\"azure-version\"" && metadata.size == 7,
+               "Azure Blob stat maps ETag and size");
+
+    cloud::list_options listing;
+    listing.delimiter = "/";
+    const auto objects = client.storage().list("cloud://test-container/dir/", listing);
+    tst::check(objects.objects.size() == 2 &&
+                   objects.objects[0].name == "dir/first & data" &&
+                   objects.objects[0].crc32c == "AAAAAA==" &&
+                   objects.objects[1].name == "dir/second" &&
+                   objects.prefixes == std::vector<std::string>{"dir/sub/"} &&
+                   server.azure_storage_lists == 2,
+               "Azure Blob list decodes names, parses metadata, and follows markers");
+
+    const auto source = std::filesystem::temp_directory_path() /
+                        ("cloud-h-azure-source-" + cloud::gcp::detail::random_uuid());
+    const auto destination = std::filesystem::temp_directory_path() /
+                             ("cloud-h-azure-destination-" + cloud::gcp::detail::random_uuid());
+    cloud::gcp::detail::TemporaryPathGuard source_guard(source);
+    cloud::gcp::detail::TemporaryPathGuard destination_guard(destination);
+    {
+        std::ofstream output(source, std::ios::binary | std::ios::trunc);
+        output << "file-payload";
+    }
+    cloud::put_options replace;
+    replace.if_generation_match = "\"azure-version\"";
+    const auto file = client.storage().put_file("cloud://test-container/file", source, replace);
+    tst::check(file.size == 12 && server.azure_storage_file_puts == 1,
+               "Azure streamed file upload uses PUT");
+    client.storage().get_file("cloud://test-container/file", destination);
+    tst::check(cloud::gcp::detail::read_small_file(destination) == "file-payload",
+               "Azure Blob get_file streams a verified file");
+    {
+        std::ofstream output(destination, std::ios::binary | std::ios::trunc);
+        output << "preserved";
+    }
+    server.corrupt_download = true;
+    tst::throws<cloud::error>(
+        [&] { client.storage().get_file("cloud://test-container/file", destination); },
+        "Azure Blob get_file rejects a corrupt checksum");
+    server.corrupt_download = false;
+    tst::check(cloud::gcp::detail::read_small_file(destination) == "preserved",
+               "Azure corrupt download preserves its destination");
+
+    client.storage().remove("cloud://test-container/object");
+    tst::throws<cloud::error>(
+        [&] { (void)client.storage().stat("cloud://test-container/object"); },
+        "Azure Blob remove deletes the routed object");
+    tst::check(server.azure_storage_puts == 1 && server.azure_storage_deletes == 1 &&
+                   server.azure_storage_gets >= 3,
+               "Azure Blob facade issued the expected operations");
+    tst::check(server.azure_storage_valid,
+               "Azure Blob requests carry bearer, conditions, and checksum metadata");
+}
+
+void storage_route_tests() {
+    fake_server server;
+    auto config = aws_storage_config(server);
+    config.provider.reset();
+    config.providers = {"aws", "azure"};
+    config.azure.storage_endpoint = server.url() + "/blob";
+    config.azure.storage_auth = cloud::auth::bearer("azure-storage-token");
+    cloud::client router(std::move(config));
+    tst::throws<cloud::error>([&] { (void)router.storage().stat("cloud://test-bucket/object"); },
+                              "multi-provider storage requires a route");
+
+    cloud::put_options create_only;
+    create_only.if_generation_match = "0";
+    const auto aws = router.route("aws");
+    const auto azure = router.route("azure");
+    tst::check(aws.storage().put("cloud://test-bucket/object", "payload", create_only).name ==
+                   "object" &&
+                   azure.storage()
+                           .put("cloud://test-container/object", "payload", create_only)
+                           .name == "object" &&
+                   server.aws_storage_puts == 1 && server.azure_storage_puts == 1,
+               "route(provider) binds cloud URIs to exactly one storage backend");
+}
+
+cloud::config aws_compute_config(const fake_server& server) {
+    cloud::config config;
+    config.provider = "aws";
+    config.region = "eu-west-1";
+    // Deliberately differ from the returned instance AZ: operation locations
+    // must report provider state rather than echoing this fallback.
+    config.zone = "eu-west-1b";
+    config.allow_insecure_http = true;
+    config.aws.access_key_id = "AKIDEXAMPLE";
+    config.aws.secret_access_key = "secret";
+    config.aws.ec2_endpoint = server.url() + "/ec2";
+    config.instance_templates["worker"].aws.id = "lt-worker";
+    config.instance_templates["worker"].aws.version = "7";
+    config.request_timeout = std::chrono::seconds(2);
+    return config;
+}
+
+void aws_compute_tests() {
+    fake_server server;
+    cloud::client client(aws_compute_config(server));
+
+    const auto instances = client.compute().instances();
+    tst::check(instances.size() == 2 && instances[0].id == "i-list-a" &&
+                   instances[0].name == "list-a" && instances[0].status == "stopped" &&
+                   instances[0].zone == "eu-west-1a" &&
+                   instances[0].machine_type == "m7i.large" &&
+                   instances[1].name == "list-b" && instances[1].status == "running" &&
+                   server.aws_compute_lists == 2,
+               "AWS EC2 list maps tagged instances and follows NextToken");
+
+    const auto created = client.compute().create("aws-created", "worker");
+    tst::check(created.name() == "i-created" && created.zone() == "eu-west-1a",
+               "AWS create returns a provider-neutral operation");
+    created.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+    tst::check(server.aws_compute_create_attempts == 2 &&
+                   server.aws_compute_create_polls >= 2,
+               "AWS RunInstances reuses its idempotency token and polls pending to running");
+
+    const auto started = client.compute().start("aws-start");
+    tst::check(started.name() == "i-start" && started.zone() == "eu-west-1a",
+               "AWS start resolves a managed logical name and its actual zone");
+    started.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+
+    const auto stopped = client.compute().stop("aws-stop");
+    tst::check(stopped.name() == "i-stop" && stopped.zone() == "eu-west-1a",
+               "AWS stop resolves a managed logical name and its actual zone");
+    stopped.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+
+    const auto destroyed = client.compute().destroy("aws-destroy");
+    tst::check(destroyed.name() == "i-destroy" && destroyed.zone() == "eu-west-1a",
+               "AWS destroy resolves a managed logical name and its actual zone");
+    destroyed.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+
+    tst::check(server.aws_compute_starts == 1 && server.aws_compute_start_polls >= 2 &&
+                   server.aws_compute_stops == 1 && server.aws_compute_stop_polls >= 2 &&
+                   server.aws_compute_destroys == 1 &&
+                   server.aws_compute_destroy_polls >= 2 && server.aws_compute_valid,
+               "AWS raw-instance actions sign requests and observe their terminal states");
+    tst::throws<cloud::error>(
+        [&] { (void)client.compute().create("aws-missing", "missing"); },
+        "AWS create rejects an unknown logical template before HTTP");
+    tst::throws<cloud::error>(
+        [&] { (void)client.compute().create("aws-existing", "worker"); },
+        "AWS create rejects an existing managed Name tag");
+}
+
+cloud::config azure_compute_config(const fake_server& server) {
+    cloud::config config;
+    config.provider = "azure";
+    config.region = "westeurope";
+    config.allow_insecure_http = true;
+    config.auth = cloud::auth::bearer("azure-batch-token");
+    config.azure.storage_auth = cloud::auth::bearer("azure-storage-token");
+    config.azure.management_auth = cloud::auth::bearer("azure-management-token");
+    config.azure.management_endpoint = server.url() + "/arm";
+    config.azure.subscription_id = "subscription";
+    config.azure.resource_group = "workers";
+    config.azure.compute_api_version = "2025-04-01";
+    auto& native = config.instance_templates["worker"].azure;
+    native.image_id = "/images/worker";
+    native.subnet_id = "/networks/subnets/workers";
+    native.machine_type = "Standard_D4s_v5";
+    native.location = "uksouth";
+    native.os_disk_type = "Premium_LRS";
+    config.request_timeout = std::chrono::seconds(2);
+    return config;
+}
+
+void azure_compute_tests() {
+    fake_server server;
+    cloud::client client(azure_compute_config(server));
+
+    server.azure_cross_origin_next = true;
+    tst::throws<cloud::error>([&] { (void)client.compute().instances(); },
+                              "Azure list rejects a cross-origin nextLink");
+    server.azure_cross_origin_next = false;
+
+    const auto instances = client.compute().instances();
+    tst::check(instances.size() == 2 && instances[0].name == "azure-list-a" &&
+                   instances[0].machine_type == "Standard_D4s_v5" &&
+                   instances[0].status == "stopped" &&
+                   instances[1].name == "azure-list-b" && instances[1].status == "running" &&
+                   server.azure_compute_lists == 3,
+               "Azure VM list maps power states and follows a same-origin nextLink");
+
+    const auto created = client.compute().create("azure-created", "worker");
+    tst::check(created.name() == "azure-created", "Azure create returns a portable operation");
+    created.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+
+    const auto started = client.compute().start("azure-start");
+    started.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+    const auto stopped = client.compute().stop("azure-stop");
+    stopped.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+    const auto destroyed = client.compute().destroy("azure-destroy");
+    destroyed.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+
+    server.azure_cross_origin_operation = true;
+    const auto untrusted = client.compute().create("azure-cross", "worker");
+    server.azure_cross_origin_operation = false;
+    tst::throws<cloud::error>(
+        [&] { untrusted.wait(std::chrono::seconds(1), std::chrono::milliseconds(1)); },
+        "Azure operation polling rejects a cross-origin asynchronous URL");
+
+    tst::check(server.azure_compute_creates == 2 && server.azure_compute_starts == 1 &&
+                   server.azure_compute_deallocates == 1 && server.azure_compute_deletes == 1 &&
+                   server.azure_compute_operation_polls >= 5 && server.azure_compute_valid,
+               "Azure raw compute uses inline image/network definitions, deallocation, and a "
+               "management-scoped bearer");
+    tst::throws<cloud::error>(
+        [&] { (void)client.compute().create("azure-missing", "missing"); },
+        "Azure create rejects an unknown logical template before HTTP");
+}
+
+cloud::config aws_mount_config(const fake_server& server) {
+    cloud::config config;
+    config.provider = "aws";
+    config.region = "eu-west-1";
+    config.allow_insecure_http = true;
+    config.aws.access_key_id = "AKIDEXAMPLE";
+    config.aws.secret_access_key = "secret";
+    config.aws.batch_endpoint = server.url();
+    config.aws.logs_endpoint = server.url();
+    config.aws.fargate_job_queue = "fargate-queue";
+    config.aws.execution_role_arn = "arn:aws:iam::1:role/execution";
+    config.aws.job_role_arn = "arn:aws:iam::1:role/job";
+    config.aws.s3_files["input-bucket"] = {
+        "arn:aws:s3files:eu-west-1:1:file-system/fs-test", {}};
+    config.poll_interval = std::chrono::milliseconds(1);
+    config.final_log_delay = std::chrono::milliseconds(1);
+    config.final_log_timeout = std::chrono::milliseconds(20);
+    return config;
+}
+
+cloud::job_spec aws_mount_spec() {
+    cloud::job_spec spec;
+    spec.name = "aws-mounted";
+    spec.image = "image";
+    spec.command = {"run"};
+    spec.resources.cpus = 2;
+    spec.resources.memory_gb = 4;
+    spec.timeout = std::chrono::seconds(60);
+    spec.mounts.push_back({"cloud://input-bucket/prefix/", "/inputs", true});
+    return spec;
+}
+
+void aws_mount_tests() {
+    fake_server server;
+    cloud::client client(aws_mount_config(server));
+    const auto spec = aws_mount_spec();
+
+    auto gpu = spec;
+    gpu.resources.gpu = "nvidia-l4";
+    tst::throws<cloud::error>([&] { (void)client.run(gpu); },
+                              "AWS mounted GPU jobs fail closed");
+    tst::check(server.aws_registers == 0, "AWS mounted GPU rejection precedes HTTP");
+
+    auto missing_queue_config = aws_mount_config(server);
+    missing_queue_config.aws.fargate_job_queue.clear();
+    cloud::client missing_queue(std::move(missing_queue_config));
+    tst::throws<cloud::error>([&] { (void)missing_queue.run(spec); },
+                              "AWS mounted jobs require an explicit Fargate queue");
+    tst::check(server.aws_registers == 0, "AWS missing-queue rejection precedes HTTP");
+
+    const auto chosen = client.plan(spec);
+    tst::check(chosen.machine_type == "FARGATE" && chosen.accelerator.empty(),
+               "AWS mounted planning selects Fargate without accelerators");
+
+    auto priced_config = aws_mount_config(server);
+    std::optional<cloud::price_request> priced_request;
+    priced_config.lookup_hourly_cost = [&](const cloud::price_request& request) {
+        priced_request = request;
+        return std::optional<double>(0.25);
+    };
+    cloud::client priced(std::move(priced_config));
+    auto rounded = spec;
+    rounded.resources.memory_gb = 4.1;
+    const auto priced_plan = priced.plan(rounded);
+    tst::check(priced_plan.estimated_hourly_cost == 0.25 && priced_request &&
+                   priced_request->machine_type == "FARGATE" && priced_request->cpus == 2 &&
+                   priced_request->memory_gb == 5,
+               "AWS Fargate callback receives billed vCPU and rounded memory quantities");
+
+    const auto job = client.run(spec);
+    tst::check(job.wait().success() && server.aws_fargate_registers == 1 &&
+                   server.aws_fargate_submits == 1 && server.aws_mount_body_valid,
+               "AWS S3 Files submission carries Fargate volumes, roles, mounts, and queue");
+}
+
+cloud::config azure_mount_config(const fake_server& server) {
+    cloud::config config;
+    config.provider = "azure";
+    config.region = "westeurope";
+    config.allow_insecure_http = true;
+    config.auth = cloud::auth::bearer("azure-token");
+    config.azure.batch_endpoint = server.url();
+    config.azure.storage_account = "storageaccount";
+    config.azure.storage_sas = "sv=test&sig=secret";
+    config.poll_interval = std::chrono::milliseconds(1);
+    config.final_log_delay = std::chrono::milliseconds(1);
+    config.final_log_timeout = std::chrono::milliseconds(20);
+    return config;
+}
+
+cloud::job_spec azure_mount_spec() {
+    cloud::job_spec spec;
+    spec.name = "azure-mounted";
+    spec.image = "image";
+    spec.command = {"run", "--fast"};
+    spec.resources.cpus = 4;
+    spec.resources.memory_gb = 16;
+    spec.timeout = std::chrono::seconds(60);
+    spec.mounts.push_back({"cloud://input-container", "/inputs", true});
+    return spec;
+}
+
+void azure_mount_tests() {
+    fake_server server;
+    cloud::client client(azure_mount_config(server));
+    const auto spec = azure_mount_spec();
+
+    auto prefix = spec;
+    prefix.mounts.front().source = "cloud://input-container/prefix/";
+    tst::throws<cloud::error>([&] { (void)client.run(prefix); },
+                              "Azure Blob mounts reject prefix-only sources");
+    tst::check(server.azure_jobs == 0, "Azure prefix rejection precedes HTTP");
+
+    const auto job = client.run(spec);
+    tst::check(job.wait().success() && server.azure_mount_jobs == 1 &&
+                   server.azure_mount_tasks == 1 && server.azure_mount_body_valid,
+               "Azure submission carries BlobFuse configuration, volume, and admin identity");
 }
 
 void aws_lifecycle_tests() {
@@ -960,7 +1990,8 @@ void aws_lifecycle_tests() {
     cancellation_retry(2, "AWS TerminateJob retries an ambiguous transport failure");
     tst::check(aws.supports("aws", cloud::feature::containers) &&
                    aws.supports("aws", cloud::feature::accelerators) &&
-                   !aws.supports("aws", cloud::feature::object_storage),
+                   aws.supports("aws", cloud::feature::object_storage) &&
+                   aws.supports("aws", cloud::feature::storage_mounts),
                "AWS capabilities");
 }
 
@@ -1020,7 +2051,7 @@ void pricing_tests() {
     gcp_prices.auth = cloud::auth::bearer("gcp-token");
     gcp_prices.allow_insecure_http = true;
     gcp_prices.billing_endpoint = server.url();
-    gcp_prices.prices = cloud::price_source::public_catalog;
+    gcp_prices.prices = cloud::price_source::public_catalogue;
     cloud::client gcp_priced(std::move(gcp_prices));
     tst::check(std::fabs(*gcp_priced.plan(price_spec).estimated_hourly_cost - 0.072) < 1e-12,
                "GCP built-in component price");
@@ -1065,7 +2096,8 @@ void pricing_tests() {
                    observed_price_request->zone == "europe-west4-a" &&
                    observed_price_request->machine_type == "n1-standard-8" &&
                    observed_price_request->accelerator == "t4" &&
-                   observed_price_request->accelerator_count == 2 && observed_price_request->spot,
+                   observed_price_request->accelerator_count == 2 && observed_price_request->spot &&
+                   observed_price_request->cpus == 4 && observed_price_request->memory_gb == 16,
                "rich price lookup receives native location and attached accelerators");
 
     cloud::config legacy_lookup;
@@ -1087,7 +2119,7 @@ void pricing_tests() {
     aws_prices.aws.job_queue = "cpu-queue";
     aws_prices.aws.machine_type = "m6i.xlarge";
     aws_prices.aws.pricing_endpoint = server.url();
-    aws_prices.prices = cloud::price_source::public_catalog;
+    aws_prices.prices = cloud::price_source::public_catalogue;
     cloud::client aws_priced(std::move(aws_prices));
     price_spec.timeout = std::chrono::seconds(60);
     tst::check(aws_priced.plan(price_spec).estimated_hourly_cost == 0.42,
@@ -1103,7 +2135,7 @@ void pricing_tests() {
     aws_spot_prices.aws.spot_job_queue = "spot-queue";
     aws_spot_prices.aws.spot_machine_type = "m6i.xlarge";
     aws_spot_prices.aws.ec2_endpoint = server.url();
-    aws_spot_prices.prices = cloud::price_source::public_catalog;
+    aws_spot_prices.prices = cloud::price_source::public_catalogue;
     cloud::client aws_spot_priced(std::move(aws_spot_prices));
     price_spec.resources.spot = true;
     tst::check(aws_spot_priced.plan(price_spec).estimated_hourly_cost == 0.125,
@@ -1117,7 +2149,7 @@ void pricing_tests() {
     azure_prices.auth = cloud::auth::bearer("azure-token");
     azure_prices.azure.batch_endpoint = server.url();
     azure_prices.azure.pricing_endpoint = server.url();
-    azure_prices.prices = cloud::price_source::public_catalog;
+    azure_prices.prices = cloud::price_source::public_catalogue;
     cloud::client azure_priced(std::move(azure_prices));
     tst::check(azure_priced.plan(price_spec).estimated_hourly_cost == 0.20,
                "Azure built-in retail price");
@@ -1335,7 +2367,7 @@ void environment_factory_tests() {
     cloud::config cheapest_config = cloud::detail::config_from_environment("cheapest");
     tst::check(cheapest_config.providers == std::vector<cloud::provider>{"gcp", "aws", "azure"} &&
                    cheapest_config.selection == cloud::selection::lowest_cost &&
-                   cheapest_config.prices == cloud::price_source::public_catalog,
+                   cheapest_config.prices == cloud::price_source::public_catalogue,
                "cheapest environment uses stable provider order");
 
     std::vector<cloud::provider> compared;
@@ -1420,7 +2452,7 @@ void environment_factory_tests() {
 
 void planning_tests() {
     static_assert(cloud::gcp::version == CLOUD_H_VERSION);
-    static_assert(CLOUD_H_VERSION_NUM == 0x000200);
+    static_assert(CLOUD_H_VERSION_NUM == 0x000300);
     static_assert(std::is_aggregate_v<cloud::resources>);
     static_assert(std::is_aggregate_v<cloud::job_spec>);
 
@@ -1589,6 +2621,13 @@ int main() {
         TST_CASE("plans and validates GCP workloads", planning_tests()),
         TST_CASE("constructs clients from the environment", environment_factory_tests()),
         TST_CASE("runs GCP lifecycle, storage, and compute", gcp_lifecycle_tests()),
+        TST_CASE("maps the storage facade to AWS S3", aws_storage_tests()),
+        TST_CASE("maps the storage facade to Azure Blob", azure_storage_tests()),
+        TST_CASE("binds storage to an explicit provider route", storage_route_tests()),
+        TST_CASE("controls raw AWS EC2 instances", aws_compute_tests()),
+        TST_CASE("controls raw Azure virtual machines", azure_compute_tests()),
+        TST_CASE("submits AWS S3 Files mounts through Fargate", aws_mount_tests()),
+        TST_CASE("submits Azure whole-container Blob mounts", azure_mount_tests()),
         TST_CASE("runs AWS Batch and recovery", aws_lifecycle_tests()),
         TST_CASE("runs Azure Batch and log recovery", azure_lifecycle_tests()),
         TST_CASE("looks up prices and selects providers", pricing_tests()));

@@ -69,13 +69,17 @@ int main(int argc, char* argv[]) {
         job.auto_delete = true;
         job.timeout = std::chrono::minutes(15);
 
-        print_plan(client.plan(job));
+        // route(job) compares prices once, then returns a cheap client pinned to
+        // that winner. Planning again prints a fresh quote for the same provider;
+        // the subsequent run cannot silently switch to another cloud.
+        cloud::client routed = client.route(job);
+        print_plan(routed.plan(job));
         if (!chosen.submit) {
             std::cout << "dry run only; pass --submit to run this job\n";
             return 0;
         }
 
-        const cloud::result result = client.run(job).wait(
+        const cloud::result result = routed.run(job).wait(
             [](const cloud::log_entry& line) { std::cout << line.text << '\n'; });
         if (!result.success()) {
             std::cerr << "job failed: " << result.error() << '\n';

@@ -1,124 +1,140 @@
 #include "cloud.h"
 
 #include <chrono>
+#include <exception>
 #include <iostream>
+#include <optional>
+#include <stdexcept>
+#include <string>
 #include <string_view>
-#include <utility>
+
+namespace {
+
+// The program stays provider-neutral. Choosing a provider is a runtime option,
+// so the job, storage calls, and lifecycle code below never branch on gcp/aws/
+// azure. "cheapest" enables the internal router; a provider name overrides it.
+struct options {
+    std::string provider = "gcp";
+    bool submit = false;
+};
+
+options parse_options(int argc, char* argv[]) {
+    options result;
+    bool provider_seen = false;
+    for (int index = 1; index < argc; ++index) {
+        const std::string_view argument(argv[index]);
+        if (argument == "--submit") {
+            if (result.submit)
+                throw std::invalid_argument("--submit may be supplied only once");
+            result.submit = true;
+        } else if (!provider_seen) {
+            result.provider = std::string(argument);
+            provider_seen = true;
+        } else {
+            throw std::invalid_argument(
+                "usage: example [cheapest|gcp|aws|azure] [--submit]");
+        }
+    }
+    return result;
+}
+
+} // namespace
 
 int main(int argc, char* argv[]) {
-    // This example is safe to run without arguments: it builds and prints a
-    // provider-native plan, but it does not submit a job. Pass --submit only
-    // after replacing every placeholder below with resources from your cloud
-    // account. A submitted job can consume billable compute and storage.
-    const bool submit = argc == 2 && std::string_view{argv[1]} == "--submit";
+    try {
+        const options chosen = parse_options(argc, argv);
 
-    // This walkthrough uses GCP so its concrete service account, mounts, and
-    // storage calls are internally consistent. The job model also supports AWS
-    // and Azure; the README shows their required queue and Batch-endpoint setup.
-    cloud::config config;
-    config.provider = "gcp";
-    config.project = "physics-project";
-    config.region = "europe";       // GCP alias for europe-west4.
-    config.zone = "europe-west4-a"; // Needed by raw GCE, not this Batch plan.
+        // from_environment() reads plain KEY=value configuration. Credentials,
+        // queues, Batch endpoints, regions, and native mount resources therefore
+        // remain outside this source file. The default is GCP only so a first dry
+        // run needs one provider; pass "cheapest" after configuring at least two.
+        cloud::client router = cloud::client::from_environment(chosen.provider);
 
-    // The default GCP chain checks an explicit environment bearer token,
-    // authorised-user ADC, and finally the GCE metadata service. See the README
-    // for the corresponding AWS credential and Azure OAuth configuration.
-    config.auth = cloud::auth::default_chain();
+        // job_spec is the provider-independent description of one invocation.
+        // Member assignment (rather than designated initialisers) keeps this
+        // example valid in C++17 as well as C++20, C++23, and C++26 modes.
+        cloud::job_spec spec;
+        spec.name = "simulation-42";
+        spec.image = "ghcr.io/example/simulation:latest";
 
-    // Public price lookup is deliberately opt-in because plan() then performs
-    // network requests. Leave it disabled for a purely local, deterministic
-    // plan, or enable the following line for a current list-price estimate:
-    // config.prices = cloud::price_source::public_catalog;
+        // Commands are shell-free tokens. The example deliberately uses a small,
+        // line-oriented text configuration rather than requiring user-authored
+        // JSON; both files remain easy to inspect with grep and ordinary tools.
+        spec.command = {"/usr/local/bin/simulate", "--config", "/input/config.txt",
+                        "--output", "/output/result.dat"};
 
-    // Short polling intervals are useful in tests, but real cloud control
-    // planes should use the defaults. These settings bound only the final log
-    // drain; config.cleanup_timeout separately bounds deletion and recovery.
-    config.final_log_delay = std::chrono::seconds(2);
-    config.final_log_timeout = std::chrono::seconds(30);
+        // A mount names a storage collection rather than one object. Bucket or
+        // container roots are the portable intersection: GCP may additionally
+        // mount a prefix, while AWS and Azure apply the native restrictions
+        // documented in the README. The input collection is read-only.
+        spec.mounts = {
+            {"cloud://sim-input", "/input", true},
+            {"cloud://sim-output", "/output", false},
+        };
 
-    // Moving the configuration makes one client own its callbacks and cached
-    // price data. The client itself performs no submission here.
-    cloud::client client(std::move(config));
+        // The planner rounds these portable minimums up to a supported native
+        // shape. Set gpu to t4, l4, a10, a100, or h100 when the configured route
+        // supports that exact model. AWS mounted jobs deliberately reject GPUs
+        // because S3 Files volumes are Fargate-only.
+        spec.resources.cpus = 4;
+        spec.resources.memory_gb = 16;
+        spec.resources.gpu_count = 1;
+        spec.resources.spot = false;
 
-    // A job_spec describes the portable part of one container invocation.
-    // Commands are passed as tokens, never through a shell. For GCP the first
-    // token becomes the entrypoint; AWS and Azure preserve the image ENTRYPOINT
-    // and pass these tokens as its command arguments.
-    // Ordinary member assignment makes the example valid in C++17 as well as
-    // every newer standard. The structures remain aggregates, so applications
-    // compiled as C++20 or later may use designated initialisers if preferred.
-    cloud::job_spec spec;
-    spec.name = "simulation-42";
-    spec.image = "ghcr.io/example/simulation:latest";
-    spec.command = {"/usr/local/bin/simulate", "--config", "/input/config.json", "--output",
-                    "/output/result.json"};
+        // A maximum price fails closed when no comparable estimate is available.
+        // It is omitted here so an explicit provider can plan without a network
+        // price lookup. "cheapest" enables the built-in catalogue automatically.
+        spec.resources.max_price_per_hour = std::nullopt;
 
-    // GCP can run the container as a dedicated service account. The controller
-    // identity must be allowed to act as this account.
-    spec.service_account = "batch-runner@physics-project.iam.gserviceaccount.com";
+        // Providers express retry limits differently, but the portable value is
+        // always the number of retries after the first attempt. auto_delete
+        // cleans up controller-owned resources as far as each API permits.
+        spec.retries = 2;
+        spec.auto_delete = true;
+        spec.timeout = std::chrono::hours(2);
 
-    // cloud:// mounts currently map to GCS prefixes. The trailing slash is
-    // intentional: a mount names a directory-like prefix, not one object.
-    // The final boolean marks the input mount read-only.
-    spec.mounts = {
-        {"cloud://sim-input/run-42/", "/input", true},
-        {"cloud://sim-output/run-42/", "/output"},
-    };
+        // route(spec) chooses once and returns a cheap client bound to the winner.
+        // Every later storage, compute, planning, and submission call therefore
+        // stays on that provider. Passing gcp/aws/azure above is the override.
+        cloud::client client = router.route(spec);
+        const cloud::plan plan = client.plan(spec);
+        std::cout << "provider: " << plan.provider << '\n'
+                  << "region:   " << plan.region << '\n'
+                  << "machine:  " << plan.machine_type << '\n';
+        if (plan.estimated_hourly_cost)
+            std::cout << "price:    $" << *plan.estimated_hourly_cost << " per hour\n";
 
-    // The planner chooses the smallest supported native shape. Set gpu to t4,
-    // l4, a10, a100, or h100 to request an accelerator. AWS GPU jobs
-    // additionally need a dedicated queue mapping in config.aws.gpu_targets.
-    spec.resources.cpus = 4;
-    spec.resources.memory_gb = 16;
-    spec.resources.gpu_count = 1;
-    spec.resources.spot = true;
+        // Planning may perform read-only catalogue requests, but it never
+        // allocates compute. Nothing below runs without the explicit --submit
+        // flag because uploads and jobs can consume billable cloud resources.
+        if (!chosen.submit) {
+            std::cout << "dry run only; pass --submit after configuring real resources\n";
+            return 0;
+        }
 
-    // A ceiling fails closed if no trustworthy estimate exists. It is omitted
-    // here because public lookup is disabled above.
-    spec.resources.max_price_per_hour = std::nullopt;
+        // cloud:// is resolved by the route: GCS on GCP, S3 on AWS, and Blob
+        // Storage on Azure. Uploading before run() makes the same object visible
+        // through the input mount without provider-specific application code.
+        client.storage().put_file("cloud://sim-input/config.txt", "./config.txt");
 
-    // Retries are delegated to the provider's Batch service. auto_delete
-    // removes the GCP/Azure job record after the terminal logs are drained; AWS
-    // retains its terminal record but deregisters the temporary job definition.
-    spec.retries = 2;
-    spec.auto_delete = true;
-    spec.timeout = std::chrono::hours(2);
+        // The returned job handle owns provider-native polling, cancellation,
+        // final log draining, and cleanup. Logging is delivered one line at a
+        // time; it is intentionally not presented as a live byte stream.
+        const cloud::result result = client.run(spec).wait([](const cloud::log_entry& line) {
+            std::cout << line.text << '\n';
+        });
+        if (!result.success()) {
+            std::cerr << "job failed: " << result.error() << '\n';
+            return 1;
+        }
 
-    // Planning validates the entire request and resolves a concrete region,
-    // machine type, accelerator, and optional hourly estimate. It never
-    // allocates compute; public pricing only adds read-only catalogue requests.
-    const cloud::plan plan = client.plan(spec);
-    std::cout << "provider: " << plan.provider << '\n'
-              << "region:   " << plan.region << '\n'
-              << "machine:  " << plan.machine_type << '\n';
-
-    if (!submit) {
-        std::cout << "dry run only; pass --submit after configuring real resources\n";
+        // get_file() downloads to a temporary file, verifies library CRC32C
+        // metadata when present, and then replaces the destination. The calling
+        // code remains identical for every route.
+        client.storage().get_file("cloud://sim-output/result.dat", "./result.dat");
         return 0;
+    } catch (const std::exception& failure) {
+        std::cerr << "example: " << failure.what() << '\n';
+        return 2;
     }
-
-    // Everything below this point can make authenticated, billable cloud API
-    // calls. Uploading through storage() is GCP-only in this release; AWS and
-    // Azure users should stage inputs with their normal object-storage tooling.
-    client.storage().put_file("cloud://sim-input/run-42/config.json", "./config.json");
-
-    // run() plans once more immediately before submission so validation and
-    // price ceilings are fresh. The returned handle owns provider-specific
-    // polling, cancellation, final log draining, and cleanup behaviour.
-    cloud::job job = client.run(spec);
-    const cloud::result result = job.wait([](const cloud::log_entry& line) {
-        // Cloud logging services provide line-level polling, not a byte stream.
-        std::cout << line.text << '\n';
-    });
-
-    if (!result.success()) {
-        std::cerr << "job failed: " << result.error() << '\n';
-        return 1;
-    }
-
-    // Download through a temporary file and verified CRC32C before replacing
-    // the destination. As with the upload, this facade currently selects GCS.
-    client.storage().get_file("cloud://sim-output/run-42/result.json", "./result.json");
-    return 0;
 }

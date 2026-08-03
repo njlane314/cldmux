@@ -6,7 +6,7 @@
 `cloud.h` is one C++17-or-newer header for running a container on temporary cloud
 compute:
 
-Version 0.2 intentionally renames the sole public header from `cloud.hpp` to
+Version 0.2 intentionally renamed the sole public header from `cloud.hpp` to
 `cloud.h`; update both the include and `CLOUD_H_VERSION` macro spelling.
 
 ```text
@@ -16,8 +16,8 @@ local data → plan → upload → run → poll logs → collect output → dele
 The job-facing model is provider-independent. GCP Batch, AWS Batch, and Azure
 Batch run container jobs; their native logging APIs feed one `cloud::job`
 handle. GPU planning and opt-in public-catalogue price lookup are built in.
-Cloud Storage and raw instance control remain deliberately GCP-only and report
-that boundary through `supports()`.
+The same selected provider owns `cloud://` object storage, native storage
+mounts, and logical-template raw instance control.
 
 It uses the REST APIs directly through libcurl. There is no SDK, daemon,
 generated code, Python or Go helper, or implementation `.cpp`; it never shells
@@ -58,7 +58,7 @@ The header is fully inline; do not define an implementation macro. The
 minimal [`examples/run.cpp`](examples/run.cpp) keeps one provider-neutral job
 definition. It defaults to a safe, planning-only price comparison; only
 `--submit` permits billable execution. The heavily commented
-[`example.cpp`](example.cpp) explains the fuller GCP storage workflow.
+[`example.cpp`](example.cpp) explains the fuller provider-neutral workflow.
 
 ## AUTOMATIC ROUTING
 
@@ -80,13 +80,13 @@ plan or missing quote aborts the decision instead of biasing it towards a
 partial set. `run()` repeats the comparison immediately before submission.
 
 Passing `gcp`, `aws`, or `azure` is the override. It loads only that provider
-and leaves catalogue lookup disabled, so `plan()` remains local. Provider
-infrastructure stays outside the program:
+and leaves catalogue lookup disabled, so `plan()` remains local. For job
+submission, provider infrastructure stays outside the program:
 
 | Provider | Required environment | Optional environment |
 |---|---|---|
 | GCP | `CLOUD_GCP_PROJECT` | `CLOUD_GCP_REGION`, `CLOUD_GCP_ZONE` |
-| AWS | at least one CPU, Spot, or complete GPU queue | `CLOUD_AWS_REGION`, `CLOUD_AWS_MACHINE_TYPE`, `CLOUD_AWS_SPOT_MACHINE_TYPE`, `CLOUD_AWS_ZONE`, `CLOUD_AWS_LOG_GROUP` |
+| AWS | at least one CPU, Spot, or complete GPU queue; mounted jobs instead require a Fargate queue, roles, and S3 Files mapping | `CLOUD_AWS_REGION`, `CLOUD_AWS_MACHINE_TYPE`, `CLOUD_AWS_SPOT_MACHINE_TYPE`, `CLOUD_AWS_ZONE`, `CLOUD_AWS_LOG_GROUP` |
 | Azure | `CLOUD_AZURE_BATCH_ENDPOINT` | `CLOUD_AZURE_REGION`, `CLOUD_AZURE_BATCH_TOKEN` for submission |
 
 `CLOUD_REGION` and `CLOUD_ZONE` are shared fallbacks. For cheapest AWS routing,
@@ -103,6 +103,24 @@ pricing is unauthenticated.
 lazily if Azure wins and the job is submitted. Configure a trusted private
 proxy or sovereign-cloud endpoint through explicit `cloud::config`, where the
 destination is visible in code.
+
+A cheapest-policy client is deliberately unbound until it has a job or an
+explicit override. Bind it before touching provider-owned resources:
+
+```cpp
+auto routed = client.route(job);       // Plan once and bind the winner.
+auto aws = client.route("aws");         // Explicit local override.
+
+std::cout << routed.selected_provider() << '\n';
+routed.storage().put("cloud://inputs/data.txt", "payload");
+routed.compute().create("worker", "general-worker").wait();
+auto submitted = routed.run(job);
+```
+
+`route()` returns a cheap `cloud::client` sharing the original state; it does
+not mutate the router. Its storage, raw compute, planning, and submission stay
+on the bound provider. `run()` revalidates and reprices the job, but cannot
+switch that routed client to a different cloud.
 
 One exact AWS GPU target can be supplied without adding provider logic to the
 program: set `CLOUD_AWS_GPU_MODEL`, `CLOUD_AWS_GPU_MACHINE_TYPE`,
@@ -151,9 +169,9 @@ config.azure.auth = cloud::auth::from([](std::string_view scope) { return token_
 cloud::client client(std::move(config));
 ```
 
-The scoped callback receives
-`https://batch.core.windows.net/.default` for Azure Batch and the Google
-Cloud Platform scope for GCP. A fixed `auth::bearer(...)` is also accepted.
+The scoped callback receives the applicable Google Cloud Platform scope or the
+Azure Batch, Blob Storage, or Resource Manager scope. A fixed
+`auth::bearer(...)` is also accepted.
 
 ## WHAT `run()` DOES
 
@@ -179,12 +197,19 @@ must itself be the executable. Azure Batch has one non-shell command-line
 field, so this release accepts only portable token characters in each Azure
 argument; unsafe or empty arguments fail during planning.
 
-Mount sources are supported only by GCP and denote a GCS bucket or prefix, not
-one object. Batch mounts them with GCS FUSE and bind-mounts the resulting
-directory at the requested container path. A read-only mount must set the third
-field to `true`. `workdir` sets the container working directory; it does not
-upload local source code. Put code in the image or in an explicitly mounted
-prefix. Buckets and prefixes are not created by `run()`.
+Mount sources denote storage collections, not individual objects. GCP accepts a
+GCS bucket or slash-terminated prefix through GCS FUSE. AWS maps the source
+bucket to a configured [S3 Files file
+system](https://docs.aws.amazon.com/batch/latest/userguide/s3files-volumes.html)
+and uses an AWS Batch Fargate queue; S3 Files mounts on EC2 and mounted GPU jobs
+fail closed. Azure mounts a complete Blob container through [BlobFuse virtual
+mounts](https://learn.microsoft.com/en-us/azure/batch/virtual-file-mount); a
+prefix below a container fails closed. A read-only mount must set the third
+field to `true`.
+
+`workdir` sets the container working directory; it does not upload local source
+code. Put code in the image or in an explicitly mounted collection. Buckets,
+containers, prefixes, and native mount resources are not created by `run()`.
 
 Cloud Logging, CloudWatch Logs, and Azure task files are polled and can be
 delayed; this is log streaming at the line level, not a live byte stream. Azure
@@ -203,7 +228,7 @@ Public-catalogue lookup is opt-in because it performs network requests during
 planning:
 
 ```cpp
-config.prices = cloud::price_source::public_catalog;
+config.prices = cloud::price_source::public_catalogue;
 ```
 
 It queries GCP Cloud Billing pricing data, the signed AWS Price List API (or EC2
@@ -224,6 +249,11 @@ requires `config.zone`, because Spot observations are Availability-Zone
 specific. A provider response with no unique applicable price leaves the
 estimate unavailable.
 
+Mounted AWS jobs run on Fargate, whose vCPU and rounded memory quantities are
+exposed to `lookup_hourly_cost`. The built-in EC2 catalogue lookup deliberately
+does not invent a Fargate quote, so lowest-cost routing for a mounted job needs
+that callback or an explicit provider override.
+
 A trusted callback remains available as an override and test seam:
 
 ```cpp
@@ -241,11 +271,12 @@ reservation or binding quote. Egress is reported as unknown.
 requires at least two of them, compares the same USD compute-only basis, and
 follows provider order for ties. Any failed plan or missing quote fails closed.
 
-## GCP STORAGE AND RAW COMPUTE
+## STORAGE AND RAW COMPUTE
 
-These provider-independent facades currently select the GCP implementation;
-an AWS- or Azure-selected client throws instead of routing data to the wrong
-provider. The narrow storage surface is:
+`cloud://bucket/key` maps to GCS, S3, or Azure Blob Storage according to the
+routed client. The URI contains no provider name because `route(job)` or
+`route(provider)` is the authority; an unbound multi-provider client fails
+closed instead of guessing. The narrow storage surface is:
 
 ```cpp
 client.storage().put(uri, bytes);
@@ -257,27 +288,60 @@ client.storage().stat(uri);
 client.storage().remove(uri);
 ```
 
-`get()` and `get_file()` generation-pin downloads and verify CRC32C. `get_file()`
-writes a temporary file before replacing the destination; replacement is atomic
-on POSIX filesystems, while the Windows compatibility fallback is recoverable
-but not atomic. File transfers default to a one-hour timeout. Uploads are
-single-request, not resumable, and can use generation preconditions through
-`cloud::put_options`.
+Transfers stay within the routed provider; the facade never copies an object to
+a different cloud. `get_file()` writes a temporary file before replacing the
+destination; replacement is atomic on POSIX filesystems, while the Windows
+compatibility fallback is recoverable but not atomic. File transfers default to
+a one-hour timeout. Uploads are single-request, not resumable.
 
-Raw GCE control remains available when Batch is not the right abstraction:
+Raw instance control remains available when Batch is not the right abstraction:
 
 ```cpp
 for (const auto& vm : client.compute().instances())
     std::cout << vm.name << ' ' << vm.status << '\n';
 
-client.compute().create("worker", "instance-template").wait();
+client.compute().create("worker", "general-worker").wait();
 client.compute().stop("worker").wait();
 client.compute().start("worker").wait();
 client.compute().destroy("worker").wait();
 ```
 
-`compute::create()` specifically creates from an existing global instance
-template. The Google-specific primitives are also exposed under `cloud::gcp`.
+The second argument to `compute().create()` is a logical template name. The
+routed client resolves it to a GCE instance template, an EC2 launch template, or
+a specialised Azure managed/Compute Gallery image plus subnet and VM size. Explicit
+`cloud::config` can define the same logical name for several providers; native
+identifiers never enter the provider-neutral call site. Google-specific
+primitives remain exposed under `cloud::gcp`.
+
+Environment configuration is plain, grep-friendly `KEY=value`; callers do not
+write JSON. `from_environment()` loads at most one logical compute template and
+one AWS S3 Files mapping, while explicit `cloud::config` supports larger maps:
+
+```text
+CLOUD_COMPUTE_TEMPLATE=general-worker
+CLOUD_GCP_INSTANCE_TEMPLATE=projects/example/global/instanceTemplates/worker
+
+CLOUD_AWS_LAUNCH_TEMPLATE_ID=lt-0123456789abcdef0
+CLOUD_AWS_S3_FILES_BUCKET=inputs
+CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN=<file-system-arn>
+CLOUD_AWS_S3_FILES_ACCESS_POINT_ARN=<access-point-arn>  # optional
+CLOUD_AWS_FARGATE_JOB_QUEUE=arn:aws:batch:...:job-queue/storage
+CLOUD_AWS_EXECUTION_ROLE_ARN=arn:aws:iam::...:role/execution
+CLOUD_AWS_JOB_ROLE_ARN=arn:aws:iam::...:role/job
+
+CLOUD_AZURE_STORAGE_ACCOUNT=examplestorage
+CLOUD_AZURE_STORAGE_TOKEN=...
+CLOUD_AZURE_STORAGE_SAS=...                              # Batch mounts only
+CLOUD_AZURE_SUBSCRIPTION_ID=...
+CLOUD_AZURE_RESOURCE_GROUP=workers
+CLOUD_AZURE_VM_IMAGE_ID=/subscriptions/.../images/worker
+CLOUD_AZURE_VM_SUBNET_ID=/subscriptions/.../subnets/workers
+CLOUD_AZURE_VM_SIZE=Standard_D4s_v5
+```
+
+AWS may use `CLOUD_AWS_LAUNCH_TEMPLATE_NAME` instead of the ID. Azure raw VM
+operations use `CLOUD_AZURE_MANAGEMENT_TOKEN`; Blob controller operations use
+the storage token, while the SAS is passed only to Batch nodes for mounts.
 
 ## AUTHENTICATION AND SAFETY
 
@@ -293,35 +357,43 @@ callback wins, followed by explicit `aws_config` fields, then
 Profiles, SSO, ECS credentials, and EC2 metadata are intentionally not
 parsed—inject them through the callback if needed.
 
-Azure Batch requires an OAuth bearer token for the Batch audience. Use
-`azure.auth` with a fixed bearer token or a scoped callback. The library does
-not invoke Azure CLI or implement a client-secret/managed-identity exchange;
-the callback is the boundary for those flows.
+Azure Batch, Blob Storage, and Resource Manager require tokens for distinct
+audiences. Use the corresponding authentication override or a scoped callback.
+The library does not invoke Azure CLI or implement a
+client-secret/managed-identity exchange; the callback is the boundary for those
+flows.
 
 The library never invokes `gcloud`, `aws`, or `az`, and never logs credentials.
 API endpoints require TLS unless insecure HTTP is explicitly enabled for a
-test. GCP mutations carry request IDs; AWS uses unique randomised names plus
-read-after-ambiguity reconciliation; Azure uses fixed IDs plus inspection before
-replay. Destructive operations target one named resource, and the library
+test. GCP mutations carry request IDs; AWS Batch uses unique randomised names
+plus read-after-ambiguity reconciliation; Azure uses fixed IDs plus inspection
+before replay. Destructive operations target one named resource, and the library
 creates no firewall rules or inbound ports. On GCP, project SSH keys are blocked
 on Batch VMs, but those VMs can still receive external IP addresses unless the
 project supplies a private network/NAT policy. AWS inherits networking from the
 configured queue/compute environment; Azure uses the Batch auto-pool network
 behaviour configured for the account.
 
+EC2 `Name` tags are not unique. Raw creation checks for an existing managed name
+before `RunInstances`, and later name-based actions reject ambiguity. A
+concurrent-create race remains possible across independent controllers; retain
+the returned instance ID and use it for lifecycle calls when coordinating them.
+
 For GCP, enable the Batch, Compute Engine, Cloud Logging, and Cloud Storage APIs
-first. The referenced buckets, instance templates, and custom service accounts
-must already exist. The controller identity needs permission to create/delete
+first. Referenced buckets, instance templates, and custom service accounts must
+already exist. The controller identity needs permission to create/delete
 Batch jobs and act as the job service account, plus Logs Viewer and any object
 permissions used through `storage()`. The Batch VM service account needs Batch
 Agent Reporter, Logs Writer, and least-privilege read/write access to its
 mounted GCS prefixes; private images may also require registry access.
 
 For AWS, create queues and compute environments first; GPU queues must use a
-GPU-optimised AMI and constrain capacity to the declared model. The controller
-needs Batch registration/submission/inspection/cancellation permissions and
-CloudWatch Logs read access. For Azure, grant Batch data-plane access to the
-Batch account and ensure the configured VM size/image is available in the
+GPU-optimised AMI and constrain capacity to the declared model. S3 Files file
+systems, VPC mount targets, access points, and Fargate queues must also exist
+before they are referenced. The controller needs the applicable Batch, EC2,
+S3, and CloudWatch permissions. For Azure, create referenced Blob containers,
+networks, and images first, grant the applicable Batch, Blob, and Resource
+Manager access, and ensure the configured VM size/image is available in the
 region.
 
 `job_spec::timeout` is enforced by the waiting controller. GCP Batch's
@@ -336,15 +408,14 @@ client.supports("aws", cloud::feature::containers);     // true
 client.supports(cloud::feature::accelerators);          // true
 ```
 
-The capability matrix is:
-
-| Feature | GCP | AWS | Azure |
-|---|---:|---:|---:|
-| Container jobs, Spot, logs, accelerators, estimates | yes | yes | yes |
-| Object storage, storage mounts, raw instances | yes | no | no |
-
 `supports()` reports implemented library behaviour, not account permissions,
 regional quota, queue configuration, or current SKU capacity.
+
+All three providers expose container jobs, object storage, native storage
+mounts, raw instances, logs, accelerators, Spot planning, and cost estimates.
+Their native semantics remain visible: GCP mounts may select prefixes, AWS S3
+Files mounts require Fargate and reject GPUs, and Azure mounts require a whole
+Blob container. Unsupported combinations fail closed.
 
 CPU tables cover GCP E2 and Azure Dsv5 through 32 vCPU/128 GiB. Canonical GPU
 names are `t4`, `l4`, `a10`, `a100`, and `h100`. GCP maps T4, L4, A100 80 GB,
@@ -395,6 +466,6 @@ Every mode uses the same cases and an in-process loopback fake server. They make
 no cloud API calls, need no credentials, and cannot incur cloud charges.
 Override `TST_DIR` when the header is not checked out at `../tst`.
 
-## LICENSE
+## LICENCE
 
 [MIT](LICENSE)

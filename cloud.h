@@ -2,7 +2,8 @@
 // C++17, libcurl >= 7.84, and nothing else. Link with: -lcurl -pthread
 //
 // GCP, AWS, and Azure Batch run one container job, expose its logs, and clean
-// up the controller resources. GCS storage and raw GCE controls are included.
+// up controller resources. Route-bound object storage, native mounts, and raw
+// instance controls cover GCP, AWS, and Azure without provider-specific calls.
 //
 // Typical code stays in namespace cloud: construct config and client, call
 // plan() to validate and resolve a native shape, then call run() to submit. The
@@ -12,9 +13,9 @@
 //
 // Reading map:
 //   1. Low-level GCP values, transport, authentication, storage, and compute
-//   2. Portable job/configuration types
-//   3. Planning, pricing, provider lifecycle, and submission internals
-//   4. Public storage, compute, job, and client handles
+//   2. Portable job/configuration types and route configuration
+//   3. Planning, pricing, provider transports, lifecycle, and submission
+//   4. Route-bound storage, compute, job, and client handles
 //
 // plan() never allocates compute. It can perform read-only pricing requests
 // when public catalogue lookup is enabled. run(), storage(), and compute() can
@@ -23,8 +24,8 @@
 #ifndef NJLANE314_CLOUD_H_INCLUDED
 #define NJLANE314_CLOUD_H_INCLUDED
 
-#define CLOUD_H_VERSION "0.2.0"
-#define CLOUD_H_VERSION_NUM 0x000200
+#define CLOUD_H_VERSION "0.3.0"
+#define CLOUD_H_VERSION_NUM 0x000300
 
 // Dependencies and compile-time contract --------------------------------------
 
@@ -43,6 +44,7 @@
 #include <fstream>
 #include <functional>
 #include <iomanip>
+#include <iterator>
 #include <limits>
 #include <locale>
 #include <map>
@@ -1257,7 +1259,7 @@ inline HttpResponse http(HttpRequest request) {
                 // Windows does not replace an existing destination with rename(). Keep
                 // the old file recoverable until the new one is safely in place.
                 std::filesystem::path backup = *request.download_file;
-                backup += ".gcp-backup-" + random_uuid();
+                backup += ".cloud-backup-" + random_uuid();
                 std::error_code backup_error;
                 std::filesystem::rename(*request.download_file, backup, backup_error);
                 if (!backup_error) {
@@ -1938,7 +1940,7 @@ private:
 
 } // namespace cloud::gcp
 
-// Public API: portable jobs plus GCP storage/compute aliases ------------------
+// Public API: portable jobs, storage, and raw compute -------------------------
 
 namespace cloud {
 
@@ -1962,6 +1964,8 @@ using provider = std::string;
 class operation {
 public:
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
+    [[nodiscard]] const std::string& location() const noexcept { return location_; }
+    // Compatibility spelling retained for callers of the original GCE handle.
     [[nodiscard]] const std::string& zone() const noexcept { return location_; }
 
     void wait(std::chrono::milliseconds timeout = std::chrono::minutes(10),
@@ -1994,7 +1998,7 @@ enum class selection { ordered, lowest_cost };
 
 // Catalogue pricing is opt-in because it adds read-only network requests during
 // plan(). Caller callbacks below take precedence over this setting.
-enum class price_source { none, public_catalog };
+enum class price_source { none, public_catalogue };
 
 // Capability flags describe implemented library behaviour only. They do not
 // imply credentials, quota, regional availability, or configured AWS queues.
@@ -2061,8 +2065,10 @@ struct resources {
     std::optional<double> max_price_per_hour;
 };
 
-// A GCP-only GCS FUSE mount. source is cloud://bucket or a slash-terminated
-// prefix; target is an absolute path inside the container.
+// A provider-neutral native storage mount. source is cloud://bucket or a
+// provider-supported slash-terminated prefix; target is an absolute path in
+// the container. Planning rejects combinations the selected backend cannot
+// represent faithfully.
 struct mount {
     std::string source;
     std::string target;
@@ -2164,6 +2170,11 @@ struct price_request {
     std::string accelerator;
     unsigned accelerator_count = 0;
     bool spot = false;
+    // Needed for resource-priced services such as Fargate, where no EC2-style
+    // machine identifier encodes the billed CPU and memory quantities. These
+    // fields are appended to preserve older positional aggregate initialisers.
+    unsigned cpus = 0;
+    double memory_gb = 0;
 };
 using price_lookup = std::function<std::optional<double>(const price_request&)>;
 // Compatibility callback. New code should use lookup_hourly_cost so attached
@@ -2350,9 +2361,9 @@ struct uri {
 };
 
 inline uri parse_uri(std::string_view value, std::string_view operation = {}) {
-    // cloud:// is deliberately provider-neutral at the facade, but only the GCP
-    // storage implementation currently consumes it. Object operations require a
-    // key; list and mount operations may address the bucket root.
+    // cloud:// is deliberately provider-neutral: the route-bound client maps it
+    // to GCS, S3, or Azure Blob Storage. Object operations require a key; list
+    // and mount operations may address the collection root.
     constexpr std::string_view prefix = "cloud://";
     if (!gcp::detail::starts_with(value, prefix))
         throw error("Cloud URI must start with cloud://");
@@ -2374,11 +2385,18 @@ inline bool implemented(std::string_view value) {
 inline bool supports(std::string_view value, feature requested) {
     if (!implemented(value))
         return false;
-    if (value == "gcp")
+    switch (requested) {
+    case feature::object_storage:
+    case feature::containers:
+    case feature::spot_instances:
+    case feature::storage_mounts:
+    case feature::log_streaming:
+    case feature::raw_instances:
+    case feature::accelerators:
+    case feature::cost_estimates:
         return true;
-    return requested == feature::containers || requested == feature::spot_instances ||
-           requested == feature::log_streaming || requested == feature::accelerators ||
-           requested == feature::cost_estimates;
+    }
+    return false;
 }
 
 inline std::string configured_region(const config& cfg, std::string_view provider) {
@@ -2783,7 +2801,7 @@ inline config config_from_environment(std::string_view requested) {
     } else if (requested == "cheapest") {
         out.providers.clear();
         out.selection = selection::lowest_cost;
-        out.prices = price_source::public_catalog;
+        out.prices = price_source::public_catalogue;
         if (!gcp::detail::env("CLOUD_GCP_PROJECT").empty()) {
             environment_gcp(out);
             out.providers.push_back("gcp");
@@ -2995,6 +3013,8 @@ inline machine_choice machine(std::string_view provider, const config& cfg,
 inline void validate_spec(const job_spec& spec);
 inline void validate_provider_spec(std::string_view provider, const config& cfg,
                                    const job_spec& spec);
+inline std::uint64_t memory_mib(double memory_gb);
+inline std::uint64_t fargate_memory_mib(const resources& requested);
 
 inline cloud::plan make_provider_plan(const config& cfg, const job_spec& spec,
                                       std::string provider) {
@@ -3007,7 +3027,9 @@ inline cloud::plan make_provider_plan(const config& cfg, const job_spec& spec,
         throw error(out.provider + " backend is not implemented");
     validate_provider_spec(out.provider, cfg, spec);
     out.region = detail::region(configured_region(cfg, out.provider), out.provider);
-    const auto selected_machine = machine(out.provider, cfg, spec.resources, out.warnings);
+    const auto selected_machine = out.provider == "aws" && !spec.mounts.empty()
+                                      ? machine_choice{"FARGATE", {}, 0}
+                                      : machine(out.provider, cfg, spec.resources, out.warnings);
     out.machine_type = selected_machine.name;
     out.accelerator = selected_machine.accelerator;
     out.accelerator_count = selected_machine.accelerator_count;
@@ -3025,6 +3047,13 @@ inline cloud::plan make_provider_plan(const config& cfg, const job_spec& spec,
     if (out.provider == "aws")
         out.warnings.push_back(
             "AWS Batch command replaces image CMD but preserves the image ENTRYPOINT");
+    if (out.provider == "aws" && !spec.mounts.empty()) {
+        const auto rounded = fargate_memory_mib(spec.resources);
+        if (rounded != memory_mib(spec.resources.memory_gb))
+            out.warnings.push_back("AWS Fargate memory was rounded up to " +
+                                   std::to_string(rounded) + " MiB");
+        out.warnings.push_back("AWS S3 Files mounts use Fargate and cannot attach GPUs");
+    }
     if (out.provider == "azure")
         out.warnings.push_back(
             "Azure task-file logs are grouped by stdout/stderr rather than globally ordered");
@@ -3055,6 +3084,33 @@ inline std::uint64_t memory_mib(double memory_gb) {
     return static_cast<std::uint64_t>(value);
 }
 
+inline std::uint64_t fargate_memory_mib(const resources& requested) {
+    const std::uint64_t wanted = memory_mib(requested.memory_gb);
+    struct fargate_shape {
+        unsigned cpus;
+        std::uint64_t first;
+        std::uint64_t last;
+        std::uint64_t step;
+    };
+    static constexpr fargate_shape shapes[] = {
+        {1, 2 * 1024, 8 * 1024, 1024},       {2, 4 * 1024, 16 * 1024, 1024},
+        {4, 8 * 1024, 30 * 1024, 1024},      {8, 16 * 1024, 60 * 1024, 4 * 1024},
+        {16, 32 * 1024, 120 * 1024, 8 * 1024},
+    };
+    for (const auto& shape : shapes) {
+        if (requested.cpus != shape.cpus)
+            continue;
+        if (wanted > shape.last)
+            break;
+        if (wanted <= shape.first)
+            return shape.first;
+        const auto increments = (wanted - shape.first + shape.step - 1) / shape.step;
+        return shape.first + increments * shape.step;
+    }
+    throw error("AWS Batch Fargate mounts require 1, 2, 4, 8, or 16 vCPUs and a supported "
+                "memory quantity");
+}
+
 inline void validate_spec(const job_spec& spec) {
     if (spec.image.empty() || spec.command.empty() || spec.command.front().empty())
         throw error("A job requires a container image and a non-empty command");
@@ -3068,21 +3124,38 @@ inline void validate_spec(const job_spec& spec) {
         spec.service_account.find('\n') != std::string::npos)
         throw error("Service account contains an invalid newline");
     for (const auto& item : spec.mounts) {
-        const uri source = parse_uri(item.source);
-        if (!source.key.empty() && !gcp::detail::ends_with(source.key, "/"))
-            throw error("GCS job mounts require a bucket or directory prefix ending in '/'");
+        (void)parse_uri(item.source);
         if (item.target.empty() || item.target.front() != '/' ||
             item.target.find(':') != std::string::npos)
             throw error("Mount targets must be absolute container paths without ':'");
+        for (const char c : item.target)
+            if (!gcp::detail::is_ascii_alnum(c) && c != '/' && c != '.' && c != '_' && c != '-')
+                throw error("Mount targets contain an unsafe character");
+        std::size_t begin = 1;
+        while (begin <= item.target.size()) {
+            const auto slash = item.target.find('/', begin);
+            const std::size_t length =
+                slash == std::string::npos ? item.target.size() - begin : slash - begin;
+            const std::string_view component(item.target.data() + begin, length);
+            if (component == "." || component == "..")
+                throw error("Mount targets must not contain '.' or '..' path components");
+            if (slash == std::string::npos)
+                break;
+            begin = slash + 1;
+        }
     }
 }
 
 inline void validate_provider_spec(std::string_view provider, const config& cfg,
                                    const job_spec& spec) {
-    if (provider == "gcp")
+    if (provider == "gcp") {
+        for (const auto& item : spec.mounts) {
+            const uri source = parse_uri(item.source);
+            if (!source.key.empty() && !gcp::detail::ends_with(source.key, "/"))
+                throw error("GCS job mounts require a bucket or directory prefix ending in '/'");
+        }
         return;
-    if (!spec.mounts.empty())
-        throw error(std::string(provider) + " Batch storage mounts are not implemented");
+    }
     if (provider == "aws") {
         if (!spec.workdir.empty())
             throw error("AWS Batch has no portable per-job container working-directory field");
@@ -3094,6 +3167,39 @@ inline void validate_provider_spec(std::string_view provider, const config& cfg,
             throw error("AWS Batch EC2 jobs require at least 4 MiB of memory");
         const std::string gpu =
             spec.resources.gpu.empty() ? std::string{} : canonical_gpu(spec.resources.gpu);
+        if (!spec.mounts.empty()) {
+            if (!gpu.empty())
+                throw error("AWS S3 Files mounts use Fargate, which does not support GPUs");
+            const auto& queue = spec.resources.spot ? cfg.aws.fargate_spot_job_queue
+                                                    : cfg.aws.fargate_job_queue;
+            if (queue.empty())
+                throw error(std::string("AWS mounted ") +
+                            (spec.resources.spot ? "Fargate Spot" : "Fargate") +
+                            " jobs require a configured queue");
+            if (cfg.aws.execution_role_arn.empty())
+                throw error("AWS mounted jobs require config::aws.execution_role_arn");
+            if (spec.service_account.empty() && cfg.aws.job_role_arn.empty())
+                throw error("AWS mounted jobs require a job role ARN");
+            (void)fargate_memory_mib(spec.resources);
+            const std::string selected_region =
+                region(configured_region(cfg, "aws"), "aws");
+            for (const auto& item : spec.mounts) {
+                const uri source = parse_uri(item.source);
+                if (!source.key.empty() && !gcp::detail::ends_with(source.key, "/"))
+                    throw error("AWS S3 Files mounts require a bucket or directory prefix ending "
+                                "in '/'");
+                const auto mapping = cfg.aws.s3_files.find(source.bucket);
+                if (mapping == cfg.aws.s3_files.end() || mapping->second.file_system_arn.empty())
+                    throw error("AWS S3 Files has no configured file system for bucket " +
+                                source.bucket);
+                if (mapping->second.file_system_arn.find(":s3files:" + selected_region + ':') ==
+                    std::string::npos)
+                    throw error("AWS S3 Files ARN region does not match the selected AWS region");
+                if (!mapping->second.access_point_arn.empty() && !source.key.empty())
+                    throw error("AWS S3 Files access-point mounts cannot select a prefix");
+            }
+            return;
+        }
         if (gpu.empty()) {
             const auto& queue = spec.resources.spot ? cfg.aws.spot_job_queue : cfg.aws.job_queue;
             if (queue.empty())
@@ -3121,6 +3227,20 @@ inline void validate_provider_spec(std::string_view provider, const config& cfg,
     if (endpoint.find(".batch.") != std::string::npos &&
         endpoint.find(std::string(".") + azure_region + ".batch.") == std::string::npos)
         throw error("Azure batch_endpoint region does not match the selected Azure region");
+    if (!spec.mounts.empty()) {
+        if (spec.mounts.size() > 10)
+            throw error("Azure Batch supports at most 10 virtual file-system mounts");
+        if (cfg.azure.storage_account.empty() || cfg.azure.storage_sas.empty())
+            throw error("Azure Blob mounts require a storage account and node SAS");
+        std::string node_agent = cfg.azure.node_agent_sku;
+        std::transform(node_agent.begin(), node_agent.end(), node_agent.begin(),
+                       gcp::detail::ascii_lower);
+        if (node_agent.find("windows") != std::string::npos)
+            throw error("Azure Blob container mounts require a Linux Batch image");
+        for (const auto& item : spec.mounts)
+            if (!parse_uri(item.source).key.empty())
+                throw error("Azure Blob mounts support complete containers, not prefixes");
+    }
     for (const auto& argument : spec.command) {
         if (argument.empty())
             throw error("Azure Batch command arguments must not be empty");
@@ -3302,6 +3422,16 @@ inline void validate_endpoint(const client_state& client, std::string_view value
     throw error(std::string(name) + " must use HTTPS (or set allow_insecure_http explicitly)");
 }
 
+inline std::string endpoint_origin(std::string_view value) {
+    const auto scheme = value.find("://");
+    if (scheme == std::string_view::npos)
+        throw error("Malformed HTTP endpoint");
+    const auto end = value.find_first_of("/?#", scheme + 3);
+    std::string result(value.substr(0, end));
+    std::transform(result.begin(), result.end(), result.begin(), gcp::detail::ascii_lower);
+    return result;
+}
+
 inline std::string aws_endpoint(const client_state& client, std::string_view configured,
                                 std::string_view service, std::string_view region) {
     std::string value =
@@ -3420,14 +3550,33 @@ inline std::string iso_time() {
     return out.str();
 }
 
-inline gcp::detail::HttpResponse azure_call(
-    const client_state& client, gcp::detail::HttpRequest request, bool retry = true,
+enum class azure_service { batch, storage, management };
+
+inline const gcp::Credentials& azure_credentials(const client_state& client,
+                                                 azure_service service) {
+    if (service == azure_service::storage)
+        return client.azure_storage_credentials();
+    if (service == azure_service::management)
+        return client.azure_management_credentials();
+    return client.azure_credentials();
+}
+
+inline gcp::detail::HttpResponse azure_service_call(
+    const client_state& client, gcp::detail::HttpRequest request, azure_service service,
+    bool retry = true,
     std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
-    // Azure receives a fresh client-request-id and bearer token per attempt. One
-    // 401 invalidates the shared token cache before normal retry classification.
+    // Batch, Blob Storage, and Resource Manager use distinct token audiences
+    // and request headers. One 401 invalidates only the affected token cache.
     if (request.url.empty())
         throw error("Azure request URL must not be empty");
     validate_endpoint(client, request.url, "Azure endpoint");
+    if (service == azure_service::management) {
+        const std::string configured =
+            gcp::detail::base_url(client.config.azure.management_endpoint);
+        if (configured.empty() || endpoint_origin(request.url) != endpoint_origin(configured))
+            throw error("Azure Resource Manager response URL changed origin");
+    }
+    const auto& credentials = azure_credentials(client, service);
     const auto base_timeout = request.timeout.value_or(client.config.request_timeout);
     for (int attempt = 0;; ++attempt) {
         auto current = request;
@@ -3441,18 +3590,28 @@ inline gcp::detail::HttpResponse azure_call(
                 std::min(base_timeout,
                          std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
         }
-        const auto token = client.azure_credentials().access_token();
+        const auto token = credentials.access_token();
         current.headers.push_back(gcp::detail::header("Authorization", "Bearer " + token.value));
-        current.headers.push_back(gcp::detail::header("ocp-date", http_date()));
-        current.headers.push_back(
-            gcp::detail::header("client-request-id", gcp::detail::random_uuid()));
-        current.headers.push_back("return-client-request-id: true");
+        if (service == azure_service::batch) {
+            current.headers.push_back(gcp::detail::header("ocp-date", http_date()));
+            current.headers.push_back(
+                gcp::detail::header("client-request-id", gcp::detail::random_uuid()));
+            current.headers.push_back("return-client-request-id: true");
+        } else if (service == azure_service::storage) {
+            current.headers.push_back(gcp::detail::header("x-ms-date", http_date()));
+            current.headers.push_back("x-ms-version: 2023-11-03");
+            current.headers.push_back(
+                gcp::detail::header("x-ms-client-request-id", gcp::detail::random_uuid()));
+        } else {
+            current.headers.push_back(
+                gcp::detail::header("x-ms-client-request-id", gcp::detail::random_uuid()));
+        }
         if (current.accept_json)
             current.headers.push_back("Accept: application/json");
         try {
             auto response = gcp::detail::http(std::move(current));
             if (response.status == 401 && attempt == 0) {
-                client.azure_credentials().invalidate();
+                credentials.invalidate();
                 continue;
             }
             check_response("Azure", response);
@@ -3462,6 +3621,1025 @@ inline gcp::detail::HttpResponse azure_call(
                 throw;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
+    }
+}
+
+inline gcp::detail::HttpResponse azure_call(
+    const client_state& client, gcp::detail::HttpRequest request, bool retry = true,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    return azure_service_call(client, std::move(request), azure_service::batch, retry, deadline);
+}
+
+inline gcp::detail::HttpResponse azure_storage_call(
+    const client_state& client, gcp::detail::HttpRequest request, bool retry = true,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    return azure_service_call(client, std::move(request), azure_service::storage, retry, deadline);
+}
+
+inline gcp::detail::HttpResponse azure_management_call(
+    const client_state& client, gcp::detail::HttpRequest request, bool retry = true,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    return azure_service_call(client, std::move(request), azure_service::management, retry,
+                              deadline);
+}
+
+// Provider object APIs use XML and path-oriented object names. These small
+// helpers implement only the fixed schemas consumed below; users never author
+// JSON or XML configuration.
+inline std::string encode_path(std::string_view value) {
+    std::string out;
+    std::size_t begin = 0;
+    while (begin <= value.size()) {
+        const auto slash = value.find('/', begin);
+        out += gcp::detail::encode(value.substr(begin, slash - begin));
+        if (slash == std::string_view::npos)
+            break;
+        out.push_back('/');
+        begin = slash + 1;
+    }
+    return out;
+}
+
+inline int hex_digit(char value) {
+    if (value >= '0' && value <= '9')
+        return value - '0';
+    if (value >= 'a' && value <= 'f')
+        return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F')
+        return value - 'A' + 10;
+    return -1;
+}
+
+inline std::string percent_decode(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '%') {
+            out.push_back(value[i]);
+            continue;
+        }
+        if (i + 2 >= value.size())
+            throw error("Malformed percent-encoded provider response");
+        const int high = hex_digit(value[i + 1]);
+        const int low = hex_digit(value[i + 2]);
+        if (high < 0 || low < 0)
+            throw error("Malformed percent-encoded provider response");
+        out.push_back(static_cast<char>((high << 4) | low));
+        i += 2;
+    }
+    return out;
+}
+
+inline std::string xml_unescape(std::string_view value) {
+    std::string out;
+    out.reserve(value.size());
+    for (std::size_t i = 0; i < value.size();) {
+        if (value[i] != '&') {
+            out.push_back(value[i++]);
+            continue;
+        }
+        const auto semicolon = value.find(';', i + 1);
+        if (semicolon == std::string_view::npos)
+            throw error("Malformed XML entity in provider response");
+        const auto entity = value.substr(i + 1, semicolon - i - 1);
+        if (entity == "amp")
+            out.push_back('&');
+        else if (entity == "lt")
+            out.push_back('<');
+        else if (entity == "gt")
+            out.push_back('>');
+        else if (entity == "quot")
+            out.push_back('"');
+        else if (entity == "apos")
+            out.push_back('\'');
+        else
+            throw error("Unsupported XML entity in provider response");
+        i = semicolon + 1;
+    }
+    return out;
+}
+
+inline std::string xml_raw_field(std::string_view xml, std::string_view tag) {
+    const std::string open = '<' + std::string(tag) + '>';
+    const std::string close = "</" + std::string(tag) + '>';
+    const auto begin = xml.find(open);
+    if (begin == std::string_view::npos)
+        return {};
+    const auto content = begin + open.size();
+    const auto end = xml.find(close, content);
+    if (end == std::string_view::npos)
+        throw error("Malformed XML provider response: missing </" + std::string(tag) + '>');
+    return std::string(xml.substr(content, end - content));
+}
+
+inline std::string xml_field(std::string_view xml, std::string_view tag) {
+    return xml_unescape(xml_raw_field(xml, tag));
+}
+
+struct xml_element_value {
+    std::string attributes;
+    std::string text;
+};
+
+// Some Azure list responses annotate an element as percent-encoded, for
+// example <Name Encoded="true">. The simpler xml_field() intentionally handles
+// only exact, attribute-free elements; this helper keeps the exceptional schema
+// explicit rather than turning the compact XML parser into a general parser.
+inline std::optional<xml_element_value> xml_element(std::string_view xml,
+                                                     std::string_view tag) {
+    const std::string prefix = '<' + std::string(tag);
+    const std::string close = "</" + std::string(tag) + '>';
+    std::size_t cursor = 0;
+    while (true) {
+        const auto begin = xml.find(prefix, cursor);
+        if (begin == std::string_view::npos)
+            return std::nullopt;
+        const auto boundary = begin + prefix.size();
+        if (boundary < xml.size() &&
+            (xml[boundary] == '>' || gcp::detail::is_ascii_space(xml[boundary]))) {
+            const auto open_end = xml.find('>', boundary);
+            if (open_end == std::string_view::npos)
+                throw error("Malformed XML provider response: unterminated <" +
+                            std::string(tag) + '>');
+            const auto end = xml.find(close, open_end + 1);
+            if (end == std::string_view::npos)
+                throw error("Malformed XML provider response: missing </" + std::string(tag) +
+                            '>');
+            return xml_element_value{
+                std::string(xml.substr(boundary, open_end - boundary)),
+                xml_unescape(xml.substr(open_end + 1, end - open_end - 1))};
+        }
+        cursor = boundary;
+    }
+}
+
+inline std::string azure_xml_name(std::string_view xml) {
+    const auto value = xml_element(xml, "Name");
+    if (!value)
+        throw error("Malformed Azure Blob list response: missing Name");
+    constexpr std::string_view attribute = "Encoded=\"true\"";
+    const auto position = value->attributes.find(attribute);
+    const bool encoded =
+        position != std::string::npos &&
+        (position == 0 || gcp::detail::is_ascii_space(value->attributes[position - 1])) &&
+        (position + attribute.size() == value->attributes.size() ||
+         gcp::detail::is_ascii_space(value->attributes[position + attribute.size()]));
+    return encoded ? percent_decode(value->text) : value->text;
+}
+
+inline std::vector<std::string_view> xml_blocks(std::string_view xml, std::string_view tag) {
+    const std::string open = '<' + std::string(tag) + '>';
+    const std::string close = "</" + std::string(tag) + '>';
+    std::vector<std::string_view> result;
+    std::size_t cursor = 0;
+    while (true) {
+        const auto begin = xml.find(open, cursor);
+        if (begin == std::string_view::npos)
+            return result;
+        const auto content = begin + open.size();
+        std::size_t scan = content;
+        std::size_t end = std::string_view::npos;
+        unsigned depth = 1;
+        while (depth != 0) {
+            const auto nested = xml.find(open, scan);
+            const auto closing = xml.find(close, scan);
+            if (closing == std::string_view::npos)
+                throw error("Malformed XML provider response: missing </" + std::string(tag) +
+                            '>');
+            if (nested != std::string_view::npos && nested < closing) {
+                ++depth;
+                scan = nested + open.size();
+            } else {
+                --depth;
+                end = closing;
+                scan = closing + close.size();
+            }
+        }
+        result.push_back(xml.substr(content, end - content));
+        cursor = scan;
+    }
+}
+
+inline std::uint64_t unsigned_text(std::string_view value, std::string_view field) {
+    std::uint64_t result = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), result);
+    if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size())
+        throw error("Malformed provider " + std::string(field));
+    return result;
+}
+
+inline std::string response_header(const gcp::detail::HttpResponse& response,
+                                   std::string_view name) {
+    const auto found = response.headers.find(name);
+    return found == response.headers.end() ? std::string{} : found->second;
+}
+
+inline std::vector<std::string> conditional_headers(const put_options& options) {
+    if (!options.if_generation_match)
+        return {};
+    if (*options.if_generation_match == "0")
+        return {"If-None-Match: *"};
+    return {gcp::detail::header("If-Match", *options.if_generation_match)};
+}
+
+inline std::string aws_storage_region(const client_state& client) {
+    return region(configured_region(client.config, "aws"), "aws");
+}
+
+inline std::string aws_storage_url(const client_state& client, std::string_view bucket,
+                                   std::string_view key = {}) {
+    if (bucket.find('/') != std::string_view::npos)
+        throw error("AWS bucket name must not contain '/'");
+    const std::string selected_region = aws_storage_region(client);
+    const std::string endpoint =
+        aws_endpoint(client, client.config.aws.s3_endpoint, "s3", selected_region);
+    std::string result = endpoint + '/' + gcp::detail::encode(bucket);
+    if (!key.empty())
+        result += '/' + encode_path(key);
+    return result;
+}
+
+inline gcp::detail::HttpResponse aws_storage_call(const client_state& client,
+                                                  gcp::detail::HttpRequest request,
+                                                  bool retry = true) {
+    return aws_call(client, std::move(request), aws_storage_region(client), "s3", retry);
+}
+
+inline std::string azure_storage_endpoint(const client_state& client) {
+    std::string endpoint = gcp::detail::base_url(client.config.azure.storage_endpoint);
+    if (endpoint.empty() && !client.config.azure.storage_account.empty())
+        endpoint = "https://" + client.config.azure.storage_account + ".blob.core.windows.net";
+    if (endpoint.empty())
+        throw error("Azure object storage requires config::azure.storage_account or "
+                    "storage_endpoint");
+    validate_endpoint(client, endpoint, "Azure storage_endpoint");
+    return endpoint;
+}
+
+inline std::string azure_storage_url(const client_state& client, std::string_view container,
+                                     std::string_view key = {}) {
+    std::string result = azure_storage_endpoint(client) + '/' + gcp::detail::encode(container);
+    if (!key.empty())
+        result += '/' + encode_path(key);
+    return result;
+}
+
+inline object aws_object_from_headers(std::string name,
+                                      const gcp::detail::HttpResponse& response) {
+    object result;
+    result.name = std::move(name);
+    result.etag = response_header(response, "etag");
+    // ETag is the portable AWS compare-and-replace token. It is deliberately
+    // not labelled as MD5 because multipart and encrypted objects differ.
+    result.generation = result.etag;
+    const std::string size = response_header(response, "content-length");
+    if (!size.empty())
+        result.size = unsigned_text(size, "object size");
+    result.content_type = response_header(response, "content-type");
+    result.updated = response_header(response, "last-modified");
+    result.crc32c = response_header(response, "x-amz-meta-cloud-crc32c");
+    return result;
+}
+
+inline object azure_object_from_headers(std::string name,
+                                        const gcp::detail::HttpResponse& response) {
+    object result;
+    result.name = std::move(name);
+    result.etag = response_header(response, "etag");
+    result.generation = result.etag;
+    const std::string size = response_header(response, "content-length");
+    if (!size.empty())
+        result.size = unsigned_text(size, "blob size");
+    result.content_type = response_header(response, "content-type");
+    result.updated = response_header(response, "last-modified");
+    result.crc32c = response_header(response, "x-ms-meta-cloudcrc32c");
+    result.md5_hash = response_header(response, "content-md5");
+    return result;
+}
+
+inline object aws_storage_stat(const client_state& client, const uri& location) {
+    auto response = aws_storage_call(
+        client, gcp::detail::HttpRequest{}
+                    .with_method("HEAD")
+                    .with_url(aws_storage_url(client, location.bucket, location.key))
+                    .with_accept_json(false));
+    return aws_object_from_headers(location.key, response);
+}
+
+inline object azure_storage_stat(const client_state& client, const uri& location) {
+    auto response = azure_storage_call(
+        client, gcp::detail::HttpRequest{}
+                    .with_method("HEAD")
+                    .with_url(azure_storage_url(client, location.bucket, location.key))
+                    .with_accept_json(false));
+    return azure_object_from_headers(location.key, response);
+}
+
+inline object aws_storage_put(const client_state& client, const uri& location,
+                              std::string_view bytes, put_options options) {
+    const std::string checksum = options.crc32c ? gcp::detail::crc32c(bytes) : std::string{};
+    auto headers = conditional_headers(options);
+    headers.push_back(gcp::detail::header("Content-Type", options.content_type));
+    if (!checksum.empty()) {
+        headers.push_back(gcp::detail::header("x-amz-checksum-crc32c", checksum));
+        headers.push_back(gcp::detail::header("x-amz-meta-cloud-crc32c", checksum));
+    }
+    (void)aws_storage_call(client, gcp::detail::HttpRequest{}
+                                      .with_method("PUT")
+                                      .with_url(aws_storage_url(client, location.bucket,
+                                                                location.key))
+                                      .with_headers(std::move(headers))
+                                      .with_body(std::string(bytes))
+                                      .with_accept_json(false));
+    const object result = aws_storage_stat(client, location);
+    if (!checksum.empty() && result.crc32c != checksum)
+        throw error("Amazon S3 upload checksum metadata mismatch");
+    return result;
+}
+
+inline object azure_storage_put(const client_state& client, const uri& location,
+                                std::string_view bytes, put_options options) {
+    const std::string checksum = options.crc32c ? gcp::detail::crc32c(bytes) : std::string{};
+    auto headers = conditional_headers(options);
+    headers.push_back("x-ms-blob-type: BlockBlob");
+    headers.push_back(gcp::detail::header("Content-Type", options.content_type));
+    if (!checksum.empty())
+        headers.push_back(gcp::detail::header("x-ms-meta-cloudcrc32c", checksum));
+    (void)azure_storage_call(client, gcp::detail::HttpRequest{}
+                                        .with_method("PUT")
+                                        .with_url(azure_storage_url(client, location.bucket,
+                                                                    location.key))
+                                        .with_headers(std::move(headers))
+                                        .with_body(std::string(bytes))
+                                        .with_accept_json(false));
+    const object result = azure_storage_stat(client, location);
+    if (!checksum.empty() && result.crc32c != checksum)
+        throw error("Azure Blob upload checksum metadata mismatch");
+    return result;
+}
+
+inline object aws_storage_put_file(const client_state& client, const uri& location,
+                                   const std::filesystem::path& source, put_options options) {
+    const auto upload = gcp::detail::prepare_upload(source, options.crc32c);
+    auto headers = conditional_headers(options);
+    headers.push_back(gcp::detail::header("Content-Type", options.content_type));
+    if (!upload->crc32c.empty()) {
+        headers.push_back(gcp::detail::header("x-amz-checksum-crc32c", upload->crc32c));
+        headers.push_back(gcp::detail::header("x-amz-meta-cloud-crc32c", upload->crc32c));
+    }
+    (void)aws_storage_call(client, gcp::detail::HttpRequest{}
+                                      .with_method("PUT")
+                                      .with_url(aws_storage_url(client, location.bucket,
+                                                                location.key))
+                                      .with_headers(std::move(headers))
+                                      .with_upload_file(upload)
+                                      .with_timeout(client.config.transfer_timeout)
+                                      .with_accept_json(false));
+    const object result = aws_storage_stat(client, location);
+    if (!upload->crc32c.empty() && result.crc32c != upload->crc32c)
+        throw error("Amazon S3 file upload checksum metadata mismatch");
+    return result;
+}
+
+inline object azure_storage_put_file(const client_state& client, const uri& location,
+                                     const std::filesystem::path& source, put_options options) {
+    const auto upload = gcp::detail::prepare_upload(source, options.crc32c);
+    auto headers = conditional_headers(options);
+    headers.push_back("x-ms-blob-type: BlockBlob");
+    headers.push_back(gcp::detail::header("Content-Type", options.content_type));
+    if (!upload->crc32c.empty())
+        headers.push_back(gcp::detail::header("x-ms-meta-cloudcrc32c", upload->crc32c));
+    (void)azure_storage_call(client, gcp::detail::HttpRequest{}
+                                        .with_method("PUT")
+                                        .with_url(azure_storage_url(client, location.bucket,
+                                                                    location.key))
+                                        .with_headers(std::move(headers))
+                                        .with_upload_file(upload)
+                                        .with_timeout(client.config.transfer_timeout)
+                                        .with_accept_json(false));
+    const object result = azure_storage_stat(client, location);
+    if (!upload->crc32c.empty() && result.crc32c != upload->crc32c)
+        throw error("Azure Blob file upload checksum metadata mismatch");
+    return result;
+}
+
+inline std::string aws_storage_get(const client_state& client, const uri& location) {
+    const object metadata = aws_storage_stat(client, location);
+    std::vector<std::string> headers;
+    if (!metadata.generation.empty())
+        headers.push_back(gcp::detail::header("If-Match", metadata.generation));
+    auto response = aws_storage_call(
+        client, gcp::detail::HttpRequest{}
+                    .with_url(aws_storage_url(client, location.bucket, location.key))
+                    .with_headers(std::move(headers))
+                    .with_calculate_crc32c(!metadata.crc32c.empty())
+                    .with_accept_json(false));
+    if (!metadata.crc32c.empty() && response.crc32c != metadata.crc32c)
+        throw error("Amazon S3 download checksum mismatch");
+    return response.body;
+}
+
+inline std::string azure_storage_get(const client_state& client, const uri& location) {
+    const object metadata = azure_storage_stat(client, location);
+    std::vector<std::string> headers;
+    if (!metadata.generation.empty())
+        headers.push_back(gcp::detail::header("If-Match", metadata.generation));
+    auto response = azure_storage_call(
+        client, gcp::detail::HttpRequest{}
+                    .with_url(azure_storage_url(client, location.bucket, location.key))
+                    .with_headers(std::move(headers))
+                    .with_calculate_crc32c(!metadata.crc32c.empty())
+                    .with_accept_json(false));
+    if (!metadata.crc32c.empty() && response.crc32c != metadata.crc32c)
+        throw error("Azure Blob download checksum mismatch");
+    return response.body;
+}
+
+inline void aws_storage_get_file(const client_state& client, const uri& location,
+                                 const std::filesystem::path& destination) {
+    const object metadata = aws_storage_stat(client, location);
+    std::vector<std::string> headers;
+    if (!metadata.generation.empty())
+        headers.push_back(gcp::detail::header("If-Match", metadata.generation));
+    auto request = gcp::detail::HttpRequest{}
+                       .with_url(aws_storage_url(client, location.bucket, location.key))
+                       .with_headers(std::move(headers))
+                       .with_accept_json(false);
+    request.download_file = destination;
+    request.timeout = client.config.transfer_timeout;
+    if (!metadata.crc32c.empty())
+        request.expected_crc32c = metadata.crc32c;
+    (void)aws_storage_call(client, std::move(request));
+}
+
+inline void azure_storage_get_file(const client_state& client, const uri& location,
+                                   const std::filesystem::path& destination) {
+    const object metadata = azure_storage_stat(client, location);
+    std::vector<std::string> headers;
+    if (!metadata.generation.empty())
+        headers.push_back(gcp::detail::header("If-Match", metadata.generation));
+    auto request = gcp::detail::HttpRequest{}
+                       .with_url(azure_storage_url(client, location.bucket, location.key))
+                       .with_headers(std::move(headers))
+                       .with_accept_json(false);
+    request.download_file = destination;
+    request.timeout = client.config.transfer_timeout;
+    if (!metadata.crc32c.empty())
+        request.expected_crc32c = metadata.crc32c;
+    (void)azure_storage_call(client, std::move(request));
+}
+
+inline void aws_storage_remove(const client_state& client, const uri& location) {
+    (void)aws_storage_call(client, gcp::detail::HttpRequest{}
+                                      .with_method("DELETE")
+                                      .with_url(aws_storage_url(client, location.bucket,
+                                                                location.key))
+                                      .with_accept_json(false));
+}
+
+inline void azure_storage_remove(const client_state& client, const uri& location) {
+    (void)azure_storage_call(client, gcp::detail::HttpRequest{}
+                                        .with_method("DELETE")
+                                        .with_url(azure_storage_url(client, location.bucket,
+                                                                    location.key))
+                                        .with_accept_json(false));
+}
+
+inline object_list aws_storage_list(const client_state& client, const uri& location,
+                                    list_options options) {
+    if (options.versions)
+        throw error("AWS object version listing is not implemented by the portable facade");
+    object_list result;
+    std::string token;
+    for (int page = 0; page < 1000; ++page) {
+        std::size_t page_size = 1000;
+        if (options.limit)
+            page_size = std::min(page_size, options.limit - result.objects.size());
+        if (page_size == 0)
+            return result;
+        std::string query = "?list-type=2&encoding-type=url&max-keys=" +
+                            std::to_string(page_size);
+        if (!options.prefix.empty())
+            query += "&prefix=" + gcp::detail::encode(options.prefix);
+        if (!options.delimiter.empty())
+            query += "&delimiter=" + gcp::detail::encode(options.delimiter);
+        if (!token.empty())
+            query += "&continuation-token=" + gcp::detail::encode(token);
+        const auto response = aws_storage_call(
+            client, gcp::detail::HttpRequest{}
+                        .with_url(aws_storage_url(client, location.bucket) + query)
+                        .with_accept_json(false));
+        for (const auto block : xml_blocks(response.body, "Contents")) {
+            object item;
+            item.name = percent_decode(xml_field(block, "Key"));
+            item.generation = xml_field(block, "ETag");
+            item.etag = item.generation;
+            const std::string size = xml_field(block, "Size");
+            if (!size.empty())
+                item.size = unsigned_text(size, "S3 object size");
+            item.updated = xml_field(block, "LastModified");
+            result.objects.push_back(std::move(item));
+            if (options.limit && result.objects.size() == options.limit)
+                return result;
+        }
+        for (const auto block : xml_blocks(response.body, "CommonPrefixes"))
+            result.prefixes.push_back(percent_decode(xml_field(block, "Prefix")));
+        const bool truncated = xml_field(response.body, "IsTruncated") == "true";
+        const std::string next = xml_field(response.body, "NextContinuationToken");
+        if (!truncated)
+            return result;
+        if (next.empty() || next == token)
+            throw error("AWS S3 listing pagination did not advance");
+        token = next;
+    }
+    throw error("AWS S3 listing exceeded 1000 pages");
+}
+
+inline object_list azure_storage_list(const client_state& client, const uri& location,
+                                      list_options options) {
+    if (options.versions)
+        throw error("Azure Blob version listing is not implemented by the portable facade");
+    object_list result;
+    std::string marker;
+    for (int page = 0; page < 1000; ++page) {
+        std::size_t page_size = 5000;
+        if (options.limit)
+            page_size = std::min(page_size, options.limit - result.objects.size());
+        if (page_size == 0)
+            return result;
+        std::string query = "?restype=container&comp=list&include=metadata&maxresults=" +
+                            std::to_string(page_size);
+        if (!options.prefix.empty())
+            query += "&prefix=" + gcp::detail::encode(options.prefix);
+        if (!options.delimiter.empty())
+            query += "&delimiter=" + gcp::detail::encode(options.delimiter);
+        if (!marker.empty())
+            query += "&marker=" + gcp::detail::encode(marker);
+        const auto response = azure_storage_call(
+            client, gcp::detail::HttpRequest{}
+                        .with_url(azure_storage_url(client, location.bucket) + query)
+                        .with_accept_json(false));
+        for (const auto block : xml_blocks(response.body, "Blob")) {
+            object item;
+            item.name = azure_xml_name(block);
+            const std::string properties = xml_raw_field(block, "Properties");
+            item.generation = xml_field(properties, "Etag");
+            item.etag = item.generation;
+            const std::string size = xml_field(properties, "Content-Length");
+            if (!size.empty())
+                item.size = unsigned_text(size, "Azure Blob size");
+            item.content_type = xml_field(properties, "Content-Type");
+            item.updated = xml_field(properties, "Last-Modified");
+            item.md5_hash = xml_field(properties, "Content-MD5");
+            const std::string metadata = xml_raw_field(block, "Metadata");
+            item.crc32c = xml_field(metadata, "cloudcrc32c");
+            result.objects.push_back(std::move(item));
+            if (options.limit && result.objects.size() == options.limit)
+                return result;
+        }
+        for (const auto block : xml_blocks(response.body, "BlobPrefix"))
+            result.prefixes.push_back(azure_xml_name(block));
+        const std::string next = xml_field(response.body, "NextMarker");
+        if (next.empty())
+            return result;
+        if (next == marker)
+            throw error("Azure Blob listing pagination did not advance");
+        marker = next;
+    }
+    throw error("Azure Blob listing exceeded 1000 pages");
+}
+
+// AWS EC2 raw-instance control ------------------------------------------------
+
+inline std::string aws_ec2_endpoint(const client_state& client) {
+    const std::string selected_region = region(configured_region(client.config, "aws"), "aws");
+    return aws_endpoint(client, client.config.aws.ec2_endpoint, "ec2", selected_region);
+}
+
+inline gcp::detail::HttpResponse aws_ec2_call(const client_state& client, std::string body,
+                                              bool retry = true,
+                                              std::chrono::steady_clock::time_point deadline =
+                                                  std::chrono::steady_clock::time_point::max()) {
+    const std::string selected_region = region(configured_region(client.config, "aws"), "aws");
+    return aws_call(client,
+                    gcp::detail::HttpRequest{}
+                        .with_method("POST")
+                        .with_url(aws_ec2_endpoint(client) + '/')
+                        .with_headers({"Content-Type: application/x-www-form-urlencoded"})
+                        .with_body(std::move(body))
+                        .with_accept_json(false),
+                    selected_region, "ec2", retry, deadline);
+}
+
+inline instance parse_aws_instance(std::string_view xml) {
+    instance result;
+    result.id = xml_field(xml, "instanceId");
+    result.name = result.id;
+    const std::string tags = xml_raw_field(xml, "tagSet");
+    for (const auto tag : xml_blocks(tags, "item"))
+        if (xml_field(tag, "key") == "Name")
+            result.name = xml_field(tag, "value");
+    result.zone = xml_field(xml_raw_field(xml, "placement"), "availabilityZone");
+    result.machine_type = xml_field(xml, "instanceType");
+    result.status = xml_field(xml_raw_field(xml, "instanceState"), "name");
+    result.internal_ip = xml_field(xml, "privateIpAddress");
+    result.external_ip = xml_field(xml, "ipAddress");
+    result.creation_timestamp = xml_field(xml, "launchTime");
+    if (result.id.empty())
+        throw error("Malformed AWS EC2 instance response: missing instanceId");
+    return result;
+}
+
+inline std::vector<instance> aws_instances_from_xml(std::string_view xml) {
+    std::vector<instance> result;
+    for (const auto instances : xml_blocks(xml, "instancesSet"))
+        for (const auto item : xml_blocks(instances, "item"))
+            result.push_back(parse_aws_instance(item));
+    return result;
+}
+
+inline std::vector<instance> aws_compute_instances(const client_state& client,
+                                                   std::size_t limit = 0) {
+    std::vector<instance> result;
+    std::string token;
+    for (int page = 0; page < 1000; ++page) {
+        std::string body = "Action=DescribeInstances&Version=2016-11-15&MaxResults=1000";
+        if (!token.empty())
+            body += "&NextToken=" + gcp::detail::encode(token);
+        const auto response = aws_ec2_call(client, std::move(body));
+        auto found = aws_instances_from_xml(response.body);
+        if (limit && found.size() > limit - result.size())
+            found.resize(limit - result.size());
+        result.insert(result.end(), std::make_move_iterator(found.begin()),
+                      std::make_move_iterator(found.end()));
+        if (limit && result.size() == limit)
+            return result;
+        const std::string next = xml_field(response.body, "nextToken");
+        if (next.empty())
+            return result;
+        if (next == token)
+            throw error("AWS EC2 instance pagination did not advance");
+        token = next;
+    }
+    throw error("AWS EC2 instance listing exceeded 1000 pages");
+}
+
+inline std::vector<instance> aws_describe_instance(const client_state& client,
+                                                   std::string_view id,
+                                                   std::chrono::steady_clock::time_point deadline =
+                                                       std::chrono::steady_clock::time_point::max()) {
+    const std::string body =
+        "Action=DescribeInstances&Version=2016-11-15&InstanceId.1=" +
+        gcp::detail::encode(id);
+    return aws_instances_from_xml(aws_ec2_call(client, body, true, deadline).body);
+}
+
+inline std::vector<instance> aws_named_instances(const client_state& client,
+                                                 std::string_view name) {
+    const std::string body =
+        "Action=DescribeInstances&Version=2016-11-15&Filter.1.Name=tag%3AName&"
+        "Filter.1.Value.1=" +
+        gcp::detail::encode(name) +
+        "&Filter.2.Name=tag%3Acloud-hpp&Filter.2.Value.1=managed";
+    auto found = aws_instances_from_xml(aws_ec2_call(client, body).body);
+    found.erase(std::remove_if(found.begin(), found.end(), [](const instance& value) {
+                    // EC2 keeps terminated instances visible for a while. They
+                    // no longer reserve the portable logical name.
+                    return value.status == "terminated";
+                }),
+                found.end());
+    return found;
+}
+
+inline instance aws_resolve_instance(const client_state& client, std::string_view name) {
+    auto found = gcp::detail::starts_with(name, "i-")
+                     ? aws_describe_instance(client, name)
+                     : aws_named_instances(client, name);
+    if (found.empty())
+        throw error("AWS EC2 instance name was not found: " + std::string(name));
+    if (found.size() != 1)
+        throw error("AWS EC2 instance name is ambiguous: " + std::string(name));
+    return std::move(found.front());
+}
+
+inline instance aws_compute_create(const client_state& client, std::string_view name,
+                                   std::string_view logical_template) {
+    if (name.empty())
+        throw error("Raw instance name must not be empty");
+    const auto configured = client.config.instance_templates.find(logical_template);
+    if (configured == client.config.instance_templates.end())
+        throw error("Unknown logical compute template: " + std::string(logical_template));
+    const auto& native = configured->second.aws;
+    if (native.id.empty() == native.name.empty())
+        throw error("AWS logical compute template requires exactly one launch template ID or "
+                    "name");
+    if (native.version.empty())
+        throw error("AWS launch template version must not be empty");
+    // EC2 Name tags are not unique. This preflight prevents ordinary duplicate
+    // creation while acknowledging that two concurrent controllers can still
+    // race; subsequent name-based actions fail closed if that happens.
+    if (!aws_named_instances(client, name).empty())
+        throw error("AWS EC2 managed instance name already exists: " + std::string(name));
+    std::string body =
+        "Action=RunInstances&Version=2016-11-15&MinCount=1&MaxCount=1&ClientToken=" +
+        gcp::detail::encode(gcp::detail::random_uuid());
+    body += native.id.empty() ? "&LaunchTemplate.LaunchTemplateName=" +
+                                    gcp::detail::encode(native.name)
+                              : "&LaunchTemplate.LaunchTemplateId=" +
+                                    gcp::detail::encode(native.id);
+    body += "&LaunchTemplate.Version=" + gcp::detail::encode(native.version) +
+            "&TagSpecification.1.ResourceType=instance&TagSpecification.1.Tag.1.Key=Name&"
+            "TagSpecification.1.Tag.1.Value=" +
+            gcp::detail::encode(name) +
+            "&TagSpecification.1.Tag.2.Key=cloud-hpp&"
+            "TagSpecification.1.Tag.2.Value=managed";
+    const auto instances = aws_instances_from_xml(aws_ec2_call(client, std::move(body)).body);
+    if (instances.size() != 1)
+        throw error("Malformed AWS RunInstances response: expected one instance");
+    return instances.front();
+}
+
+inline void aws_compute_action(const client_state& client, std::string_view action,
+                               std::string_view id) {
+    (void)aws_ec2_call(client, "Action=" + std::string(action) +
+                                  "&Version=2016-11-15&InstanceId.1=" +
+                                  gcp::detail::encode(id));
+}
+
+inline void wait_aws_instance(const client_state& client, std::string id, std::string target,
+                              std::chrono::milliseconds timeout,
+                              std::chrono::milliseconds poll_interval) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (true) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= deadline)
+            throw error("Timed out waiting for AWS EC2 instance '" + id + "'");
+        std::vector<instance> found;
+        try {
+            found = aws_describe_instance(client, id, deadline);
+        } catch (const error& failure) {
+            const bool temporarily_missing =
+                failure.http_status() == 400 &&
+                failure.response().find("InvalidInstanceID.NotFound") != std::string::npos;
+            if (!temporarily_missing)
+                throw;
+            // EC2 documents eventual consistency immediately after RunInstances.
+            // Keep polling rather than turning this transient 400 into failure.
+        }
+        if (!found.empty() && found.front().status == target) {
+            return;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining <= std::chrono::milliseconds::zero())
+            throw error("Timed out waiting for AWS EC2 instance '" + id + "'");
+        std::this_thread::sleep_for(std::min(poll_interval, remaining));
+    }
+}
+
+// Azure Resource Manager raw-instance control --------------------------------
+
+inline std::string azure_management_endpoint(const client_state& client) {
+    const std::string endpoint =
+        gcp::detail::base_url(client.config.azure.management_endpoint);
+    if (endpoint.empty())
+        throw error("Azure raw compute requires config::azure.management_endpoint");
+    validate_endpoint(client, endpoint, "Azure management_endpoint");
+    if (client.config.azure.subscription_id.empty() || client.config.azure.resource_group.empty())
+        throw error("Azure raw compute requires a subscription ID and resource group");
+    return endpoint;
+}
+
+inline std::string azure_vm_collection_url(const client_state& client) {
+    return azure_management_endpoint(client) + "/subscriptions/" +
+           gcp::detail::encode(client.config.azure.subscription_id) + "/resourceGroups/" +
+           gcp::detail::encode(client.config.azure.resource_group) +
+           "/providers/Microsoft.Compute/virtualMachines";
+}
+
+inline std::string azure_vm_url(const client_state& client, std::string_view name,
+                                std::string_view action = {}) {
+    std::string result = azure_vm_collection_url(client) + '/' + gcp::detail::encode(name);
+    if (!action.empty())
+        result += '/' + std::string(action);
+    result += "?api-version=" + gcp::detail::encode(client.config.azure.compute_api_version);
+    return result;
+}
+
+inline std::string azure_power_state(
+    const client_state& client, std::string_view name,
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+    const auto json = gcp::detail::parse_json(
+        azure_management_call(
+            client, gcp::detail::HttpRequest{}.with_url(azure_vm_url(client, name, "instanceView")),
+            true, deadline)
+            .body);
+    const auto* view = json.get("statuses");
+    if (!view) {
+        const auto* properties = json.get("properties");
+        view = properties ? properties->get("statuses") : nullptr;
+    }
+    if (view)
+        for (const auto& status : view->array()) {
+            const std::string code = gcp::detail::field(status, "code");
+            constexpr std::string_view prefix = "PowerState/";
+            if (gcp::detail::starts_with(code, prefix))
+                return code.substr(prefix.size());
+        }
+    return "unknown";
+}
+
+inline instance parse_azure_instance(const client_state& client,
+                                     const gcp::detail::Json& json) {
+    instance result;
+    result.id = gcp::detail::field(json, "id");
+    result.name = gcp::detail::field(json, "name");
+    result.zone = gcp::detail::field(json, "location");
+    if (const auto* properties = json.get("properties")) {
+        if (const auto* hardware = properties->get("hardwareProfile"))
+            result.machine_type = gcp::detail::field(*hardware, "vmSize");
+        result.creation_timestamp = gcp::detail::field(*properties, "timeCreated");
+        result.status = gcp::detail::field(*properties, "provisioningState");
+    }
+    if (result.name.empty())
+        throw error("Malformed Azure VM response: missing name");
+    try {
+        result.status = azure_power_state(client, result.name);
+    } catch (const error& failure) {
+        if (failure.http_status() != 404)
+            throw;
+    }
+    return result;
+}
+
+inline std::vector<instance> azure_compute_instances(const client_state& client,
+                                                     std::size_t limit = 0) {
+    std::vector<instance> result;
+    std::string url = azure_vm_collection_url(client) + "?api-version=" +
+                      gcp::detail::encode(client.config.azure.compute_api_version);
+    for (int page = 0; page < 1000 && !url.empty(); ++page) {
+        const auto json = gcp::detail::parse_json(
+            azure_management_call(client, gcp::detail::HttpRequest{}.with_url(url)).body);
+        if (const auto* values = json.get("value"))
+            for (const auto& item : values->array()) {
+                result.push_back(parse_azure_instance(client, item));
+                if (limit && result.size() == limit)
+                    return result;
+            }
+        const std::string next = gcp::detail::field(json, "nextLink");
+        if (next == url)
+            throw error("Azure VM pagination did not advance");
+        url = next;
+    }
+    if (!url.empty())
+        throw error("Azure VM listing exceeded 1000 pages");
+    return result;
+}
+
+struct azure_compute_operation {
+    std::string name;
+    std::string location;
+    std::string poll_url;
+    std::string target;
+    bool status_url = false;
+};
+
+inline azure_compute_operation azure_operation(const gcp::detail::HttpResponse& response,
+                                                std::string name, std::string target,
+                                                std::string location = {}) {
+    std::string poll = response_header(response, "azure-asyncoperation");
+    const bool status_url = !poll.empty();
+    if (!status_url)
+        poll = response_header(response, "location");
+    return {std::move(name), std::move(location), std::move(poll), std::move(target), status_url};
+}
+
+inline azure_compute_operation azure_compute_create(const client_state& client,
+                                                     std::string_view name,
+                                                     std::string_view logical_template) {
+    if (name.empty())
+        throw error("Raw instance name must not be empty");
+    const auto configured = client.config.instance_templates.find(logical_template);
+    if (configured == client.config.instance_templates.end())
+        throw error("Unknown logical compute template: " + std::string(logical_template));
+    const auto& native = configured->second.azure;
+    if (native.image_id.empty() || native.subnet_id.empty() || native.machine_type.empty())
+        throw error("Azure logical compute template requires image, subnet, and machine type");
+    const std::string location =
+        region(native.location.empty() ? configured_region(client.config, "azure")
+                                       : native.location,
+               "azure");
+    const std::string vm_name(name);
+    const std::string body =
+        "{\"location\":" + gcp::detail::json_quote(location) +
+        ",\"properties\":{\"hardwareProfile\":{\"vmSize\":" +
+        gcp::detail::json_quote(native.machine_type) +
+        "},\"storageProfile\":{\"imageReference\":{\"id\":" +
+        gcp::detail::json_quote(native.image_id) +
+        "},\"osDisk\":{\"name\":" + gcp::detail::json_quote(vm_name + "-os") +
+        ",\"createOption\":\"FromImage\",\"deleteOption\":\"Delete\","
+        "\"managedDisk\":{\"storageAccountType\":" +
+        gcp::detail::json_quote(native.os_disk_type) +
+        "}}},\"networkProfile\":{\"networkApiVersion\":\"2022-11-01\","
+        "\"networkInterfaceConfigurations\":[{\"name\":" +
+        gcp::detail::json_quote(vm_name + "-nic") +
+        ",\"properties\":{\"primary\":true,\"deleteOption\":\"Delete\","
+        "\"ipConfigurations\":[{\"name\":\"ipconfig\",\"properties\":{"
+        "\"primary\":true,\"subnet\":{\"id\":" +
+        gcp::detail::json_quote(native.subnet_id) + "}}}]}}]}}}";
+    const auto response = azure_management_call(
+        client,
+        gcp::detail::HttpRequest{}
+            .with_method("PUT")
+            .with_url(azure_vm_url(client, name))
+            .with_headers({"Content-Type: application/json", "If-None-Match: *"})
+            .with_body(body),
+        false);
+    return azure_operation(response, vm_name, "running", location);
+}
+
+inline azure_compute_operation azure_compute_action(const client_state& client,
+                                                     std::string_view name,
+                                                     std::string_view action,
+                                                     std::string target) {
+    const auto response = azure_management_call(
+        client, gcp::detail::HttpRequest{}
+                    .with_method(action == "delete" ? "DELETE" : "POST")
+                    .with_url(action == "delete" ? azure_vm_url(client, name)
+                                                 : azure_vm_url(client, name, action)),
+        false);
+    return azure_operation(response, std::string(name), std::move(target));
+}
+
+inline void wait_azure_compute(const client_state& client, azure_compute_operation operation,
+                               std::chrono::milliseconds timeout,
+                               std::chrono::milliseconds poll_interval) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!operation.poll_url.empty()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw error("Timed out waiting for Azure VM operation '" + operation.name + "'");
+        const auto response = azure_management_call(
+            client, gcp::detail::HttpRequest{}.with_url(operation.poll_url), true, deadline);
+        bool completed = false;
+        if (operation.status_url) {
+            if (!response.body.empty()) {
+                const auto json = gcp::detail::parse_json(response.body);
+                std::string status = gcp::detail::field(json, "status");
+                if (status.empty())
+                    if (const auto* properties = json.get("properties"))
+                        status = gcp::detail::field(*properties, "provisioningState");
+                if (status == "Failed" || status == "Canceled" || status == "Cancelled")
+                    throw error("Azure VM operation failed with state " + status);
+                completed = status == "Succeeded";
+            }
+        } else {
+            // A Location URL may finish with an empty 200/201/204 or with the
+            // resulting resource rather than an operation-status document.
+            completed = response.status != 202;
+        }
+        if (completed) {
+            if (operation.target == "deleted")
+                return;
+            operation.poll_url.clear();
+            break;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining <= std::chrono::milliseconds::zero())
+            throw error("Timed out waiting for Azure VM operation '" + operation.name + "'");
+        auto delay = poll_interval;
+        const std::string retry_after = response_header(response, "retry-after");
+        if (!retry_after.empty()) {
+            try {
+                const auto seconds = unsigned_text(retry_after, "Retry-After");
+                if (seconds <= static_cast<std::uint64_t>(
+                                   std::numeric_limits<std::int64_t>::max() / 1000))
+                    delay = std::max(
+                        delay, std::chrono::milliseconds(static_cast<std::int64_t>(seconds * 1000)));
+            } catch (const error&) {
+                // HTTP-date Retry-After values are uncommon for ARM; fall back
+                // to the caller's bounded polling interval.
+            }
+        }
+        std::this_thread::sleep_for(std::min(delay, remaining));
+    }
+    while (true) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            throw error("Timed out waiting for Azure VM '" + operation.name + "'");
+        try {
+            const std::string state = azure_power_state(client, operation.name, deadline);
+            if (state == operation.target)
+                return;
+        } catch (const error& failure) {
+            if (operation.target == "deleted" && failure.http_status() == 404)
+                return;
+            throw;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        if (remaining <= std::chrono::milliseconds::zero())
+            throw error("Timed out waiting for Azure VM '" + operation.name + "'");
+        std::this_thread::sleep_for(std::min(poll_interval, remaining));
     }
 }
 
@@ -3587,8 +4765,8 @@ inline std::pair<double, double> gcp_machine_resources(const cloud::plan& chosen
     throw error("No GCP pricing composition for machine type " + chosen.machine_type);
 }
 
-inline std::optional<double> gcp_catalog_price(const client_state& client,
-                                               const cloud::plan& chosen, bool spot) {
+inline std::optional<double> gcp_catalogue_price(const client_state& client,
+                                                const cloud::plan& chosen, bool spot) {
     // Compose hourly CPU, RAM, and optional GPU component SKUs. Filters reject
     // custom/sole-tenant/commitment variants and conflicting component matches.
     // A2 Ultra and A3 High shapes also carry mandatory billed Local SSD. Until
@@ -3670,11 +4848,11 @@ inline std::optional<double> gcp_catalog_price(const client_state& client,
     return total;
 }
 
-inline std::optional<double> aws_catalog_price(const client_state& client,
-                                               const cloud::plan& chosen, bool spot) {
+inline std::optional<double> aws_catalogue_price(const client_state& client,
+                                                const cloud::plan& chosen, bool spot) {
     // Spot is the newest Linux/UNIX observation for one exact Availability Zone.
     // On-demand requires one unique Linux/shared/no-software hourly price term.
-    if (chosen.machine_type == "batch-managed")
+    if (chosen.machine_type == "batch-managed" || chosen.machine_type == "FARGATE")
         return std::nullopt;
     if (spot) {
         const std::string zone = configured_zone(client.config, "aws");
@@ -3772,8 +4950,8 @@ inline std::optional<double> aws_catalog_price(const client_state& client,
     return found;
 }
 
-inline std::optional<double> azure_catalog_price(const client_state& client,
-                                                 const cloud::plan& chosen, bool spot) {
+inline std::optional<double> azure_catalogue_price(const client_state& client,
+                                                  const cloud::plan& chosen, bool spot) {
     // Select the latest effective primary-region USD consumption row. Windows,
     // low-priority, wrong-market, and conflicting same-date rows are rejected.
     const std::string endpoint = gcp::detail::base_url(client.config.azure.pricing_endpoint);
@@ -3828,8 +5006,8 @@ inline std::optional<double> azure_catalog_price(const client_state& client,
     return found;
 }
 
-inline std::optional<double> catalog_price(const client_state& client, const cloud::plan& chosen,
-                                           bool spot) {
+inline std::optional<double> catalogue_price(const client_state& client,
+                                             const cloud::plan& chosen, bool spot) {
     // Cache keys include provider, region, zone, native shape, accelerator, and
     // market. Only successful quotes are cached; unavailable prices are retried.
     const std::string key = chosen.provider + '\n' + chosen.region + '\n' +
@@ -3847,11 +5025,11 @@ inline std::optional<double> catalog_price(const client_state& client, const clo
     }
     std::optional<double> price;
     if (chosen.provider == "gcp")
-        price = gcp_catalog_price(client, chosen, spot);
+        price = gcp_catalogue_price(client, chosen, spot);
     if (chosen.provider == "aws")
-        price = aws_catalog_price(client, chosen, spot);
+        price = aws_catalogue_price(client, chosen, spot);
     if (chosen.provider == "azure")
-        price = azure_catalog_price(client, chosen, spot);
+        price = azure_catalogue_price(client, chosen, spot);
     if (price) {
         std::lock_guard lock(client.price_mutex);
         client.price_cache[key] = {now, *price};
@@ -3876,6 +5054,11 @@ inline cloud::plan priced_plan(const client_state& client, const job_spec& spec,
         request.accelerator = out.accelerator;
         request.accelerator_count = out.accelerator_count;
         request.spot = spec.resources.spot;
+        request.cpus = spec.resources.cpus;
+        request.memory_gb =
+            out.provider == "aws" && !spec.mounts.empty()
+                ? static_cast<double>(fargate_memory_mib(spec.resources)) / 1024.0
+                : spec.resources.memory_gb;
         out.estimated_hourly_cost = client.config.lookup_hourly_cost(request);
     } else if (client.config.estimate_hourly_cost) {
         if (!out.accelerator.empty())
@@ -3884,8 +5067,8 @@ inline cloud::plan priced_plan(const client_state& client, const job_spec& spec,
                 "estimator omits the accelerator and count");
         out.estimated_hourly_cost = client.config.estimate_hourly_cost(
             out.provider, out.region, out.machine_type, spec.resources.spot);
-    } else if (client.config.prices == price_source::public_catalog) {
-        out.estimated_hourly_cost = catalog_price(client, out, spec.resources.spot);
+    } else if (client.config.prices == price_source::public_catalogue) {
+        out.estimated_hourly_cost = catalogue_price(client, out, spec.resources.spot);
     }
     if (out.estimated_hourly_cost &&
         (!std::isfinite(*out.estimated_hourly_cost) || *out.estimated_hourly_cost < 0))
@@ -4812,6 +5995,8 @@ inline std::uint64_t duration_seconds(std::chrono::milliseconds value) {
 }
 
 inline std::string aws_queue(const config& cfg, const job_spec& spec) {
+    if (!spec.mounts.empty())
+        return spec.resources.spot ? cfg.aws.fargate_spot_job_queue : cfg.aws.fargate_job_queue;
     if (spec.resources.gpu.empty())
         return spec.resources.spot ? cfg.aws.spot_job_queue : cfg.aws.job_queue;
     const std::string gpu = canonical_gpu(spec.resources.gpu);
@@ -4904,7 +6089,9 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
     // named job. A lost registration response is reconciled by exact-name lookup;
     // a lost submission response is reconciled by queue/name lookup. If submission
     // remains unknown, keep the definition active for a possibly accepted job.
-    const auto memory = memory_mib(spec.resources.memory_gb);
+    const bool fargate = !spec.mounts.empty();
+    const auto memory =
+        fargate ? fargate_memory_mib(spec.resources) : memory_mib(spec.resources.memory_gb);
     std::string requirements =
         "[{\"type\":\"VCPU\",\"value\":" +
         gcp::detail::json_quote(std::to_string(spec.resources.cpus)) +
@@ -4916,8 +6103,43 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
     std::string container = "{\"image\":" + gcp::detail::json_quote(spec.image) +
                             ",\"command\":" + strings(spec.command) +
                             ",\"resourceRequirements\":" + requirements;
-    if (!spec.service_account.empty())
-        container += ",\"jobRoleArn\":" + gcp::detail::json_quote(spec.service_account);
+    const std::string job_role =
+        spec.service_account.empty() ? client->config.aws.job_role_arn : spec.service_account;
+    if (!job_role.empty())
+        container += ",\"jobRoleArn\":" + gcp::detail::json_quote(job_role);
+    if (fargate) {
+        container += ",\"executionRoleArn\":" +
+                     gcp::detail::json_quote(client->config.aws.execution_role_arn) +
+                     ",\"fargatePlatformConfiguration\":{\"platformVersion\":\"LATEST\"}";
+        std::string volumes;
+        std::string mount_points;
+        for (std::size_t i = 0; i < spec.mounts.size(); ++i) {
+            const auto& item = spec.mounts[i];
+            const uri source = parse_uri(item.source);
+            const auto& mapping = client->config.aws.s3_files.at(source.bucket);
+            const std::string volume = "cloud-" + std::to_string(i);
+            if (!volumes.empty()) {
+                volumes += ',';
+                mount_points += ',';
+            }
+            std::string native = "{\"fileSystemArn\":" +
+                                 gcp::detail::json_quote(mapping.file_system_arn);
+            if (!mapping.access_point_arn.empty()) {
+                native += ",\"accessPointArn\":" +
+                          gcp::detail::json_quote(mapping.access_point_arn);
+            } else {
+                const std::string root = source.key.empty() ? "/" : "/" + source.key;
+                native += ",\"rootDirectory\":" + gcp::detail::json_quote(root);
+            }
+            native += '}';
+            volumes += "{\"name\":" + gcp::detail::json_quote(volume) +
+                       ",\"s3filesVolumeConfiguration\":" + native + '}';
+            mount_points += "{\"sourceVolume\":" + gcp::detail::json_quote(volume) +
+                            ",\"containerPath\":" + gcp::detail::json_quote(item.target) +
+                            ",\"readOnly\":" + (item.read_only ? "true" : "false") + '}';
+        }
+        container += ",\"volumes\":[" + volumes + "],\"mountPoints\":[" + mount_points + ']';
+    }
     container += ",\"logConfiguration\":{\"logDriver\":\"awslogs\",\"options\":{"
                  "\"awslogs-group\":" +
                  gcp::detail::json_quote(client->config.aws.log_group) +
@@ -4925,7 +6147,8 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
                  ",\"awslogs-stream-prefix\":\"cloud\"}}}";
     const std::string definition_body =
         "{\"jobDefinitionName\":" + gcp::detail::json_quote(name) +
-        ",\"type\":\"container\",\"platformCapabilities\":[\"EC2\"],"
+        ",\"type\":\"container\",\"platformCapabilities\":[\"" +
+        (fargate ? "FARGATE" : "EC2") + "\"],"
         "\"containerProperties\":" +
         container + '}';
     const std::string endpoint = aws_batch_endpoint(*client, chosen.region);
@@ -5093,15 +6316,8 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
                                            duration_seconds(client->config.cleanup_timeout) +
                                            duration_seconds(client->config.final_log_timeout) +
                                            duration_seconds(client->config.request_timeout);
-    const std::string job_body =
-        "{\"id\":" + gcp::detail::json_quote(id) +
-        ",\"onAllTasksComplete\":\"noaction\",\"constraints\":{\"maxWallClockTime\":" +
-        gcp::detail::json_quote("PT" + std::to_string(watchdog_seconds) + "S") +
-        "},\"poolInfo\":{"
-        "\"autoPoolSpecification\":{\"autoPoolIdPrefix\":\"cloud\","
-        "\"poolLifetimeOption\":\"job\",\"keepAlive\":false,\"pool\":{"
-        "\"vmSize\":" +
-        gcp::detail::json_quote(chosen.machine_type) +
+    std::string pool =
+        "{\"vmSize\":" + gcp::detail::json_quote(chosen.machine_type) +
         ",\"targetDedicatedNodes\":" + (spot ? "0" : "1") +
         ",\"targetLowPriorityNodes\":" + (spot ? "1" : "0") +
         ",\"taskSlotsPerNode\":1,\"virtualMachineConfiguration\":{"
@@ -5111,7 +6327,34 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
         ",\"sku\":" + gcp::detail::json_quote(azure.image_sku) +
         ",\"version\":\"latest\"},\"nodeAgentSKUId\":" +
         gcp::detail::json_quote(azure.node_agent_sku) +
-        ",\"containerConfiguration\":{\"type\":\"dockerCompatible\"}}}}}}";
+        ",\"containerConfiguration\":{\"type\":\"dockerCompatible\"}}";
+    if (!spec.mounts.empty()) {
+        std::string mounts;
+        for (std::size_t i = 0; i < spec.mounts.size(); ++i) {
+            const auto& item = spec.mounts[i];
+            const uri source = parse_uri(item.source);
+            if (!mounts.empty())
+                mounts += ',';
+            mounts += "{\"azureBlobFileSystemConfiguration\":{\"accountName\":" +
+                      gcp::detail::json_quote(azure.storage_account) +
+                      ",\"containerName\":" + gcp::detail::json_quote(source.bucket) +
+                      ",\"relativeMountPath\":" +
+                      gcp::detail::json_quote("cloud-" + std::to_string(i)) +
+                      ",\"sasKey\":" + gcp::detail::json_quote(azure.storage_sas);
+            if (item.read_only)
+                mounts += ",\"blobfuseOptions\":\"-o ro\"";
+            mounts += "}}";
+        }
+        pool += ",\"mountConfiguration\":[" + mounts + ']';
+    }
+    pool += '}';
+    const std::string job_body =
+        "{\"id\":" + gcp::detail::json_quote(id) +
+        ",\"onAllTasksComplete\":\"noaction\",\"constraints\":{\"maxWallClockTime\":" +
+        gcp::detail::json_quote("PT" + std::to_string(watchdog_seconds) + "S") +
+        "},\"poolInfo\":{\"autoPoolSpecification\":{\"autoPoolIdPrefix\":\"cloud\","
+        "\"poolLifetimeOption\":\"job\",\"keepAlive\":false,\"pool\":" +
+        pool + "}}}";
     const auto create_fixed = [&](std::string collection_url, std::string resource_url,
                                   const std::string& body, std::string_view kind) {
         const auto recovery =
@@ -5155,6 +6398,16 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
     std::string run_options = "--rm";
     if (!spec.workdir.empty())
         run_options += " --workdir=" + spec.workdir;
+    for (std::size_t i = 0; i < spec.mounts.size(); ++i) {
+        const auto& item = spec.mounts[i];
+        run_options += " --volume=/mnt/batch/tasks/fsmounts/cloud-" + std::to_string(i) + ':' +
+                       item.target + (item.read_only ? ":ro" : "");
+    }
+    const std::string mount_identity =
+        spec.mounts.empty()
+            ? std::string{}
+            : ",\"userIdentity\":{\"autoUser\":{\"scope\":\"task\","
+              "\"elevationLevel\":\"admin\"}}";
     const std::string task_body =
         "{\"id\":\"task\",\"commandLine\":" + gcp::detail::json_quote(azure_command(spec.command)) +
         ",\"constraints\":{\"maxWallClockTime\":" +
@@ -5162,7 +6415,8 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
         ",\"maxTaskRetryCount\":" + std::to_string(spec.retries) +
         ",\"retentionTime\":\"PT1H\"},\"containerSettings\":{\"imageName\":" +
         gcp::detail::json_quote(spec.image) +
-        ",\"containerRunOptions\":" + gcp::detail::json_quote(run_options) + "}}";
+        ",\"containerRunOptions\":" + gcp::detail::json_quote(run_options) + "}" +
+        mount_identity + '}';
     try {
         create_fixed(azure_batch_url(*client, "/jobs/" + gcp::detail::encode(id) + "/tasks"),
                      azure_batch_url(*client, "/jobs/" + gcp::detail::encode(id) + "/tasks/" +
@@ -5192,45 +6446,81 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
 
 // Public storage, compute, job, and client handles -----------------------------
 
-// Provider-shaped facade for GCS. It deliberately fails on an AWS/Azure-selected
-// client rather than silently routing data to the wrong cloud account.
+// Route-bound object-storage facade. cloud://bucket/key names a GCS object, S3
+// object, or Azure Blob according to the client's fixed provider.
 class storage {
 public:
     object put(std::string_view destination, std::string_view bytes,
                put_options options = {}) const {
         const auto uri = detail::parse_uri(destination, "put");
+        if (provider() == "aws")
+            return detail::aws_storage_put(*state_, uri, bytes, std::move(options));
+        if (provider() == "azure")
+            return detail::azure_storage_put(*state_, uri, bytes, std::move(options));
         return raw().bucket(uri.bucket).put(uri.key, bytes, std::move(options));
     }
 
     object put_file(std::string_view destination, const std::filesystem::path& source,
                     put_options options = {}) const {
         const auto uri = detail::parse_uri(destination, "put_file");
+        if (provider() == "aws")
+            return detail::aws_storage_put_file(*state_, uri, source, std::move(options));
+        if (provider() == "azure")
+            return detail::azure_storage_put_file(*state_, uri, source, std::move(options));
         return raw().bucket(uri.bucket).put_file(uri.key, source, std::move(options));
     }
 
     [[nodiscard]] std::string get(std::string_view source) const {
         const auto uri = detail::parse_uri(source, "get");
+        if (provider() == "aws")
+            return detail::aws_storage_get(*state_, uri);
+        if (provider() == "azure")
+            return detail::azure_storage_get(*state_, uri);
         return raw().bucket(uri.bucket).get(uri.key);
     }
 
     void get_file(std::string_view source, const std::filesystem::path& destination) const {
         const auto uri = detail::parse_uri(source, "get_file");
+        if (provider() == "aws") {
+            detail::aws_storage_get_file(*state_, uri, destination);
+            return;
+        }
+        if (provider() == "azure") {
+            detail::azure_storage_get_file(*state_, uri, destination);
+            return;
+        }
         raw().bucket(uri.bucket).get_file(uri.key, destination);
     }
 
     [[nodiscard]] object_list list(std::string_view source, list_options options = {}) const {
         const auto uri = detail::parse_uri(source);
         options.prefix = uri.key + options.prefix;
+        if (provider() == "aws")
+            return detail::aws_storage_list(*state_, uri, std::move(options));
+        if (provider() == "azure")
+            return detail::azure_storage_list(*state_, uri, std::move(options));
         return raw().bucket(uri.bucket).list(std::move(options));
     }
 
     [[nodiscard]] object stat(std::string_view source) const {
         const auto uri = detail::parse_uri(source, "stat");
+        if (provider() == "aws")
+            return detail::aws_storage_stat(*state_, uri);
+        if (provider() == "azure")
+            return detail::azure_storage_stat(*state_, uri);
         return raw().bucket(uri.bucket).stat(uri.key);
     }
 
     void remove(std::string_view source) const {
         const auto uri = detail::parse_uri(source, "remove");
+        if (provider() == "aws") {
+            detail::aws_storage_remove(*state_, uri);
+            return;
+        }
+        if (provider() == "azure") {
+            detail::azure_storage_remove(*state_, uri);
+            return;
+        }
         raw().bucket(uri.bucket).erase(uri.key);
     }
 
@@ -5247,30 +6537,98 @@ private:
     }
     [[nodiscard]] gcp::Cloud& raw() const {
         if (provider() != "gcp")
-            throw error("Generic object storage is currently available only for GCP");
+            throw error("Unsupported object-storage provider");
         return state_->raw;
     }
     std::shared_ptr<detail::client_state> state_;
     std::optional<cloud::provider> provider_;
 };
 
-// Provider-shaped facade for raw GCE instances. Batch jobs do not use this path;
-// it remains an explicit escape hatch for long-lived/template-based VMs.
+// Route-bound raw-instance escape hatch. Batch jobs do not use this path.
 class compute {
 public:
     [[nodiscard]] std::vector<instance> instances(std::size_t limit = 0) const {
+        if (provider() == "aws")
+            return detail::aws_compute_instances(*state_, limit);
+        if (provider() == "azure")
+            return detail::azure_compute_instances(*state_, limit);
         return raw().vms(limit);
     }
-    [[nodiscard]] operation create(std::string name, std::string instance_template) const {
-        return wrap(raw().create_from_template(std::move(name), std::move(instance_template)));
+    [[nodiscard]] operation create(std::string name, std::string logical_template) const {
+        if (provider() == "aws") {
+            const auto native = detail::aws_compute_create(*state_, name, logical_template);
+            return operation(native.id, native.zone,
+                             [state = state_, id = native.id](auto timeout, auto poll) {
+                detail::wait_aws_instance(*state, id, "running", timeout, poll);
+            });
+        }
+        if (provider() == "azure") {
+            auto native = detail::azure_compute_create(*state_, name, logical_template);
+            return operation(native.name, native.location,
+                             [state = state_, native = std::move(native)](auto timeout, auto poll) {
+                                 detail::wait_azure_compute(*state, native, timeout, poll);
+                             });
+        }
+        const auto configured = state_->config.instance_templates.find(logical_template);
+        if (configured == state_->config.instance_templates.end() ||
+            configured->second.gcp_instance_template.empty())
+            throw error("Unknown GCP logical compute template: " + logical_template);
+        return wrap(raw().create_from_template(std::move(name),
+                                               configured->second.gcp_instance_template));
     }
     [[nodiscard]] operation start(std::string name) const {
+        if (provider() == "aws") {
+            const auto native = detail::aws_resolve_instance(*state_, name);
+            detail::aws_compute_action(*state_, "StartInstances", native.id);
+            return operation(native.id, native.zone,
+                             [state = state_, id = native.id](auto timeout, auto poll) {
+                                 detail::wait_aws_instance(*state, id, "running", timeout, poll);
+                             });
+        }
+        if (provider() == "azure") {
+            auto native = detail::azure_compute_action(*state_, name, "start", "running");
+            return operation(native.name, native.location,
+                             [state = state_, native = std::move(native)](auto timeout, auto poll) {
+                                 detail::wait_azure_compute(*state, native, timeout, poll);
+                             });
+        }
         return wrap(raw().vm(std::move(name)).start());
     }
     [[nodiscard]] operation stop(std::string name) const {
+        if (provider() == "aws") {
+            const auto native = detail::aws_resolve_instance(*state_, name);
+            detail::aws_compute_action(*state_, "StopInstances", native.id);
+            return operation(native.id, native.zone,
+                             [state = state_, id = native.id](auto timeout, auto poll) {
+                                 detail::wait_aws_instance(*state, id, "stopped", timeout, poll);
+                             });
+        }
+        if (provider() == "azure") {
+            auto native =
+                detail::azure_compute_action(*state_, name, "deallocate", "deallocated");
+            return operation(native.name, native.location,
+                             [state = state_, native = std::move(native)](auto timeout, auto poll) {
+                                 detail::wait_azure_compute(*state, native, timeout, poll);
+                             });
+        }
         return wrap(raw().vm(std::move(name)).stop());
     }
     [[nodiscard]] operation destroy(std::string name) const {
+        if (provider() == "aws") {
+            const auto native = detail::aws_resolve_instance(*state_, name);
+            detail::aws_compute_action(*state_, "TerminateInstances", native.id);
+            return operation(native.id, native.zone,
+                             [state = state_, id = native.id](auto timeout, auto poll) {
+                                 detail::wait_aws_instance(*state, id, "terminated", timeout, poll);
+                             });
+        }
+        if (provider() == "azure") {
+            auto native = detail::azure_compute_action(*state_, name, "delete", "deleted");
+            return operation(native.name, native.location,
+                             [state = state_, native = std::move(native)](auto timeout, auto poll) {
+                                 detail::wait_azure_compute(*state, native, timeout, poll);
+                             });
+        }
         return wrap(raw().vm(std::move(name)).erase());
     }
 
@@ -5287,7 +6645,7 @@ private:
     }
     [[nodiscard]] gcp::Cloud& raw() const {
         if (provider() != "gcp")
-            throw error("Generic raw instance control is currently available only for GCP");
+            throw error("Unsupported raw-compute provider");
         return state_->raw;
     }
     [[nodiscard]] static operation wrap(gcp::Operation native) {
@@ -5562,7 +6920,8 @@ public:
     }
 
     [[nodiscard]] bool supports(std::string_view value, feature requested) const {
-        // Capability is an implementation matrix, not a live account/quota probe.
+        // Capability reports implemented behaviour, not a live account, quota,
+        // queue, regional SKU, or credential probe.
         return detail::supports(value, requested);
     }
 
