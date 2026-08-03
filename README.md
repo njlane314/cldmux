@@ -45,12 +45,14 @@ int main() {
 Build with:
 
 ```sh
-c++ -std=c++17 -Iinclude -I. examples/run.cpp -lcurl -pthread -o cloud-run
+c++ -std=c++17 -Iinclude -I. example.cpp -lcurl -pthread -o cloud-run
 ```
 
-[`examples/run.cpp`](examples/run.cpp) is a minimal provider-neutral command.
-It diagnoses and compares by default; only `--submit` permits billable work.
-The heavily commented [`example.cpp`](example.cpp) explains the wider API.
+The repository has one heavily commented [`example.cpp`](example.cpp). It is a
+provider-neutral command and an author checklist covering routing, pricing,
+resources, mounts, storage, raw compute, diagnostics, output, and lifecycle
+choices. It diagnoses and compares by default; only `--submit` permits billable
+work.
 
 ## ROUTING
 
@@ -369,8 +371,9 @@ make sanitise
 
 `make check` compiles every modular header, tests the generator, checks both
 generated headers byte-for-byte, runs modular and single-header suites, probes
-multi-translation-unit use, and builds both examples. Tests use a loopback fake
-server, make no cloud API calls, need no credentials, and cannot incur charges.
+multi-translation-unit use, and builds the example in both forms. Tests use a
+loopback fake server, make no cloud API calls, need no credentials, and cannot
+incur charges.
 
 ## LICENCE
 

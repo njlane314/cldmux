@@ -1,4 +1,8 @@
-#include "examples/support.h"
+#if defined(CLOUD_TEST_AMALGAMATED)
+#include "cloud.h"
+#else
+#include <cloud/cloud.hpp>
+#endif
 
 #if __cplusplus >= 202002L
 #include <tst.hpp>
@@ -81,8 +85,11 @@ template <class... Tests> int run(Tests&&... tests) {
 #endif
 
 #include <arpa/inet.h>
+#include <array>
 #include <atomic>
 #include <cctype>
+#include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -96,11 +103,14 @@ template <class... Tests> int run(Tests&&... tests) {
 #include <optional>
 #include <sstream>
 #include <stdexcept>
+#include <string>
+#include <string_view>
 #include <sys/socket.h>
 #include <thread>
 #include <type_traits>
 #include <unistd.h>
 #include <utility>
+#include <vector>
 
 namespace {
 
@@ -3162,18 +3172,6 @@ void command_output_tests() {
                "command result preserves warnings and leaves errors to the caller");
 }
 
-void example_support_tests() {
-    tst::check(cloud_example::parse_runtime("30s") == std::chrono::seconds(30) &&
-                   cloud_example::parse_runtime("20m") == std::chrono::minutes(20) &&
-                   cloud_example::parse_runtime("2h") == std::chrono::hours(2),
-               "example runtime parser units");
-    for (const std::string_view invalid :
-         {"", "0s", "-1s", "1", "1d", "18446744073709551615h"})
-        tst::throws<std::invalid_argument>(
-            [=] { (void)cloud_example::parse_runtime(invalid); },
-            "example runtime parser rejects malformed or overflowing input");
-}
-
 } // namespace
 
 int main() {
@@ -3192,6 +3190,5 @@ int main() {
         TST_CASE("runs AWS Batch and recovery", aws_lifecycle_tests()),
         TST_CASE("runs Azure Batch and log recovery", azure_lifecycle_tests()),
         TST_CASE("looks up prices and selects providers", pricing_tests()),
-        TST_CASE("formats custom command output", command_output_tests()),
-        TST_CASE("parses example command options", example_support_tests()));
+        TST_CASE("formats custom command output", command_output_tests()));
 }

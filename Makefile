@@ -23,22 +23,18 @@ TEST_SAN_MODULAR := /tmp/cloud-modular-test-san
 TEST_SAN_AMALGAMATED := /tmp/cloud-amalgamated-test-san
 EXAMPLE_MODULAR := /tmp/cloud-example-modular
 EXAMPLE_AMALGAMATED := /tmp/cloud-example-amalgamated
-RUN_MODULAR := /tmp/cloud-run-modular
-RUN_AMALGAMATED := /tmp/cloud-run-amalgamated
 ODR_MODULAR := /tmp/cloud-odr-modular
 ODR_AMALGAMATED := /tmp/cloud-odr-amalgamated
 
 .PHONY: check check-readme check-headers check-tool check-modular \
 	check-amalgamation check-amalgamated check-odr check-odr-modular \
 	check-odr-amalgamated check-cli check-standards check-c++17 check-c++20 \
-	check-c++23 amalgamate example example-amalgamated examples \
-	examples-amalgamated sanitise
+	check-c++23 amalgamate example example-amalgamated sanitise
 
 check: check-readme check-headers check-tool check-modular check-amalgamated \
-	check-odr check-cli example-amalgamated examples-amalgamated
+	check-odr check-cli example-amalgamated
 	@! grep -n "$$(printf '\t')" cloud.h single_include/cloud.h \
-		$$(find include tests tools -type f) example.cpp examples/run.cpp \
-		examples/support.h test.cpp README.md
+		$$(find include tests tools -type f) example.cpp test.cpp README.md
 
 check-readme:
 	awk '/^```cpp$$/ {code=1; next} code && /^```/ {exit} code {print}' README.md | \
@@ -125,18 +121,9 @@ example-amalgamated: check-amalgamation
 		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. example.cpp \
 		$(CURL_LIBS) -pthread -o $(EXAMPLE_AMALGAMATED)
 
-examples:
-	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -Iinclude -I. \
-		examples/run.cpp $(CURL_LIBS) -pthread -o $(RUN_MODULAR)
-
-examples-amalgamated: check-amalgamation
-	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
-		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. examples/run.cpp \
-		$(CURL_LIBS) -pthread -o $(RUN_AMALGAMATED)
-
-check-cli: example examples
+check-cli: example
 	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
-		CLOUD_GCP_REGION=europe-west4 $(RUN_MODULAR) gcp)"; \
+		CLOUD_GCP_REGION=europe-west4 $(EXAMPLE_MODULAR) gcp)"; \
 		printf '%s\n' "$$output"; \
 		printf '%s\n' "$$output" | grep -q '^output_version=1$$'; \
 		printf '%s\n' "$$output" | grep -q '^requested_provider=gcp$$'; \
@@ -154,42 +141,51 @@ check-cli: example examples
 		printf '%s\n' "$$output" | grep -q '^program=cloud-run$$'; \
 		printf '%s\n' "$$output" | grep -q '^status=dry-run$$'; \
 		! printf '%s\n' "$$output" | grep -Ev '^[a-z_]+=.*$$'
-	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
-		CLOUD_GCP_REGION=europe-west4 $(EXAMPLE_MODULAR) gcp)"; \
-		printf '%s\n' "$$output" | grep -q '^application=simulation$$'; \
-		printf '%s\n' "$$output" | grep -q '^preflight=planned$$'; \
-		printf '%s\n' "$$output" | grep -q '^status=dry-run$$'
 	@output="$$(env -i PATH="$(PATH)" CLOUD_AWS_JOB_QUEUE=test-queue \
-		CLOUD_AWS_REGION=eu-west-1 $(RUN_MODULAR) aws)"; \
+		CLOUD_AWS_REGION=eu-west-1 $(EXAMPLE_MODULAR) aws)"; \
 		printf '%s\n' "$$output" | grep -q '^provider=aws$$'; \
 		printf '%s\n' "$$output" | grep -q '^provider_job_timeout_seconds=not-applicable$$'
 	@output="$$(env -i PATH="$(PATH)" \
 		CLOUD_AZURE_BATCH_ENDPOINT=https://test.westeurope.batch.azure.com \
-		CLOUD_AZURE_REGION=westeurope $(RUN_MODULAR) azure)"; \
+		CLOUD_AZURE_REGION=westeurope $(EXAMPLE_MODULAR) azure)"; \
 		printf '%s\n' "$$output" | grep -q '^provider=azure$$'; \
 		printf '%s\n' "$$output" | grep -q '^provider_job_timeout_seconds=1290$$'
-	@status=0; env -i PATH="$(PATH)" $(RUN_MODULAR) >/dev/null 2>&1 || status=$$?; \
+	@output="$$($(EXAMPLE_MODULAR) --help)"; \
+		printf '%s\n' "$$output" | grep -q '^Usage: cloud-run '; \
+		printf '%s\n' "$$output" | grep -q '^  cheapest   compare every configured provider'
+	@status=0; env -i PATH="$(PATH)" $(EXAMPLE_MODULAR) >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
-	@status=0; $(RUN_MODULAR) gcp extra >/dev/null 2>&1 || status=$$?; test $$status -eq 2
+	@status=0; $(EXAMPLE_MODULAR) gcp extra >/dev/null 2>&1 || status=$$?; \
+		test $$status -eq 2
 	@status=0; bad="$$(printf 'bad\nprovider')"; \
-		output="$$( $(RUN_MODULAR) "$$bad" 2>&1)" || status=$$?; \
+		output="$$( $(EXAMPLE_MODULAR) "$$bad" 2>&1)" || status=$$?; \
 		test $$status -eq 2; \
 		test "$$(printf '%s\n' "$$output" | wc -l | tr -d ' ')" -eq 1; \
 		printf '%s\n' "$$output" | grep -Fq '\n'
-	@status=0; $(RUN_MODULAR) gcp --submit --submit >/dev/null 2>&1 || status=$$?; \
+	@status=0; $(EXAMPLE_MODULAR) gcp --submit --submit >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
-	@status=0; $(RUN_MODULAR) gcp --estimate --estimate >/dev/null 2>&1 || status=$$?; \
+	@status=0; $(EXAMPLE_MODULAR) gcp --estimate --estimate >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
-	@status=0; $(RUN_MODULAR) gcp --expected-attempt-runtime=0s >/dev/null 2>&1 || \
-		status=$$?; test $$status -eq 2
-	@status=0; $(RUN_MODULAR) gcp --expected-attempt-runtime=15 >/dev/null 2>&1 || \
-		status=$$?; test $$status -eq 2
+	@status=0; $(EXAMPLE_MODULAR) gcp --help --help >/dev/null 2>&1 || status=$$?; \
+		test $$status -eq 2
+	@set -e; for value in 0s -1s 15 1d 18446744073709551615h; do \
+		status=0; $(EXAMPLE_MODULAR) gcp \
+			--expected-attempt-runtime=$$value >/dev/null 2>&1 || status=$$?; \
+		test $$status -eq 2; \
+	done
+	@status=0; $(EXAMPLE_MODULAR) gcp --expected-attempt-runtime=1m \
+		--expected-attempt-runtime=2m >/dev/null 2>&1 || status=$$?; \
+		test $$status -eq 2
+	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
+		CLOUD_GCP_REGION=europe-west4 $(EXAMPLE_MODULAR) gcp \
+		--expected-attempt-runtime=30s)"; \
+		printf '%s\n' "$$output" | grep -q '^expected_attempt_runtime_seconds=30$$'
 	@status=0; output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
-		CLOUD_GCP_REGION=europe-west4 $(RUN_MODULAR) gcp \
+		CLOUD_GCP_REGION=europe-west4 $(EXAMPLE_MODULAR) gcp \
 		--expected-attempt-runtime=16m 2>&1)" || status=$$?; \
 		test $$status -eq 2; \
 		test "$$output" = 'error=Expected attempt runtime must not exceed the controller timeout'
-	@status=0; $(RUN_MODULAR) gcp --unknown >/dev/null 2>&1 || status=$$?; \
+	@status=0; $(EXAMPLE_MODULAR) gcp --unknown >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
 
 check-standards:
