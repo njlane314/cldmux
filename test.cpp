@@ -277,6 +277,9 @@ public:
     std::atomic<bool> gcp_compute_valid{true};
     std::atomic<bool> azure_cross_origin_next{false};
     std::atomic<bool> azure_cross_origin_operation{false};
+    std::atomic<bool> azure_cross_origin_price{false};
+    std::atomic<bool> aws_compute_retry_wait{false};
+    std::atomic<bool> azure_compute_retry_wait{false};
     std::atomic<bool> corrupt_download{false};
     std::atomic<bool> request_id_changed{false};
 
@@ -431,6 +434,10 @@ private:
                     if (body.find("Filter.1.Value.1=aws-start") != std::string_view::npos)
                         return {200, aws_instances_xml(
                                          aws_instance_xml("i-start", "aws-start", "stopped"))};
+                    if (body.find("Filter.1.Value.1=i-worker") != std::string_view::npos)
+                        return {200, aws_instances_xml(
+                                         aws_instance_xml("i-0123456789abcdef0", "i-worker",
+                                                          "stopped"))};
                     if (body.find("Filter.1.Value.1=aws-stop") != std::string_view::npos)
                         return {200, aws_instances_xml(
                                          aws_instance_xml("i-stop", "aws-stop", "running"))};
@@ -439,12 +446,26 @@ private:
                                 aws_instances_xml(aws_instance_xml(
                                     "i-destroy", "aws-destroy", "running"))};
                     if (body.find("Filter.1.Value.1=aws-existing") != std::string_view::npos)
-                        return {200,
-                                aws_instances_xml(aws_instance_xml(
-                                    "i-existing", "aws-existing", "running"))};
+                        return body.find("NextToken=name-existing-2") != std::string_view::npos
+                                   ? reply{200,
+                                           aws_instances_xml(aws_instance_xml(
+                                               "i-existing", "aws-existing", "running"))}
+                                   : reply{200, aws_instances_xml({}, "name-existing-2")};
+                    if (body.find("Filter.1.Value.1=aws-ambiguous") != std::string_view::npos)
+                        return body.find("NextToken=name-ambiguous-2") != std::string_view::npos
+                                   ? reply{200,
+                                           aws_instances_xml(aws_instance_xml(
+                                               "i-ambiguous-b", "aws-ambiguous", "stopped"))}
+                                   : reply{200,
+                                           aws_instances_xml(
+                                               aws_instance_xml("i-ambiguous-a", "aws-ambiguous",
+                                                                "stopped"),
+                                               "name-ambiguous-2")};
                     return {200, aws_instances_xml({})};
                 }
                 if (body.find("InstanceId.1=i-created") != std::string_view::npos) {
+                    if (aws_compute_retry_wait)
+                        return {500, "<Error><Message>retry wait</Message></Error>"};
                     const int read = ++aws_compute_create_polls;
                     return {200,
                             aws_instances_xml(aws_instance_xml(
@@ -455,6 +476,12 @@ private:
                     return {200,
                             aws_instances_xml(aws_instance_xml(
                                 "i-start", "aws-start", read == 1 ? "pending" : "running"))};
+                }
+                if (body.find("InstanceId.1=i-0123456789abcdef0") != std::string_view::npos) {
+                    ++aws_compute_start_polls;
+                    return {200,
+                            aws_instances_xml(aws_instance_xml(
+                                "i-0123456789abcdef0", "i-worker", "running"))};
                 }
                 if (body.find("InstanceId.1=i-stop") != std::string_view::npos) {
                     const int read = ++aws_compute_stop_polls;
@@ -480,7 +507,8 @@ private:
 
             if (body.find("Action=StartInstances") != std::string_view::npos) {
                 ++aws_compute_starts;
-                if (body.find("InstanceId.1=i-start") == std::string_view::npos)
+                if (body.find("InstanceId.1=i-start") == std::string_view::npos &&
+                    body.find("InstanceId.1=i-0123456789abcdef0") == std::string_view::npos)
                     aws_compute_valid = false;
                 return {200, "<StartInstancesResponse/>"};
             }
@@ -579,6 +607,8 @@ private:
                                       url() + "/arm/operations/delete"}};
             }
             if (method == "GET" && starts_with(target, "/arm/operations/")) {
+                if (azure_compute_retry_wait)
+                    return {500, "{\"error\":{\"message\":\"retry wait\"}}"};
                 const int read = ++azure_compute_operation_polls;
                 if (target == "/arm/operations/create" && read == 1)
                     return {200, "{\"status\":\"InProgress\"}"};
@@ -780,7 +810,10 @@ private:
                 "\"isPrimaryMeterRegion\":true,\"productName\":\"Virtual Machines Dsv5 Series\","
                 "\"meterName\":\"D4s v5 Low Priority\",\"skuName\":\"D4s v5 Low Priority\","
                 "\"effectiveStartDate\":\"2024-01-01T00:00:00Z\","
-                "\"retailPrice\":0.05}],\"NextPageLink\":null}"};
+                "\"retailPrice\":0.05}],\"NextPageLink\":" +
+                    cloud::gcp::detail::json_quote(
+                        azure_cross_origin_price ? "https://evil.example/prices?page=2" : "") +
+                    "}"};
         }
 
         if (method == "POST" && starts_with(target, "/jobs?api-version=")) {
@@ -944,6 +977,7 @@ private:
                     ++aws_storage_puts;
                 if (!has_header(headers, "x-amz-checksum-crc32c", checksum) ||
                     !has_header(headers, "x-amz-meta-cloud-crc32c", checksum) ||
+                    (body.empty() && !has_header(headers, "content-length", "0")) ||
                     (file && !has_header(headers, "if-match", "\"aws-version\"")) ||
                     (!file && !has_header(headers, "if-none-match", "*")))
                     aws_storage_valid = false;
@@ -1026,6 +1060,7 @@ private:
                     ++azure_storage_puts;
                 if (!has_header(headers, "x-ms-blob-type", "BlockBlob") ||
                     !has_header(headers, "x-ms-meta-cloudcrc32c", checksum) ||
+                    (body.empty() && !has_header(headers, "content-length", "0")) ||
                     (file && !has_header(headers, "if-match", "\"azure-version\"")) ||
                     (!file && !has_header(headers, "if-none-match", "*")))
                     azure_storage_valid = false;
@@ -1505,6 +1540,9 @@ void aws_storage_tests() {
     tst::check(stored.name == "object" && stored.generation == "\"aws-version\"" &&
                    stored.size == 7 && stored.crc32c == cloud::gcp::detail::crc32c("payload"),
                "AWS S3 put returns portable metadata");
+    const auto empty = client.storage().put("cloud://test-bucket/empty", "", create_only);
+    tst::check(empty.size == 0 && empty.crc32c == cloud::gcp::detail::crc32c(""),
+               "AWS S3 put transmits an explicit empty object");
     tst::check(client.storage().get("cloud://test-bucket/object") == "payload",
                "AWS S3 get verifies the stored checksum");
     const auto metadata = client.storage().stat("cloud://test-bucket/object");
@@ -1551,9 +1589,10 @@ void aws_storage_tests() {
                "AWS corrupt download preserves its destination");
 
     client.storage().remove("cloud://test-bucket/object");
+    client.storage().remove("cloud://test-bucket/empty");
     tst::throws<cloud::error>([&] { (void)client.storage().stat("cloud://test-bucket/object"); },
                               "AWS S3 remove deletes the routed object");
-    tst::check(server.aws_storage_puts == 1 && server.aws_storage_deletes == 1 &&
+    tst::check(server.aws_storage_puts == 2 && server.aws_storage_deletes == 2 &&
                    server.aws_storage_gets >= 3,
                "AWS S3 facade issued the expected operations");
     tst::check(server.aws_storage_valid,
@@ -1572,6 +1611,9 @@ void azure_storage_tests() {
     tst::check(stored.name == "object" && stored.generation == "\"azure-version\"" &&
                    stored.size == 7 && stored.crc32c == cloud::gcp::detail::crc32c("payload"),
                "Azure Blob put returns portable metadata");
+    const auto empty = client.storage().put("cloud://test-container/empty", "", create_only);
+    tst::check(empty.size == 0 && empty.crc32c == cloud::gcp::detail::crc32c(""),
+               "Azure Blob put transmits an explicit empty object");
     tst::check(client.storage().get("cloud://test-container/object") == "payload",
                "Azure Blob get verifies the stored checksum");
     const auto metadata = client.storage().stat("cloud://test-container/object");
@@ -1620,10 +1662,11 @@ void azure_storage_tests() {
                "Azure corrupt download preserves its destination");
 
     client.storage().remove("cloud://test-container/object");
+    client.storage().remove("cloud://test-container/empty");
     tst::throws<cloud::error>(
         [&] { (void)client.storage().stat("cloud://test-container/object"); },
         "Azure Blob remove deletes the routed object");
-    tst::check(server.azure_storage_puts == 1 && server.azure_storage_deletes == 1 &&
+    tst::check(server.azure_storage_puts == 2 && server.azure_storage_deletes == 2 &&
                    server.azure_storage_gets >= 3,
                "Azure Blob facade issued the expected operations");
     tst::check(server.azure_storage_valid,
@@ -1691,11 +1734,26 @@ void aws_compute_tests() {
     tst::check(server.aws_compute_create_attempts == 2 &&
                    server.aws_compute_create_polls >= 2,
                "AWS RunInstances reuses its idempotency token and polls pending to running");
+    server.aws_compute_retry_wait = true;
+    const auto aws_deadline_start = std::chrono::steady_clock::now();
+    tst::throws<cloud::error>(
+        [&] { created.wait(std::chrono::milliseconds(20), std::chrono::milliseconds(1)); },
+        "AWS operation retry honours its wait deadline");
+    const auto aws_deadline_elapsed = std::chrono::steady_clock::now() - aws_deadline_start;
+    server.aws_compute_retry_wait = false;
+    tst::check(aws_deadline_elapsed < std::chrono::milliseconds(90),
+               "AWS retry backoff is capped by the operation deadline");
 
     const auto started = client.compute().start("aws-start");
     tst::check(started.name() == "i-start" && started.zone() == "eu-west-1a",
                "AWS start resolves a managed logical name and its actual zone");
     started.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+
+    const auto prefixed = client.compute().start("i-worker");
+    tst::check(prefixed.name() == "i-0123456789abcdef0" &&
+                   prefixed.zone() == "eu-west-1a",
+               "AWS logical names beginning i- remain managed Name-tag lookups");
+    prefixed.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
 
     const auto stopped = client.compute().stop("aws-stop");
     tst::check(stopped.name() == "i-stop" && stopped.zone() == "eu-west-1a",
@@ -1707,7 +1765,7 @@ void aws_compute_tests() {
                "AWS destroy resolves a managed logical name and its actual zone");
     destroyed.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
 
-    tst::check(server.aws_compute_starts == 1 && server.aws_compute_start_polls >= 2 &&
+    tst::check(server.aws_compute_starts == 2 && server.aws_compute_start_polls >= 3 &&
                    server.aws_compute_stops == 1 && server.aws_compute_stop_polls >= 2 &&
                    server.aws_compute_destroys == 1 &&
                    server.aws_compute_destroy_polls >= 2 && server.aws_compute_valid,
@@ -1718,6 +1776,11 @@ void aws_compute_tests() {
     tst::throws<cloud::error>(
         [&] { (void)client.compute().create("aws-existing", "worker"); },
         "AWS create rejects an existing managed Name tag");
+    tst::throws<cloud::error>(
+        [&] { (void)client.compute().create("i-0123456789abcdef0", "worker"); },
+        "AWS create reserves exact EC2 instance-ID syntax");
+    tst::throws<cloud::error>([&] { (void)client.compute().start("aws-ambiguous"); },
+                              "AWS name resolution detects ambiguity across pages");
 }
 
 cloud::config azure_compute_config(const fake_server& server) {
@@ -1760,8 +1823,18 @@ void azure_compute_tests() {
                "Azure VM list maps power states and follows a same-origin nextLink");
 
     const auto created = client.compute().create("azure-created", "worker");
-    tst::check(created.name() == "azure-created", "Azure create returns a portable operation");
+    tst::check(created.name() == "azure-created" && created.location() == "uksouth",
+               "Azure create returns a portable operation with its native location");
     created.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
+    server.azure_compute_retry_wait = true;
+    const auto azure_deadline_start = std::chrono::steady_clock::now();
+    tst::throws<cloud::error>(
+        [&] { created.wait(std::chrono::milliseconds(20), std::chrono::milliseconds(1)); },
+        "Azure operation retry honours its wait deadline");
+    const auto azure_deadline_elapsed = std::chrono::steady_clock::now() - azure_deadline_start;
+    server.azure_compute_retry_wait = false;
+    tst::check(azure_deadline_elapsed < std::chrono::milliseconds(90),
+               "Azure retry backoff is capped by the operation deadline");
 
     const auto started = client.compute().start("azure-start");
     started.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
@@ -2157,6 +2230,19 @@ void pricing_tests() {
     tst::check(azure_priced.plan(price_spec).estimated_hourly_cost == 0.04,
                "Azure built-in Spot price");
     price_spec.resources.spot = false;
+
+    server.azure_cross_origin_price = true;
+    cloud::config unsafe_azure_prices;
+    unsafe_azure_prices.provider = "azure";
+    unsafe_azure_prices.region = "europe";
+    unsafe_azure_prices.allow_insecure_http = true;
+    unsafe_azure_prices.azure.batch_endpoint = server.url();
+    unsafe_azure_prices.azure.pricing_endpoint = server.url();
+    unsafe_azure_prices.prices = cloud::price_source::public_catalogue;
+    cloud::client unsafe_azure_priced(std::move(unsafe_azure_prices));
+    tst::throws<cloud::error>([&] { (void)unsafe_azure_priced.plan(price_spec); },
+                              "Azure retail pagination rejects a cross-origin URL");
+    server.azure_cross_origin_price = false;
 
     cloud::config cheapest_config;
     cheapest_config.providers = {"gcp", "aws", "azure"};

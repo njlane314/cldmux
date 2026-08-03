@@ -846,6 +846,7 @@ struct HttpRequest {
     std::string url;
     std::vector<std::string> headers;
     std::string body;
+    bool body_present = false;
     std::shared_ptr<UploadSource> upload_file;
     std::optional<std::filesystem::path> download_file;
     std::optional<std::string> expected_crc32c;
@@ -880,6 +881,7 @@ struct HttpRequest {
     }
     HttpRequest&& with_body(std::string value) && {
         body = std::move(value);
+        body_present = true;
         return std::move(*this);
     }
     HttpRequest&& with_upload_file(std::shared_ptr<UploadSource> value) && {
@@ -1176,7 +1178,7 @@ inline HttpResponse http(HttpRequest request) {
         curl_set(curl.get(), CURLOPT_NOBODY, 1L);
     } else if (request.method != "GET") {
         curl_set(curl.get(), CURLOPT_CUSTOMREQUEST, request.method.c_str());
-        if (!request.body.empty()) {
+        if (request.body_present) {
             curl_set(curl.get(), CURLOPT_POSTFIELDS, request.body.data());
             curl_set(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, curl_size(request.body.size()));
         }
@@ -3514,7 +3516,15 @@ inline gcp::detail::HttpResponse aws_call(
             if (!retry || attempt == 3 || !retryable(failure.http_status()))
                 throw;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
+        auto backoff = std::chrono::milliseconds(100 * (1 << attempt));
+        if (deadline != std::chrono::steady_clock::time_point::max())
+            backoff =
+                std::min(backoff, std::max(std::chrono::milliseconds::zero(),
+                                           std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               deadline - std::chrono::steady_clock::now())));
+        if (backoff <= std::chrono::milliseconds::zero())
+            throw error("Cloud operation deadline exceeded");
+        std::this_thread::sleep_for(backoff);
     }
 }
 
@@ -3620,7 +3630,15 @@ inline gcp::detail::HttpResponse azure_service_call(
             if (!retry || attempt == 3 || !retryable(failure.http_status()))
                 throw;
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
+        auto backoff = std::chrono::milliseconds(100 * (1 << attempt));
+        if (deadline != std::chrono::steady_clock::time_point::max())
+            backoff =
+                std::min(backoff, std::max(std::chrono::milliseconds::zero(),
+                                           std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               deadline - std::chrono::steady_clock::now())));
+        if (backoff <= std::chrono::milliseconds::zero())
+            throw error("Cloud operation deadline exceeded");
+        std::this_thread::sleep_for(backoff);
     }
 }
 
@@ -4296,25 +4314,48 @@ inline std::vector<instance> aws_describe_instance(const client_state& client,
 
 inline std::vector<instance> aws_named_instances(const client_state& client,
                                                  std::string_view name) {
-    const std::string body =
-        "Action=DescribeInstances&Version=2016-11-15&Filter.1.Name=tag%3AName&"
-        "Filter.1.Value.1=" +
-        gcp::detail::encode(name) +
-        "&Filter.2.Name=tag%3Acloud-hpp&Filter.2.Value.1=managed";
-    auto found = aws_instances_from_xml(aws_ec2_call(client, body).body);
-    found.erase(std::remove_if(found.begin(), found.end(), [](const instance& value) {
-                    // EC2 keeps terminated instances visible for a while. They
-                    // no longer reserve the portable logical name.
-                    return value.status == "terminated";
-                }),
-                found.end());
-    return found;
+    std::vector<instance> result;
+    std::string token;
+    for (int page = 0; page < 1000; ++page) {
+        std::string body =
+            "Action=DescribeInstances&Version=2016-11-15&MaxResults=1000&"
+            "Filter.1.Name=tag%3AName&Filter.1.Value.1=" +
+            gcp::detail::encode(name) +
+            "&Filter.2.Name=tag%3Acloud-hpp&Filter.2.Value.1=managed";
+        if (!token.empty())
+            body += "&NextToken=" + gcp::detail::encode(token);
+        const auto response = aws_ec2_call(client, std::move(body));
+        for (auto& found : aws_instances_from_xml(response.body)) {
+            // EC2 keeps terminated instances visible for a while. They no
+            // longer reserve the portable logical name.
+            if (found.status != "terminated")
+                result.push_back(std::move(found));
+            // Two live matches are enough to fail every name-based operation.
+            if (result.size() == 2)
+                return result;
+        }
+        const std::string next = xml_field(response.body, "nextToken");
+        if (next.empty())
+            return result;
+        if (next == token)
+            throw error("AWS EC2 managed-name pagination did not advance");
+        token = next;
+    }
+    throw error("AWS EC2 managed-name lookup exceeded 1000 pages");
+}
+
+inline bool is_aws_instance_id(std::string_view value) {
+    // EC2 IDs use i- plus either the historical 8 or current 17 hexadecimal
+    // digits. A logical name such as i-worker must remain a Name-tag lookup.
+    if (!gcp::detail::starts_with(value, "i-") || (value.size() != 10 && value.size() != 19))
+        return false;
+    return std::all_of(value.begin() + 2, value.end(),
+                       [](char digit) { return hex_digit(digit) >= 0; });
 }
 
 inline instance aws_resolve_instance(const client_state& client, std::string_view name) {
-    auto found = gcp::detail::starts_with(name, "i-")
-                     ? aws_describe_instance(client, name)
-                     : aws_named_instances(client, name);
+    auto found = is_aws_instance_id(name) ? aws_describe_instance(client, name)
+                                          : aws_named_instances(client, name);
     if (found.empty())
         throw error("AWS EC2 instance name was not found: " + std::string(name));
     if (found.size() != 1)
@@ -4326,6 +4367,8 @@ inline instance aws_compute_create(const client_state& client, std::string_view 
                                    std::string_view logical_template) {
     if (name.empty())
         throw error("Raw instance name must not be empty");
+    if (is_aws_instance_id(name))
+        throw error("AWS logical instance names must not use EC2 instance-ID syntax");
     const auto configured = client.config.instance_templates.find(logical_template);
     if (configured == client.config.instance_templates.end())
         throw error("Unknown logical compute template: " + std::string(logical_template));
@@ -4956,6 +4999,7 @@ inline std::optional<double> azure_catalogue_price(const client_state& client,
     // low-priority, wrong-market, and conflicting same-date rows are rejected.
     const std::string endpoint = gcp::detail::base_url(client.config.azure.pricing_endpoint);
     validate_endpoint(client, endpoint, "Azure pricing_endpoint");
+    const std::string pricing_origin = endpoint_origin(endpoint);
     const std::string filter = "serviceName eq 'Virtual Machines' and armRegionName eq '" +
                                chosen.region + "' and armSkuName eq '" + chosen.machine_type +
                                "' and priceType eq 'Consumption'";
@@ -4964,6 +5008,8 @@ inline std::optional<double> azure_catalogue_price(const client_state& client,
     std::string effective;
     const std::string now = iso_time();
     while (!url.empty()) {
+        if (endpoint_origin(url) != pricing_origin)
+            throw error("Azure retail price pagination changed origin");
         const auto json = gcp::detail::parse_json(
             public_call(client, gcp::detail::HttpRequest{}.with_url(url)).body);
         gcp::detail::for_each_json(json, "Items", [&](const gcp::detail::Json& item) {
@@ -6942,8 +6988,8 @@ public:
     [[nodiscard]] const gcp::Cloud& gcp() const noexcept { return state_->raw; }
 
 private:
-    client(std::shared_ptr<detail::client_state> state, cloud::provider provider)
-        : state_(std::move(state)), bound_provider_(std::move(provider)),
+    client(std::shared_ptr<detail::client_state> state, cloud::provider selected_provider)
+        : state_(std::move(state)), bound_provider_(std::move(selected_provider)),
           storage_(state_, bound_provider_), compute_(state_, bound_provider_) {}
 
     std::shared_ptr<detail::client_state> state_;

@@ -8,6 +8,10 @@ compute:
 
 Version 0.2 intentionally renamed the sole public header from `cloud.hpp` to
 `cloud.h`; update both the include and `CLOUD_H_VERSION` macro spelling.
+Version 0.3 makes the second `compute().create()` argument a logical template
+key; map an earlier direct GCE template value through
+`config.instance_templates[key].gcp_instance_template`. It also adopts the
+British `price_source::public_catalogue` spelling.
 
 ```text
 local data → plan → upload → run → poll logs → collect output → delete
