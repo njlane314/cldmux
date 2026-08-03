@@ -598,12 +598,14 @@ bool same_object(const cloud::object& first, const cloud::object& second) {
 } // namespace
 
 struct prepared_run::implementation {
-    implementation(request requested, cloud::job_spec job, cloud::client bound,
-                   cloud::plan selected, quote quoted, std::string input, std::string output,
-                   std::filesystem::path pending)
-        : requested(std::move(requested)), job(std::move(job)), bound(std::move(bound)),
-          selected(std::move(selected)), quoted(std::move(quoted)), input_uri(std::move(input)),
-          output_uri(std::move(output)), pending_file(std::move(pending)) {}
+    implementation(request requested_value, cloud::job_spec job_value,
+                   cloud::client bound_value, cloud::plan selected_value,
+                   quote quoted_value, std::string input_value, std::string output_value,
+                   std::filesystem::path pending_value)
+        : requested(std::move(requested_value)), job(std::move(job_value)),
+          bound(std::move(bound_value)), selected(std::move(selected_value)),
+          quoted(std::move(quoted_value)), input_uri(std::move(input_value)),
+          output_uri(std::move(output_value)), pending_file(std::move(pending_value)) {}
 
     request requested;
     cloud::job_spec job;
