@@ -1734,15 +1734,19 @@ void aws_compute_tests() {
     tst::check(server.aws_compute_create_attempts == 2 &&
                    server.aws_compute_create_polls >= 2,
                "AWS RunInstances reuses its idempotency token and polls pending to running");
+    const auto clock_origin = std::chrono::steady_clock::time_point{};
+    tst::check(cloud::detail::bounded_retry_delay(
+                   0, clock_origin + std::chrono::milliseconds(20), clock_origin) ==
+                   std::chrono::milliseconds(20) &&
+                   cloud::detail::bounded_retry_delay(
+                       0, std::chrono::steady_clock::time_point::max(), clock_origin) ==
+                       std::chrono::milliseconds(100),
+               "provider retry delays are deterministically capped by operation deadlines");
     server.aws_compute_retry_wait = true;
-    const auto aws_deadline_start = std::chrono::steady_clock::now();
     tst::throws<cloud::error>(
         [&] { created.wait(std::chrono::milliseconds(20), std::chrono::milliseconds(1)); },
         "AWS operation retry honours its wait deadline");
-    const auto aws_deadline_elapsed = std::chrono::steady_clock::now() - aws_deadline_start;
     server.aws_compute_retry_wait = false;
-    tst::check(aws_deadline_elapsed < std::chrono::milliseconds(90),
-               "AWS retry backoff is capped by the operation deadline");
 
     const auto started = client.compute().start("aws-start");
     tst::check(started.name() == "i-start" && started.zone() == "eu-west-1a",
@@ -1827,14 +1831,10 @@ void azure_compute_tests() {
                "Azure create returns a portable operation with its native location");
     created.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));
     server.azure_compute_retry_wait = true;
-    const auto azure_deadline_start = std::chrono::steady_clock::now();
     tst::throws<cloud::error>(
         [&] { created.wait(std::chrono::milliseconds(20), std::chrono::milliseconds(1)); },
         "Azure operation retry honours its wait deadline");
-    const auto azure_deadline_elapsed = std::chrono::steady_clock::now() - azure_deadline_start;
     server.azure_compute_retry_wait = false;
-    tst::check(azure_deadline_elapsed < std::chrono::milliseconds(90),
-               "Azure retry backoff is capped by the operation deadline");
 
     const auto started = client.compute().start("azure-start");
     started.wait(std::chrono::seconds(1), std::chrono::milliseconds(1));

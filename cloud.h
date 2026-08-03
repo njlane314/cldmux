@@ -3415,6 +3415,17 @@ inline bool retryable(long status) {
     return status == 0 || status == 408 || status == 429 || (status >= 500 && status < 600);
 }
 
+inline std::chrono::milliseconds bounded_retry_delay(
+    int attempt, std::chrono::steady_clock::time_point deadline,
+    std::chrono::steady_clock::time_point now) {
+    auto delay = std::chrono::milliseconds(100 * (1 << attempt));
+    if (deadline != std::chrono::steady_clock::time_point::max())
+        delay = std::min(
+            delay, std::max(std::chrono::milliseconds::zero(),
+                            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
+    return delay;
+}
+
 inline void validate_endpoint(const client_state& client, std::string_view value,
                               std::string_view name) {
     if (gcp::detail::starts_with(value, "https://"))
@@ -3516,12 +3527,8 @@ inline gcp::detail::HttpResponse aws_call(
             if (!retry || attempt == 3 || !retryable(failure.http_status()))
                 throw;
         }
-        auto backoff = std::chrono::milliseconds(100 * (1 << attempt));
-        if (deadline != std::chrono::steady_clock::time_point::max())
-            backoff =
-                std::min(backoff, std::max(std::chrono::milliseconds::zero(),
-                                           std::chrono::duration_cast<std::chrono::milliseconds>(
-                                               deadline - std::chrono::steady_clock::now())));
+        const auto backoff =
+            bounded_retry_delay(attempt, deadline, std::chrono::steady_clock::now());
         if (backoff <= std::chrono::milliseconds::zero())
             throw error("Cloud operation deadline exceeded");
         std::this_thread::sleep_for(backoff);
@@ -3630,12 +3637,8 @@ inline gcp::detail::HttpResponse azure_service_call(
             if (!retry || attempt == 3 || !retryable(failure.http_status()))
                 throw;
         }
-        auto backoff = std::chrono::milliseconds(100 * (1 << attempt));
-        if (deadline != std::chrono::steady_clock::time_point::max())
-            backoff =
-                std::min(backoff, std::max(std::chrono::milliseconds::zero(),
-                                           std::chrono::duration_cast<std::chrono::milliseconds>(
-                                               deadline - std::chrono::steady_clock::now())));
+        const auto backoff =
+            bounded_retry_delay(attempt, deadline, std::chrono::steady_clock::now());
         if (backoff <= std::chrono::milliseconds::zero())
             throw error("Cloud operation deadline exceeded");
         std::this_thread::sleep_for(backoff);
@@ -6610,7 +6613,9 @@ public:
         }
         if (provider() == "azure") {
             auto native = detail::azure_compute_create(*state_, name, logical_template);
-            return operation(native.name, native.location,
+            const std::string operation_name = native.name;
+            const std::string operation_location = native.location;
+            return operation(operation_name, operation_location,
                              [state = state_, native = std::move(native)](auto timeout, auto poll) {
                                  detail::wait_azure_compute(*state, native, timeout, poll);
                              });
@@ -6633,7 +6638,9 @@ public:
         }
         if (provider() == "azure") {
             auto native = detail::azure_compute_action(*state_, name, "start", "running");
-            return operation(native.name, native.location,
+            const std::string operation_name = native.name;
+            const std::string operation_location = native.location;
+            return operation(operation_name, operation_location,
                              [state = state_, native = std::move(native)](auto timeout, auto poll) {
                                  detail::wait_azure_compute(*state, native, timeout, poll);
                              });
@@ -6652,7 +6659,9 @@ public:
         if (provider() == "azure") {
             auto native =
                 detail::azure_compute_action(*state_, name, "deallocate", "deallocated");
-            return operation(native.name, native.location,
+            const std::string operation_name = native.name;
+            const std::string operation_location = native.location;
+            return operation(operation_name, operation_location,
                              [state = state_, native = std::move(native)](auto timeout, auto poll) {
                                  detail::wait_azure_compute(*state, native, timeout, poll);
                              });
@@ -6670,7 +6679,9 @@ public:
         }
         if (provider() == "azure") {
             auto native = detail::azure_compute_action(*state_, name, "delete", "deleted");
-            return operation(native.name, native.location,
+            const std::string operation_name = native.name;
+            const std::string operation_location = native.location;
+            return operation(operation_name, operation_location,
                              [state = state_, native = std::move(native)](auto timeout, auto poll) {
                                  detail::wait_azure_compute(*state, native, timeout, poll);
                              });
