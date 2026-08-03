@@ -338,6 +338,7 @@ Use the generated single header when vendoring one file:
 ```
 
 ```text
+apps/                        user application implementations
 include/cloud/               canonical modular headers
 include/cloud/detail/        transport, pricing, storage, and submission
 include/cloud/detail/providers/
