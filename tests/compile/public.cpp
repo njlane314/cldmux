@@ -1,4 +1,4 @@
-#include "cloud.h"
+#include <cloud>
 
 int main() {
     cloud::job_spec job;

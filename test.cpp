@@ -1,8 +1,4 @@
-#if defined(CLOUD_TEST_AMALGAMATED)
-#include "cloud.h"
-#else
-#include <cloud/cloud.hpp>
-#endif
+#include <cloud>
 
 #if __cplusplus >= 202002L
 #include <tst.hpp>
@@ -773,7 +769,7 @@ private:
             if (aws_cancel_accepted)
                 return {200,
                         "{\"jobs\":[{\"jobId\":\"aws-job-id\",\"status\":\"FAILED\","
-                        "\"statusReason\":\"cloud.h cancellation\","
+                        "\"statusReason\":\"cloud cancellation\","
                         "\"container\":{\"exitCode\":1,\"logStreamName\":\"cloud/stream\"}}]}"};
             const std::string state = aws_cancel_mode == 1 ? "RUNNABLE" : "STARTING";
             return {200, "{\"jobs\":[{\"jobId\":\"aws-job-id\",\"status\":" +

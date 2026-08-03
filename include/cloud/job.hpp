@@ -143,7 +143,7 @@ inline job_state update(const job_data& job, const gcp::detail::Json& json) {
             return job_state::succeeded;
         if (state == "FAILED") {
             const std::string reason = gcp::detail::field(json, "statusReason");
-            return contains(reason, "cloud.h cancellation") ? job_state::cancelled
+            return contains(reason, "cloud cancellation") ? job_state::cancelled
                                                             : job_state::failed;
         }
         return job_state::unknown;
@@ -773,7 +773,7 @@ inline gcp::detail::Json cancel_job(const job_data& job) {
                                              "/v1/" + std::string(operation))
                                    .with_headers({"Content-Type: application/json"})
                                    .with_body("{\"jobId\":" + gcp::detail::json_quote(job.id) +
-                                              ",\"reason\":\"cloud.h cancellation\"}"),
+                                              ",\"reason\":\"cloud cancellation\"}"),
                                job.chosen.region, "batch", false, deadline);
                 mutation_uncertain = false;
             } catch (const error& failure) {

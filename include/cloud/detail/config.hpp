@@ -1,7 +1,7 @@
 #pragma once
 
 // Common dependencies, version macros, and low-level configuration shared by
-// every modular header.
+// every private source fragment.
 
 #define CLOUD_H_VERSION "0.4.0"
 #define CLOUD_H_VERSION_NUM 0x000400

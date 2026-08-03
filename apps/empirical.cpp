@@ -1,8 +1,4 @@
-#if defined(CLOUD_TEST_AMALGAMATED)
-#include "cloud.h"
-#else
-#include <cloud/cloud.hpp>
-#endif
+#include <cloud>
 
 #include <algorithm>
 #include <charconv>
@@ -635,7 +631,7 @@ cloud::command_output diagnostic_output(const options& configuration,
         if (value.quote_overridden)
             output.add("warning", value.provider +
                                       ": caller-supplied hourly quote is not verified or "
-                                      "repriced by cloud.h");
+                                      "repriced by cloud");
     }
 
     output.add("routing_basis", decision.basis);

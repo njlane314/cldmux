@@ -42,7 +42,7 @@ printf '%s\n' '#pragma once' > "$sandbox/third_party.hpp"
 
 root=$sandbox/include/cloud/root.hpp
 include_root=$sandbox/include
-output=$sandbox/cloud.h
+output=$sandbox/cloud
 
 "$tool" --root "$root" --include-root "$include_root" --output "$output" --write
 "$tool" --root "$root" --include-root "$include_root" --output "$output" --check
@@ -87,7 +87,7 @@ grep -q '^#ifndef CLOUD_ALTERNATE_GUARD_HPP$' "$alternate" || \
     fail "alternate module guard was stripped"
 grep -q '^#else$' "$alternate" || fail "alternate guard branch was removed"
 
-printf '%s\n' '#include "cloud.h"' 'int main() { return root_value() == 2 ? 0 : 1; }' \
+printf '%s\n' '#include <cloud>' 'int main() { return root_value() == 2 ? 0 : 1; }' \
     > "$sandbox/consumer.cpp"
 # compiler_flags is intentionally word-split so callers can pass ordinary flags.
 # shellcheck disable=SC2086

@@ -289,7 +289,7 @@ public:
                                 const auto json = detail::cancel_job(*data_);
                                 result out = detail::make_result(*data_, json);
                                 data_->cached = out;
-                                detail::delete_job(*data_, "cloud.h log callback failure");
+                                detail::delete_job(*data_, "cloud log callback failure");
                             } catch (...) {
                             }
                         }
@@ -310,7 +310,7 @@ public:
                         out.message = "Cloud job exceeded its controller timeout";
                     if (!log_warning.empty())
                         out.warnings.push_back(log_warning);
-                    cleanup(out, "cloud.h timeout");
+                    cleanup(out, "cloud timeout");
                     return out;
                 }
                 (void)emit(deadline);
@@ -330,7 +330,7 @@ public:
                     result out = detail::make_result(*data_, json);
                     if (!log_warning.empty())
                         out.warnings.push_back(log_warning);
-                    cleanup(out, "cloud.h automatic cleanup");
+                    cleanup(out, "cloud automatic cleanup");
                     return out;
                 }
                 detail::pause(*data_->client, deadline);
@@ -341,7 +341,7 @@ public:
                 try {
                     const auto json = detail::cancel_job(*data_);
                     result out = detail::make_result(*data_, json);
-                    cleanup(out, "cloud.h control failure");
+                    cleanup(out, "cloud control failure");
                 } catch (...) {
                 }
             }
@@ -368,7 +368,7 @@ public:
             data_->cached->warnings.push_back(std::move(warning));
         if (data_->spec.auto_delete || data_->chosen.provider == "azure") {
             try {
-                detail::delete_job(*data_, "cloud.h cancellation");
+                detail::delete_job(*data_, "cloud cancellation");
             } catch (const std::exception& failure) {
                 data_->cached->warnings.push_back(std::string("automatic cleanup failed: ") +
                                                   failure.what());

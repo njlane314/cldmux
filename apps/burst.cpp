@@ -1,10 +1,6 @@
 #include "burst.hpp"
 
-#if defined(CLOUD_TEST_AMALGAMATED)
-#include "cloud.h"
-#else
-#include <cloud/cloud.hpp>
-#endif
+#include <cloud>
 
 #include <algorithm>
 #include <array>

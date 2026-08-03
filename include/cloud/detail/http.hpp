@@ -14,14 +14,14 @@ struct CurlGlobal {
             throw Error("curl_global_init failed");
         const curl_version_info_data* info = curl_version_info(CURLVERSION_NOW);
         if (!info || !(info->features & CURL_VERSION_THREADSAFE))
-            throw Error("cloud.h requires a thread-safe libcurl build");
+            throw Error("cloud requires a thread-safe libcurl build");
     }
     // Deliberately process-lifetime: destructor-time cleanup can race clients
     // owned by other static objects.
     ~CurlGlobal() = default;
 };
 
-static_assert(LIBCURL_VERSION_NUM >= 0x075400, "cloud.h requires libcurl 7.84.0 or newer");
+static_assert(LIBCURL_VERSION_NUM >= 0x075400, "cloud requires libcurl 7.84.0 or newer");
 
 inline void ensure_curl() {
     static CurlGlobal global;
@@ -349,7 +349,7 @@ inline HttpResponse http(HttpRequest request) {
                                "HTTP timeout"));
     curl_set(curl.get(), CURLOPT_CONNECTTIMEOUT_MS,
              curl_milliseconds(request.connect_timeout, "HTTP connect timeout"));
-    curl_set(curl.get(), CURLOPT_USERAGENT, "cloud.h/" CLOUD_H_VERSION);
+    curl_set(curl.get(), CURLOPT_USERAGENT, "cloud/" CLOUD_H_VERSION);
     if (request.no_proxy)
         curl_set(curl.get(), CURLOPT_NOPROXY, "*");
 

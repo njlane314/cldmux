@@ -19,7 +19,7 @@ local data → plan → upload → run → poll logs → collect output → dele
 ## EXAMPLE
 
 ```cpp
-#include "cloud.h"
+#include <cloud>
 
 #include <chrono>
 #include <iostream>
@@ -45,7 +45,7 @@ int main() {
 Build with:
 
 ```sh
-c++ -std=c++17 -Iinclude -I. example.cpp -lcurl -pthread -o cloud-run
+c++ -std=c++17 -I. example.cpp -lcurl -pthread -o cloud-run
 ```
 
 The repository has one heavily commented [`example.cpp`](example.cpp). It is a
@@ -256,7 +256,7 @@ move-only result to `execute()` is the caller's approval.
 make burst
 export BURST_INPUT_ROOT=cloud://burst-input
 export BURST_OUTPUT_ROOT=cloud://burst-output
-/tmp/cloud-burst-modular --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
+/tmp/cloud-burst --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
     --input=case.tar.zst --output=result.tar.zst -- /app/solve
 # Review the KEY=value quote, then repeat with --submit to approve it.
 ```
@@ -287,7 +287,7 @@ cost proxy = routing quote snapshot × routing runtime / 3600 + known data cost
 ```
 
 ```sh
-c++ -std=c++17 -Iinclude -I. apps/empirical.cpp -lcurl -pthread -o cloud-empirical
+c++ -std=c++17 -I. apps/empirical.cpp -lcurl -pthread -o cloud-empirical
 cloud-empirical render-v2 --candidates=gcp,aws,azure \
     --data-cost=gcp:0.01 --data-cost=aws:0.02 --data-cost=azure:0
 cloud-empirical render-v2 --provider=aws --data-cost=aws:0.02 --submit
@@ -390,16 +390,11 @@ latency or carbon optimisers. Provider-native regions may be supplied directly.
 
 ## SOURCE LAYOUT
 
-Use the modular headers for development:
+`cloud` is the only public header. Place it on the compiler's include path and
+include it like a standard-library header:
 
 ```cpp
-#include <cloud/cloud.hpp>
-```
-
-Use the generated single header when vendoring one file:
-
-```cpp
-#include "cloud.h"
+#include <cloud>
 ```
 
 ```text
@@ -407,16 +402,15 @@ apps/burst.hpp               provider-neutral burst API
 apps/burst.cpp               sole cloud-backed burst adapter
 apps/burst_main.cpp          quote-and-approve UNIX command
 apps/empirical.cpp           observed-runtime routing application
-include/cloud/               canonical modular headers
-include/cloud/detail/        transport, pricing, storage, and submission
+cloud                        generated public header
+include/cloud/               private generator fragments
+include/cloud/detail/        private transport, pricing, and submission fragments
 include/cloud/detail/providers/
-single_include/cloud.h       generated release header
-cloud.h                      identical compatibility copy
 tools/amalgamate.cpp         standalone C++17 generator
 tests/compile/               first-include and ODR probes
 ```
 
-Never edit either generated `cloud.h`. Change the modular source and run:
+Never edit the generated `cloud` header. Change the private fragments and run:
 
 ```sh
 make amalgamate
@@ -438,11 +432,10 @@ make check-standards
 make sanitise
 ```
 
-`make check` compiles every modular header, tests the generator, checks both
-generated headers byte-for-byte, runs modular and single-header suites, probes
-multi-translation-unit use, and builds the example, burst, and empirical
-applications in both forms. Tests use loopback fakes and offline quotes; they
-need no cloud credentials and cannot incur charges.
+`make check` compiles every private fragment, tests the generator, verifies the
+generated public header, probes multi-translation-unit use, and builds the
+example, burst, and empirical applications. Tests use loopback fakes and offline
+quotes; they need no cloud credentials and cannot incur charges.
 
 ## LICENCE
 
