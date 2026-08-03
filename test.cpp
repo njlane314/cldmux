@@ -2678,10 +2678,10 @@ void environment_factory_tests() {
     environment.set("CLOUD_AWS_S3_FILES_BUCKET", "inputs");
     environment.set("CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN",
                     "arn:aws:s3files:eu-west-1:123:file-system/fs-1");
-    environment.set("CLOUD_AWS_S3_FILES_INPUT_BUCKET", "burst-input");
+    environment.set("CLOUD_AWS_S3_FILES_INPUT_BUCKET", "dispatch-input");
     environment.set("CLOUD_AWS_S3_FILES_INPUT_FILE_SYSTEM_ARN",
                     "arn:aws:s3files:eu-west-1:123:file-system/fs-input");
-    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "burst-output");
+    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "dispatch-output");
     environment.set("CLOUD_AWS_S3_FILES_OUTPUT_FILE_SYSTEM_ARN",
                     "arn:aws:s3files:eu-west-1:123:file-system/fs-output");
     environment.set("CLOUD_AWS_LAUNCH_TEMPLATE_ID", "lt-123");
@@ -2696,9 +2696,11 @@ void environment_factory_tests() {
                    aws_config.aws.fargate_job_queue == "fargate-queue" &&
                    aws_config.aws.s3_files.at("inputs").file_system_arn.find("fs-1") !=
                        std::string::npos &&
-                   aws_config.aws.s3_files.at("burst-input").file_system_arn.find("fs-input") !=
+                   aws_config.aws.s3_files.at("dispatch-input").file_system_arn.find(
+                       "fs-input") !=
                        std::string::npos &&
-                   aws_config.aws.s3_files.at("burst-output").file_system_arn.find("fs-output") !=
+                   aws_config.aws.s3_files.at("dispatch-output").file_system_arn.find(
+                       "fs-output") !=
                        std::string::npos &&
                    aws_config.instance_templates.at("worker").aws.id == "lt-123" &&
                    cloud::detail::configured_region(aws_config, "aws") == "eu-west-1" &&
@@ -2707,7 +2709,7 @@ void environment_factory_tests() {
     environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "inputs");
     tst::throws<cloud::error>([] { (void)cloud::detail::config_from_environment("aws"); },
                               "AWS environment rejects conflicting named mount mappings");
-    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "burst-output");
+    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "dispatch-output");
     const auto aws_plan = cloud::client::from_environment("aws").plan(spec);
     tst::check(aws_plan.provider == "aws" && aws_plan.region == "eu-west-1" &&
                    aws_plan.machine_type == "m6i.xlarge" && !aws_plan.estimated_hourly_cost,

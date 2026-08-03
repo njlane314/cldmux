@@ -15,8 +15,8 @@ printf '%s\n' 'immutable input' > "$input"
 
 run() {
     env -i PATH="$PATH" \
-        BURST_INPUT_ROOT=cloud://burst-input \
-        BURST_OUTPUT_ROOT=cloud://burst-output \
+        DISPATCH_INPUT_ROOT=cloud://dispatch-input \
+        DISPATCH_OUTPUT_ROOT=cloud://dispatch-output \
         CLOUD_GCP_PROJECT=test-project \
         CLOUD_GCP_REGION=europe-west4 \
         "$binary" "$@"
@@ -35,18 +35,18 @@ dry_run() {
 }
 
 help=$(run --help)
-printf '%s\n' "$help" | grep -q '^Usage: burst-run '
+printf '%s\n' "$help" | grep -q '^Usage: dispatch '
 printf '%s\n' "$help" | grep -q '^  --submit '
 printf '%s\n' "$help" | grep -q \
-    '^Set distinct BURST_INPUT_ROOT and BURST_OUTPUT_ROOT cloud:// bucket/container$'
-! printf '%s\n' "$help" | grep -q 'BURST_ARTIFACT_ROOT'
+    '^Set distinct DISPATCH_INPUT_ROOT and DISPATCH_OUTPUT_ROOT cloud:// bucket/container$'
+! printf '%s\n' "$help" | grep -q 'DISPATCH_ARTIFACT_ROOT'
 
 before=$(cksum "$input")
 quote=$(dry_run)
 after=$(cksum "$input")
 test "$before" = "$after"
 printf '%s\n' "$quote" | grep -q '^output_version=1$'
-printf '%s\n' "$quote" | grep -q '^program=burst-run$'
+printf '%s\n' "$quote" | grep -q '^program=dispatch$'
 printf '%s\n' "$quote" | grep -q '^request_id=simulation-0042$'
 printf '%s\n' "$quote" | grep -q '^requested_policy=gcp$'
 printf '%s\n' "$quote" | grep -q '^provider=gcp$'
@@ -59,9 +59,9 @@ printf '%s\n' "$quote" | grep -q '^expected_active_runtime_seconds=300$'
 printf '%s\n' "$quote" | grep -q '^controller_timeout_seconds=3600$'
 printf '%s\n' "$quote" | grep -q '^configured_attempt_limit=2$'
 printf '%s\n' "$quote" | grep -q \
-    '^container_input=/burst/input/runs/simulation-0042/input.tar.zst$'
+    '^container_input=/dispatch/input/runs/simulation-0042/input.tar.zst$'
 printf '%s\n' "$quote" | grep -q \
-    '^container_output=/burst/output/runs/simulation-0042/output.tar.zst$'
+    '^container_output=/dispatch/output/runs/simulation-0042/output.tar.zst$'
 printf '%s\n' "$quote" | grep -Fq "receipt_file=$physical_output.receipt"
 printf '%s\n' "$quote" | grep -q '^approval=required$'
 printf '%s\n' "$quote" | grep -q '^status=dry-run$'
@@ -202,12 +202,12 @@ error=$(env -i PATH="$PATH" \
     -- /bin/echo 2>&1) || status=$?
 test "$status" -eq 2
 test "$error" = \
-    'error=distinct BURST_INPUT_ROOT and BURST_OUTPUT_ROOT values are required'
+    'error=distinct DISPATCH_INPUT_ROOT and DISPATCH_OUTPUT_ROOT values are required'
 
 status=0
 error=$(env -i PATH="$PATH" \
-    BURST_INPUT_ROOT=cloud://same-root \
-    BURST_OUTPUT_ROOT=cloud://same-root \
+    DISPATCH_INPUT_ROOT=cloud://same-root \
+    DISPATCH_OUTPUT_ROOT=cloud://same-root \
     CLOUD_GCP_PROJECT=test-project \
     CLOUD_GCP_REGION=europe-west4 \
     "$binary" \
@@ -220,7 +220,7 @@ error=$(env -i PATH="$PATH" \
     -- /bin/echo 2>&1) || status=$?
 test "$status" -eq 2
 test "$error" = \
-    'error=BURST_INPUT_ROOT and BURST_OUTPUT_ROOT must name different buckets or containers'
+    'error=DISPATCH_INPUT_ROOT and DISPATCH_OUTPUT_ROOT must name different buckets or containers'
 
 status=0
 run --id=no-command --image=image --input="$input" --output="$output" \

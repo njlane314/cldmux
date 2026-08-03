@@ -1,4 +1,4 @@
-#include "apps/burst.hpp"
+#include "apps/dispatch.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -11,14 +11,14 @@
 #include <system_error>
 #include <type_traits>
 
-namespace burst {
+namespace dispatch {
 namespace testing {
 
 std::string sha256_file(const std::filesystem::path& path);
 void persist_receipt(receipt value, const std::filesystem::path& path);
 
 } // namespace testing
-} // namespace burst
+} // namespace dispatch
 
 namespace {
 
@@ -33,16 +33,16 @@ public:
         std::random_device random;
         const auto root = std::filesystem::temp_directory_path();
         for (unsigned attempt = 0; attempt < 64; ++attempt) {
-            path_ = root / ("cloud-burst-test-" + std::to_string(random()) + '-' +
+            path_ = root / ("cloud-dispatch-test-" + std::to_string(random()) + '-' +
                             std::to_string(attempt));
             std::error_code failure;
             if (std::filesystem::create_directory(path_, failure))
                 return;
             if (failure && failure != std::errc::file_exists)
-                throw std::runtime_error("cannot create burst test directory: " +
+                throw std::runtime_error("cannot create dispatch test directory: " +
                                          failure.message());
         }
-        throw std::runtime_error("cannot choose a burst test directory");
+        throw std::runtime_error("cannot choose a dispatch test directory");
     }
 
     temporary_directory(const temporary_directory&) = delete;
@@ -64,13 +64,13 @@ void write_file(const std::filesystem::path& path, std::string_view contents) {
     output.write(contents.data(), static_cast<std::streamsize>(contents.size()));
     output.close();
     if (!output)
-        throw std::runtime_error("cannot write burst test file");
+        throw std::runtime_error("cannot write dispatch test file");
 }
 
 std::string read_file(const std::filesystem::path& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input)
-        throw std::runtime_error("cannot read burst test file");
+        throw std::runtime_error("cannot read dispatch test file");
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
@@ -78,17 +78,17 @@ void hash_tests(const std::filesystem::path& directory) {
     const auto artefact = directory / "artefact";
 
     write_file(artefact, "");
-    check(burst::testing::sha256_file(artefact) ==
+    check(dispatch::testing::sha256_file(artefact) ==
               "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
           "SHA-256 empty vector");
 
     write_file(artefact, "abc");
-    check(burst::testing::sha256_file(artefact) ==
+    check(dispatch::testing::sha256_file(artefact) ==
               "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
           "SHA-256 abc vector");
 
     write_file(artefact, std::string(1'000'000, 'a'));
-    check(burst::testing::sha256_file(artefact) ==
+    check(dispatch::testing::sha256_file(artefact) ==
               "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
           "SHA-256 million-a vector");
 }
@@ -122,7 +122,7 @@ void check_record_grammar(std::string_view text) {
 }
 
 void receipt_tests(const std::filesystem::path& directory) {
-    burst::receipt value;
+    dispatch::receipt value;
     value.request_id = "simulation-0042";
     value.execution_id = "execution-9";
     value.run_id = "provider-run-17";
@@ -156,7 +156,7 @@ void receipt_tests(const std::filesystem::path& directory) {
     value.warnings = {"transaction\rwarning"};
 
     const auto receipt = directory / "run.receipt";
-    burst::testing::persist_receipt(value, receipt);
+    dispatch::testing::persist_receipt(value, receipt);
     const std::string first = read_file(receipt);
     check_record_grammar(first);
     check(first.find("receipt_version=1\nreceipt_status=complete\n") == 0,
@@ -182,7 +182,7 @@ void receipt_tests(const std::filesystem::path& directory) {
 
     bool rejected = false;
     try {
-        burst::testing::persist_receipt(value, receipt);
+        dispatch::testing::persist_receipt(value, receipt);
     } catch (const std::runtime_error&) {
         rejected = true;
     }
@@ -193,16 +193,16 @@ void receipt_tests(const std::filesystem::path& directory) {
 } // namespace
 
 int main() {
-    static_assert(std::is_move_constructible_v<burst::prepared_run>);
-    static_assert(!std::is_copy_constructible_v<burst::prepared_run>);
+    static_assert(std::is_move_constructible_v<dispatch::prepared_run>);
+    static_assert(!std::is_copy_constructible_v<dispatch::prepared_run>);
     try {
         const temporary_directory temporary;
         hash_tests(temporary.path());
         receipt_tests(temporary.path());
-        std::cout << "PASS  burst hashes and receipts\n";
+        std::cout << "PASS  dispatch hashes and receipts\n";
         return 0;
     } catch (const std::exception& failure) {
-        std::cerr << "FAIL  burst hashes and receipts\n" << failure.what() << '\n';
+        std::cerr << "FAIL  dispatch hashes and receipts\n" << failure.what() << '\n';
         return 1;
     }
 }

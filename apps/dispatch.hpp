@@ -10,7 +10,7 @@
 #include <string_view>
 #include <vector>
 
-namespace burst {
+namespace dispatch {
 
 // One already-archived workload. Infrastructure and credentials stay outside
 // this domain-facing type; policy is the only routing choice the caller makes.
@@ -122,4 +122,4 @@ public:
     [[nodiscard]] receipt execute(prepared_run prepared, progress on_progress = {}) const;
 };
 
-} // namespace burst
+} // namespace dispatch

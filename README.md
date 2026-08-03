@@ -246,17 +246,17 @@ Callbacks return a finite, non-negative USD hourly rate or `std::nullopt`.
 `resources::max_price_per_hour` fails closed when the estimate is absent or too
 high. An earlier plan is never a reservation; `run()` prices again.
 
-## BURST APPLICATION
+## DISPATCH APPLICATION
 
-[`apps/burst.hpp`](apps/burst.hpp) is a provider-neutral, two-phase adapter.
+[`apps/dispatch.hpp`](apps/dispatch.hpp) is a provider-neutral, two-phase adapter.
 `prepare()` validates, quotes, and pins without allocating compute. Passing its
 move-only result to `execute()` is the caller's approval.
 
 ```sh
-make burst
-export BURST_INPUT_ROOT=cloud://burst-input
-export BURST_OUTPUT_ROOT=cloud://burst-output
-/tmp/cloud-burst --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
+make dispatch
+export DISPATCH_INPUT_ROOT=cloud://dispatch-input
+export DISPATCH_OUTPUT_ROOT=cloud://dispatch-output
+/tmp/cloud-dispatch --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
     --input=case.tar.zst --output=result.tar.zst -- /app/solve
 # Review the KEY=value quote, then repeat with --submit to approve it.
 ```
@@ -265,15 +265,15 @@ The dry run reports the route, hourly price, expected runtime, and advisory cost
 `--policy=gcp`, `aws`, or `azure` overrides cheapest routing; an unpriced
 submission also needs `--allow-unpriced`.
 
-The container reads `/burst/input/runs/ID/input.tar.zst`, writes
-`/burst/output/runs/ID/output.tar.zst`, emits line-oriented progress, and exits
+The container reads `/dispatch/input/runs/ID/input.tar.zst`, writes
+`/dispatch/output/runs/ID/output.tar.zst`, emits line-oriented progress, and exits
 zero on success. The two roots must name different buckets/containers so input
 stays read-only. AWS needs both named S3 Files mappings and is CPU-only here.
 
 `execute()` uses a create-only input upload and no-clobber local publication. Its
 grep-friendly receipt records the image digest, SHA-256 hashes, quote, route,
 elapsed time, result, and recovery state. An interruption leaves `.pending` and
-`.pending.EXECUTION_ID`; do not resubmit blindly. Burst is not a scheduler,
+.pending.EXECUTION_ID`; do not resubmit blindly. Dispatch is not a scheduler,
 credential store, provisioner, archiver, or workflow engine.
 
 ## EMPIRICAL ROUTING
@@ -398,9 +398,9 @@ include it like a standard-library header:
 ```
 
 ```text
-apps/burst.hpp               provider-neutral burst API
-apps/burst.cpp               sole cloud-backed burst adapter
-apps/burst_main.cpp          quote-and-approve UNIX command
+apps/dispatch.hpp            provider-neutral dispatch API
+apps/dispatch.cpp            sole cloud-backed dispatch adapter
+apps/dispatch_main.cpp       quote-and-approve UNIX command
 apps/empirical.cpp           observed-runtime routing application
 cloud                        generated public header
 include/cloud/               private generator fragments
@@ -434,8 +434,8 @@ make sanitise
 
 `make check` compiles every private fragment, tests the generator, verifies the
 generated public header, probes multi-translation-unit use, and builds the
-example, burst, and empirical applications. Tests use loopback fakes and offline
-quotes; they need no cloud credentials and cannot incur charges.
+example, dispatch, and empirical applications. Tests use loopback fakes and
+offline quotes; they need no cloud credentials and cannot incur charges.
 
 ## LICENCE
 

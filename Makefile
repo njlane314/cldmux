@@ -21,21 +21,34 @@ TEST_SAN := /tmp/cloud-test-san
 EXAMPLE := /tmp/cloud-example
 EMPIRICAL := /tmp/cloud-empirical
 EMPIRICAL_SAN := /tmp/cloud-empirical-san
-BURST := /tmp/cloud-burst
-BURST_TEST := /tmp/cloud-burst-test
-BURST_SAN := /tmp/cloud-burst-san
-BURST_TEST_SAN := /tmp/cloud-burst-test-san
+DISPATCH := /tmp/cloud-dispatch
+DISPATCH_TEST := /tmp/cloud-dispatch-test
+DISPATCH_SAN := /tmp/cloud-dispatch-san
+DISPATCH_TEST_SAN := /tmp/cloud-dispatch-test-san
 ODR := /tmp/cloud-odr
 
 .PHONY: check check-readme check-headers check-tool check-amalgamation \
-    check-library check-odr check-cli check-empirical check-burst \
-    check-burst-header check-standards check-c++17 check-c++20 check-c++23 \
-    amalgamate example empirical burst sanitise
+    check-library check-odr check-cli check-empirical check-dispatch \
+    check-dispatch-header check-stale-names check-standards check-c++17 \
+    check-c++20 check-c++23 amalgamate example empirical dispatch sanitise
 
 check: check-readme check-headers check-tool check-library check-odr check-cli \
-    check-empirical check-burst
+    check-empirical check-dispatch check-stale-names
 	@! grep -n "$$(printf '\t')" cloud \
 		$$(find apps include tests tools -type f) example.cpp test.cpp README.md
+
+check-stale-names:
+	@set -eu; \
+		names=$$(find . -path './.git' -prune -o -path './build' -prune -o \
+			-iname '*bu[r]st*' -print); \
+		test -z "$$names"; \
+		status=0; \
+		grep -Rni 'bu[r]st' apps include tests tools .github || status=$$?; \
+		test "$$status" -eq 1; \
+		status=0; \
+		grep -ni 'bu[r]st' Makefile README.md cloud example.cpp test.cpp || \
+			status=$$?; \
+		test "$$status" -eq 1
 
 check-readme:
 	awk '/^```cpp$$/ {code=1; next} code && /^```/ {exit} code {print}' README.md | \
@@ -97,20 +110,21 @@ empirical: check-amalgamation
 check-empirical: empirical
 	sh tests/empirical.sh $(EMPIRICAL)
 
-burst: check-amalgamation
+dispatch: check-amalgamation
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. \
-		apps/burst.cpp apps/burst_main.cpp $(CURL_LIBS) -pthread -o $(BURST)
+		apps/dispatch.cpp apps/dispatch_main.cpp $(CURL_LIBS) -pthread -o $(DISPATCH)
 
-check-burst-header:
-	@! grep -nE '^[[:space:]]*#include[[:space:]].*cloud|cloud::' apps/burst.hpp
+check-dispatch-header:
+	@! grep -nE '^[[:space:]]*#include[[:space:]].*cloud|cloud::' apps/dispatch.hpp
 	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. \
-		-fsyntax-only tests/compile/burst.cpp
+		-fsyntax-only tests/compile/dispatch.cpp
 
-check-burst: check-burst-header burst
-	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DBURST_TESTING \
-		-I. apps/burst.cpp tests/burst.cpp $(CURL_LIBS) -pthread -o $(BURST_TEST)
-	$(BURST_TEST)
-	sh tests/burst.sh $(BURST)
+check-dispatch: check-dispatch-header dispatch
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DDISPATCH_TESTING \
+		-I. apps/dispatch.cpp tests/dispatch.cpp $(CURL_LIBS) -pthread \
+		-o $(DISPATCH_TEST)
+	$(DISPATCH_TEST)
+	sh tests/dispatch.sh $(DISPATCH)
 
 check-cli: example
 	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
@@ -204,11 +218,11 @@ sanitise: check-amalgamation
 	sh tests/empirical.sh $(EMPIRICAL_SAN)
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
 		-fsanitize=address,undefined -fno-omit-frame-pointer -I. \
-		apps/burst.cpp apps/burst_main.cpp $(CURL_LIBS) -pthread \
-		-o $(BURST_SAN)
-	sh tests/burst.sh $(BURST_SAN)
-	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DBURST_TESTING \
+		apps/dispatch.cpp apps/dispatch_main.cpp $(CURL_LIBS) -pthread \
+		-o $(DISPATCH_SAN)
+	sh tests/dispatch.sh $(DISPATCH_SAN)
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DDISPATCH_TESTING \
 		-fsanitize=address,undefined -fno-omit-frame-pointer -I. \
-		apps/burst.cpp tests/burst.cpp $(CURL_LIBS) -pthread \
-		-o $(BURST_TEST_SAN)
-	$(BURST_TEST_SAN)
+		apps/dispatch.cpp tests/dispatch.cpp $(CURL_LIBS) -pthread \
+		-o $(DISPATCH_TEST_SAN)
+	$(DISPATCH_TEST_SAN)

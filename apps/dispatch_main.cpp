@@ -1,4 +1,4 @@
-#include "burst.hpp"
+#include "dispatch.hpp"
 
 #include <charconv>
 #include <chrono>
@@ -18,7 +18,7 @@
 namespace {
 
 struct options {
-    burst::request request;
+    dispatch::request request;
     std::chrono::milliseconds expected_runtime = std::chrono::minutes(5);
     bool allow_unpriced = false;
     bool submit = false;
@@ -153,12 +153,12 @@ std::chrono::milliseconds parse_duration(std::string_view text, std::string_view
 }
 
 void print_help(std::ostream& output) {
-    output << "Usage: burst-run --id=ID --image=IMAGE --input=FILE --output=FILE [OPTIONS] -- "
+    output << "Usage: dispatch --id=ID --image=IMAGE --input=FILE --output=FILE [OPTIONS] -- "
               "COMMAND [ARGUMENT ...]\n"
            << "\n"
            << "Prepare and quote by default; only --submit permits remote mutation.\n"
-           << "The command reads /burst/input/runs/ID/input.tar.zst and writes\n"
-           << "/burst/output/runs/ID/output.tar.zst. It reports line-oriented progress and\n"
+           << "The command reads /dispatch/input/runs/ID/input.tar.zst and writes\n"
+           << "/dispatch/output/runs/ID/output.tar.zst. It reports line-oriented progress and\n"
            << "returns zero only after the output and receipt have been published locally.\n"
            << "\n"
            << "Options:\n"
@@ -178,7 +178,7 @@ void print_help(std::ostream& output) {
            << "  --submit                   approve the prepared run and mutate remotely\n"
            << "  --help                     show this text and exit\n"
            << "\n"
-           << "Set distinct BURST_INPUT_ROOT and BURST_OUTPUT_ROOT cloud:// bucket/container\n"
+           << "Set distinct DISPATCH_INPUT_ROOT and DISPATCH_OUTPUT_ROOT cloud:// bucket/container\n"
            << "roots. Provider infrastructure and\n"
            << "credentials remain in CLOUD_* configuration. AWS native mounts are CPU-only.\n";
 }
@@ -282,10 +282,10 @@ options parse_options(int argc, char* argv[]) {
     return result;
 }
 
-void show_quote(const options& arguments, const burst::prepared_run& prepared) {
-    const burst::quote& value = prepared.selected_quote();
+void show_quote(const options& arguments, const dispatch::prepared_run& prepared) {
+    const dispatch::quote& value = prepared.selected_quote();
     record(std::cout, "output_version", "1");
-    record(std::cout, "program", "burst-run");
+    record(std::cout, "program", "dispatch");
     record(std::cout, "request_id", arguments.request.id);
     record(std::cout, "requested_policy", arguments.request.policy);
     record(std::cout, "provider", value.provider);
@@ -309,9 +309,9 @@ void show_quote(const options& arguments, const burst::prepared_run& prepared) {
     record_integer(std::cout, "configured_attempt_limit",
                    static_cast<std::uint64_t>(arguments.request.retries) + 1U);
     record(std::cout, "container_input",
-           "/burst/input/runs/" + arguments.request.id + "/input.tar.zst");
+           "/dispatch/input/runs/" + arguments.request.id + "/input.tar.zst");
     record(std::cout, "container_output",
-           "/burst/output/runs/" + arguments.request.id + "/output.tar.zst");
+           "/dispatch/output/runs/" + arguments.request.id + "/output.tar.zst");
     record(std::cout, "receipt_file", prepared.receipt_path().string());
     for (const auto& warning : value.warnings)
         record(std::cout, "warning", warning);
@@ -323,7 +323,7 @@ void show_quote(const options& arguments, const burst::prepared_run& prepared) {
                "configured retries can add cost beyond the single-runtime estimate");
 }
 
-void show_receipt(const burst::receipt& value) {
+void show_receipt(const dispatch::receipt& value) {
     record(std::cout, "execution_id", value.execution_id);
     record(std::cout, "run_id", value.run_id.empty() ? "unavailable" : value.run_id);
     record(std::cout, "job_state", value.job_state);
@@ -360,7 +360,7 @@ int main(int argc, char* argv[]) {
             return 0;
         }
 
-        burst::core executor;
+        dispatch::core executor;
         auto prepared = executor.prepare(arguments.request);
         show_quote(arguments, prepared);
         if (!arguments.submit) {
@@ -375,7 +375,7 @@ int main(int argc, char* argv[]) {
 
         record(std::cout, "approval", "--submit");
         record(std::cout, "status", "executing");
-        const burst::receipt result =
+        const dispatch::receipt result =
             executor.execute(std::move(prepared),
                              [](std::string_view line) { record(std::cout, "progress", line); });
         show_receipt(result);

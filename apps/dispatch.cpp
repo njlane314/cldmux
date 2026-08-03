@@ -1,4 +1,4 @@
-#include "burst.hpp"
+#include "dispatch.hpp"
 
 #include <cloud>
 
@@ -20,7 +20,7 @@
 #include <system_error>
 #include <utility>
 
-namespace burst {
+namespace dispatch {
 namespace {
 
 constexpr std::string_view receipt_version = "1";
@@ -49,16 +49,16 @@ std::string storage_root(std::string value, std::string_view variable) {
 }
 
 roots configured_roots() {
-    std::string input = environment("BURST_INPUT_ROOT");
-    std::string output = environment("BURST_OUTPUT_ROOT");
+    std::string input = environment("DISPATCH_INPUT_ROOT");
+    std::string output = environment("DISPATCH_OUTPUT_ROOT");
     if (input.empty() || output.empty())
         throw std::invalid_argument(
-            "distinct BURST_INPUT_ROOT and BURST_OUTPUT_ROOT values are required");
-    roots result{storage_root(std::move(input), "BURST_INPUT_ROOT"),
-                 storage_root(std::move(output), "BURST_OUTPUT_ROOT")};
+            "distinct DISPATCH_INPUT_ROOT and DISPATCH_OUTPUT_ROOT values are required");
+    roots result{storage_root(std::move(input), "DISPATCH_INPUT_ROOT"),
+                 storage_root(std::move(output), "DISPATCH_OUTPUT_ROOT")};
     if (result.input == result.output)
         throw std::invalid_argument(
-            "BURST_INPUT_ROOT and BURST_OUTPUT_ROOT must name different buckets or containers");
+            "DISPATCH_INPUT_ROOT and DISPATCH_OUTPUT_ROOT must name different buckets or containers");
     return result;
 }
 
@@ -137,7 +137,7 @@ void validate_local_request(request& value) {
     if (std::filesystem::exists(receipt_path))
         throw std::invalid_argument("receipt already exists");
     if (std::filesystem::exists(pending_path))
-        throw std::invalid_argument("pending burst receipt already exists");
+        throw std::invalid_argument("pending dispatch receipt already exists");
 
     // Pin paths at prepare time; changing the process working directory must
     // not redirect a previously approved transaction.
@@ -361,7 +361,7 @@ public:
             std::ostringstream suffix;
             suffix << std::hex << random() << random() << attempt;
             const auto candidate = parent_or_current(destination) /
-                                   ('.' + destination.filename().string() + ".burst-" +
+                                   ('.' + destination.filename().string() + ".dispatch-" +
                                     std::string(purpose) + '-' + suffix.str() + ".tmpdir");
             std::error_code failure;
             if (!std::filesystem::create_directory(candidate, failure)) {
@@ -640,11 +640,11 @@ prepared_run core::prepare(request value) const {
     const std::string run_key = "runs/" + value.id;
 
     cloud::job_spec job;
-    job.name = "burst-" + value.id;
+    job.name = "dispatch-" + value.id;
     job.image = value.image;
     job.command = value.command;
-    job.mounts = {{artefact_roots.input, "/burst/input", true},
-                  {artefact_roots.output, "/burst/output", false}};
+    job.mounts = {{artefact_roots.input, "/dispatch/input", true},
+                  {artefact_roots.output, "/dispatch/output", false}};
     job.resources.cpus = value.cpus;
     job.resources.memory_gb = value.memory_gb;
     job.resources.gpu = value.gpu;
@@ -910,7 +910,7 @@ receipt core::execute(prepared_run prepared, progress on_progress) const {
     return value;
 }
 
-#if defined(BURST_TESTING)
+#if defined(DISPATCH_TESTING)
 namespace testing {
 
 std::string sha256_file(const std::filesystem::path& path) { return fingerprint_file(path).sha256; }
@@ -924,4 +924,4 @@ void persist_receipt(receipt value, const std::filesystem::path& path) {
 } // namespace testing
 #endif
 
-} // namespace burst
+} // namespace dispatch
