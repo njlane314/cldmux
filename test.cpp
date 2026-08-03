@@ -393,6 +393,18 @@ private:
 
     reply route(std::string_view method, std::string_view target, std::string_view headers,
                 std::string_view body) {
+        if (method == "GET" && starts_with(target, "/transport-body?")) {
+            const std::size_t bytes = static_cast<std::size_t>(std::stoull(query(target, "bytes")));
+            const std::string status = query(target, "status");
+            return {status.empty() ? 200 : std::stoi(status), std::string(bytes, 'x')};
+        }
+        if (method == "GET" && target == "/transport-headers") {
+            reply response;
+            for (int index = 0; index < 300; ++index)
+                response.headers.push_back("X-Limit-" + std::to_string(index) + ": " +
+                                           std::string(1024, 'x'));
+            return response;
+        }
         if (method == "POST" && target == "/ec2/") {
             const std::string authorisation = request_header(headers, "authorization");
             if (!starts_with(authorisation, "AWS4-HMAC-SHA256") ||
@@ -760,19 +772,25 @@ private:
         }
         if (method == "GET" && starts_with(target, "/v1/services/6F81-5844-456A/skus")) {
             ++gcp_price_reads;
+            if (target.find("pageSize=200") == std::string_view::npos)
+                return {400, "{\"error\":\"unsafe page size\"}"};
+            if (target.find("pageToken=page-2") != std::string_view::npos)
+                return {200,
+                        "{\"skus\":[" +
+                            gcp_sku("G2 Instance Core", "OnDemand", 20'000'000) + ',' +
+                            gcp_sku("G2 Custom Instance Core", "OnDemand", 21'000'000) + ',' +
+                            gcp_sku("G2 Sole Tenancy Instance Core", "OnDemand", 22'000'000) +
+                            ',' + gcp_sku("G2 Instance Ram", "OnDemand", 3'000'000) + ',' +
+                            gcp_sku("G2 Custom Instance Ram", "OnDemand", 4'000'000) + ',' +
+                            gcp_sku("G2 Sole Tenancy Instance Ram", "OnDemand", 5'000'000) + ',' +
+                            gcp_sku("Nvidia L4 GPU", "OnDemand", 500'000'000) + ',' +
+                            gcp_sku("Nvidia L4 GPU", "Commit1Yr", 400'000'000) + "]}"};
             return {200, "{\"skus\":[" + gcp_sku("E2 Instance Core", "OnDemand", 10'000'000) + ',' +
                              gcp_sku("E2 Custom Instance Core", "OnDemand", 11'000'000) + ',' +
                              gcp_sku("E2 Instance Ram", "OnDemand", 2'000'000) + ',' +
                              gcp_sku("E2 Custom Instance Ram", "OnDemand", 3'000'000) + ',' +
-                             gcp_sku("E2 Instance Core", "Commit1Yr", 4'000'000) + ',' +
-                             gcp_sku("G2 Instance Core", "OnDemand", 20'000'000) + ',' +
-                             gcp_sku("G2 Custom Instance Core", "OnDemand", 21'000'000) + ',' +
-                             gcp_sku("G2 Sole Tenancy Instance Core", "OnDemand", 22'000'000) +
-                             ',' + gcp_sku("G2 Instance Ram", "OnDemand", 3'000'000) + ',' +
-                             gcp_sku("G2 Custom Instance Ram", "OnDemand", 4'000'000) + ',' +
-                             gcp_sku("G2 Sole Tenancy Instance Ram", "OnDemand", 5'000'000) + ',' +
-                             gcp_sku("Nvidia L4 GPU", "OnDemand", 500'000'000) + ',' +
-                             gcp_sku("Nvidia L4 GPU", "Commit1Yr", 400'000'000) + "]}"};
+                             gcp_sku("E2 Instance Core", "Commit1Yr", 4'000'000) +
+                             "],\"nextPageToken\":\"page-2\"}"};
         }
         if (method == "GET" && (target.find("%24filter=") != std::string_view::npos ||
                                 target.find("$filter=") != std::string_view::npos)) {
@@ -1359,6 +1377,109 @@ private:
     std::map<std::string, std::string> azure_objects_;
     std::string aws_compute_client_token_;
 };
+
+void transport_limit_tests() {
+    fake_server server;
+
+    const auto expect_body_limit = [](auto action, long status, std::string_view label) {
+        bool caught = false;
+        try {
+            action();
+        } catch (const cloud::error& failure) {
+            caught = true;
+            tst::check(std::string_view(failure.what()).find(
+                           "HTTP response body exceeded the private byte limit") !=
+                           std::string_view::npos &&
+                           failure.http_status() == status && failure.response().size() <= 8 * 1024,
+                       label);
+        }
+        tst::check(caught, label);
+    };
+
+    const auto exact = cloud::gcp::detail::http(
+        cloud::gcp::detail::HttpRequest{}
+            .with_url(server.url() + "/transport-body?bytes=32")
+            .with_max_response_bytes(32));
+    tst::check(exact.body == std::string(32, 'x'), "exact in-memory response limit");
+
+    expect_body_limit(
+        [&] {
+            (void)cloud::gcp::detail::http(
+                cloud::gcp::detail::HttpRequest{}
+                    .with_url(server.url() + "/transport-body?bytes=33")
+                    .with_max_response_bytes(32));
+        },
+        200, "oversized in-memory response rejected explicitly");
+
+    const auto destination = std::filesystem::temp_directory_path() /
+                             ("cloud-h-stream-limit-" + cloud::gcp::detail::random_uuid());
+    cloud::gcp::detail::TemporaryPathGuard destination_guard(destination);
+    cloud::gcp::detail::HttpRequest download;
+    download.url = server.url() + "/transport-body?bytes=64";
+    download.download_file = destination;
+    download.max_response_bytes = 32;
+    (void)cloud::gcp::detail::http(std::move(download));
+    tst::check(cloud::gcp::detail::read_small_file(destination) == std::string(64, 'x'),
+               "successful file response streams beyond memory limit");
+
+    expect_body_limit(
+        [&] {
+            (void)cloud::gcp::detail::http(
+                cloud::gcp::detail::HttpRequest{}.with_url(
+                    server.url() + "/transport-body?bytes=65537&status=500"));
+        },
+        500, "oversized HTTP error response rejected explicitly");
+
+    const auto error_destination = std::filesystem::temp_directory_path() /
+                                   ("cloud-h-error-limit-" +
+                                    cloud::gcp::detail::random_uuid());
+    cloud::gcp::detail::TemporaryPathGuard error_destination_guard(error_destination);
+    {
+        std::ofstream existing(error_destination, std::ios::binary);
+        existing << "sentinel";
+    }
+    const std::string part_prefix = error_destination.filename().string() + ".cloud-part-";
+    expect_body_limit(
+        [&] {
+            cloud::gcp::detail::HttpRequest failed_download;
+            failed_download.url = server.url() + "/transport-body?bytes=65537&status=500";
+            failed_download.download_file = error_destination;
+            (void)cloud::gcp::detail::http(std::move(failed_download));
+        },
+        500, "oversized streamed error response rejected explicitly");
+    tst::check(cloud::gcp::detail::read_small_file(error_destination) == "sentinel",
+               "streamed error preserves existing destination");
+    for (const auto& entry : std::filesystem::directory_iterator(error_destination.parent_path()))
+        tst::check(!starts_with(entry.path().filename().string(), part_prefix),
+                   "streamed error removes temporary file");
+
+    bool header_limit = false;
+    try {
+        (void)cloud::gcp::detail::http(
+            cloud::gcp::detail::HttpRequest{}.with_url(server.url() + "/transport-headers"));
+    } catch (const cloud::error& failure) {
+        header_limit = true;
+        tst::check(std::string_view(failure.what()).find(
+                       "HTTP response headers exceeded the private byte limit") !=
+                       std::string_view::npos &&
+                       failure.http_status() == 200 && failure.response().empty(),
+                   "oversized HTTP headers rejected explicitly");
+    }
+    tst::check(header_limit, "oversized HTTP headers rejected explicitly");
+
+    const auto credential_path = std::filesystem::temp_directory_path() /
+                                 ("cloud-h-credential-limit-" +
+                                  cloud::gcp::detail::random_uuid());
+    cloud::gcp::detail::TemporaryPathGuard credential_guard(credential_path);
+    {
+        std::ofstream credential(credential_path, std::ios::binary);
+        credential << "{\"x\":1}";
+    }
+    (void)cloud::gcp::detail::read_json_file(credential_path, 7);
+    tst::throws<cloud::error>(
+        [&] { (void)cloud::gcp::detail::read_json_file(credential_path, 6); },
+        "credential file byte limit");
+}
 
 void gcp_lifecycle_tests() {
     fake_server server;
@@ -2128,15 +2249,15 @@ void pricing_tests() {
     cloud::client gcp_priced(std::move(gcp_prices));
     tst::check(std::fabs(*gcp_priced.plan(price_spec).estimated_hourly_cost - 0.072) < 1e-12,
                "GCP built-in component price");
-    auto exact_catalog_ceiling = price_spec;
-    exact_catalog_ceiling.resources.max_price_per_hour = 0.072;
-    (void)gcp_priced.plan(exact_catalog_ceiling);
+    auto exact_catalogue_ceiling = price_spec;
+    exact_catalogue_ceiling.resources.max_price_per_hour = 0.072;
+    (void)gcp_priced.plan(exact_catalogue_ceiling);
     auto gcp_l4_price = price_spec;
     gcp_l4_price.resources.gpu = "l4";
     tst::check(std::fabs(*gcp_priced.plan(gcp_l4_price).estimated_hourly_cost - 0.628) < 1e-12,
                "GCP GPU catalogue price ignores custom, sole-tenancy, and commitment SKUs");
     (void)gcp_priced.plan(gcp_l4_price);
-    tst::check(server.gcp_price_reads == 2, "GCP price cache");
+    tst::check(server.gcp_price_reads == 4, "GCP paginated price cache");
 
     auto gcp_bundled_disk_price = price_spec;
     gcp_bundled_disk_price.resources.gpu = "a100";
@@ -2145,7 +2266,7 @@ void pricing_tests() {
     gcp_bundled_disk_price.resources.max_price_per_hour = 100;
     tst::throws<cloud::error>([&] { (void)gcp_priced.plan(gcp_bundled_disk_price); },
                               "GCP bundled Local SSD price ceiling fails closed");
-    tst::check(server.gcp_price_reads == 2,
+    tst::check(server.gcp_price_reads == 4,
                "GCP bundled Local SSD shape skips component catalogue lookup");
 
     cloud::config rich_lookup;
@@ -2538,7 +2659,7 @@ void environment_factory_tests() {
 
 void planning_tests() {
     static_assert(cloud::gcp::version == CLOUD_H_VERSION);
-    static_assert(CLOUD_H_VERSION_NUM == 0x000300);
+    static_assert(CLOUD_H_VERSION_NUM == 0x000301);
     static_assert(std::is_aggregate_v<cloud::resources>);
     static_assert(std::is_aggregate_v<cloud::job_spec>);
 
@@ -2615,6 +2736,30 @@ void planning_tests() {
     for (const std::string_view invalid : {"1.", "1e", "-"})
         tst::throws<cloud::error>([=] { (void)cloud::gcp::detail::parse_json(invalid); },
                                   "malformed JSON number rejected");
+    cloud::gcp::detail::JsonLimits depth_limit;
+    depth_limit.max_depth = 2;
+    (void)cloud::gcp::detail::parse_json("[[0]]", depth_limit);
+    tst::throws<cloud::error>(
+        [&] { (void)cloud::gcp::detail::parse_json("[[[0]]]", depth_limit); },
+        "JSON nesting limit");
+    cloud::gcp::detail::JsonLimits node_limit;
+    node_limit.max_nodes = 3;
+    (void)cloud::gcp::detail::parse_json("[0,1]", node_limit);
+    tst::throws<cloud::error>(
+        [&] { (void)cloud::gcp::detail::parse_json("[0,1,2]", node_limit); },
+        "JSON node limit");
+    cloud::gcp::detail::JsonLimits byte_limit;
+    byte_limit.max_bytes = 3;
+    (void)cloud::gcp::detail::parse_json("[0]", byte_limit);
+    byte_limit.max_bytes = 2;
+    tst::throws<cloud::error>([&] { (void)cloud::gcp::detail::parse_json("[0]", byte_limit); },
+                              "JSON byte limit");
+    tst::throws<cloud::error>(
+        [] {
+            (void)cloud::gcp::detail::unsigned_field(
+                cloud::gcp::detail::parse_json("{\"value\":\"42suffix\"}"), "value");
+        },
+        "unsigned provider field requires complete input consumption");
     tst::check(!cloud::gcp::detail::is_ascii_alnum(static_cast<char>(0xe5)),
                "identifier grammar is ASCII");
     tst::check(cloud::detail::parse_state("QUEUED") == cloud::job_state::queued &&
@@ -2705,6 +2850,7 @@ void planning_tests() {
 int main() {
     return tst::run(
         TST_CASE("plans and validates GCP workloads", planning_tests()),
+        TST_CASE("bounds private provider responses", transport_limit_tests()),
         TST_CASE("constructs clients from the environment", environment_factory_tests()),
         TST_CASE("runs GCP lifecycle, storage, and compute", gcp_lifecycle_tests()),
         TST_CASE("maps the storage facade to AWS S3", aws_storage_tests()),

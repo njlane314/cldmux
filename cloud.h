@@ -24,8 +24,8 @@
 #ifndef NJLANE314_CLOUD_H_INCLUDED
 #define NJLANE314_CLOUD_H_INCLUDED
 
-#define CLOUD_H_VERSION "0.3.0"
-#define CLOUD_H_VERSION_NUM 0x000300
+#define CLOUD_H_VERSION "0.3.1"
+#define CLOUD_H_VERSION_NUM 0x000301
 
 // Dependencies and compile-time contract --------------------------------------
 
@@ -425,15 +425,28 @@ private:
     Value value_;
 };
 
+// Provider control responses are untrusted. These private defaults bound both
+// the input retained for parsing and the tree built from it; callers never need
+// to configure or interact with the wire codec.
+struct JsonLimits {
+    std::size_t max_bytes = 16 * 1024 * 1024;
+    std::size_t max_depth = 64;
+    std::size_t max_nodes = 262'144;
+};
+
 // Strict recursive-descent parser for provider responses. It accepts exactly
-// JSON whitespace/number/string grammar and converts Unicode escapes to UTF-8.
+// JSON whitespace/number/string grammar, converts Unicode escapes to UTF-8, and
+// stops before hostile nesting or collection sizes can exhaust local memory.
 class JsonParser {
 public:
-    explicit JsonParser(std::string_view input) : input_(input) {}
+    explicit JsonParser(std::string_view input, JsonLimits limits = {})
+        : input_(input), limits_(limits) {}
 
     Json parse() {
+        if (input_.size() > limits_.max_bytes)
+            fail("response exceeds byte limit");
         whitespace();
-        Json value = parse_value();
+        Json value = parse_value(0);
         whitespace();
         if (position_ != input_.size())
             fail("trailing characters");
@@ -463,7 +476,12 @@ private:
         return true;
     }
 
-    Json parse_value() {
+    Json parse_value(std::size_t depth) {
+        if (depth > limits_.max_depth)
+            fail("nesting limit exceeded");
+        if (nodes_ == limits_.max_nodes)
+            fail("node limit exceeded");
+        ++nodes_;
         whitespace();
         if (position_ >= input_.size())
             fail("expected value");
@@ -483,9 +501,9 @@ private:
         case '"':
             return Json(parse_string());
         case '[':
-            return parse_array();
+            return parse_array(depth);
         case '{':
-            return parse_object();
+            return parse_object(depth);
         default:
             if (input_[position_] == '-' || is_ascii_digit(input_[position_]))
                 return parse_number();
@@ -634,12 +652,12 @@ private:
         }
     }
 
-    Json parse_array() {
+    Json parse_array(std::size_t depth) {
         return parse_collection(']', "expected ',' or ']'", Json::Array{},
-                                [&](auto& out) { out.push_back(parse_value()); });
+                                [&](auto& out) { out.push_back(parse_value(depth + 1)); });
     }
 
-    Json parse_object() {
+    Json parse_object(std::size_t depth) {
         return parse_collection('}', "expected ',' or '}'", Json::Object{}, [&](auto& out) {
             if (position_ >= input_.size() || input_[position_] != '"')
                 fail("expected object key");
@@ -648,15 +666,19 @@ private:
             if (take() != ':')
                 fail("expected ':'");
             whitespace();
-            out.emplace(std::move(key), parse_value());
+            out.emplace(std::move(key), parse_value(depth + 1));
         });
     }
 
     std::string_view input_;
+    JsonLimits limits_;
     std::size_t position_ = 0;
+    std::size_t nodes_ = 0;
 };
 
-inline Json parse_json(std::string_view text) { return JsonParser(text).parse(); }
+inline Json parse_json(std::string_view text, JsonLimits limits = {}) {
+    return JsonParser(text, limits).parse();
+}
 
 inline std::string field(const Json& value, std::string_view key) {
     const Json* child = value.get(key);
@@ -693,11 +715,11 @@ inline std::uint64_t unsigned_field(const Json& value, std::string_view key) {
     const std::string text = field(value, key);
     if (text.empty())
         return 0;
-    try {
-        return std::stoull(text);
-    } catch (...) {
+    std::uint64_t result = 0;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), result);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size())
         throw Error("Invalid unsigned integer in JSON field '" + std::string(key) + "'");
-    }
+    return result;
 }
 
 inline std::string last_path_segment(std::string value) {
@@ -855,6 +877,9 @@ struct HttpRequest {
     bool no_proxy = false;
     std::optional<std::chrono::milliseconds> timeout;
     std::chrono::milliseconds connect_timeout{10'000};
+    // In-memory responses are deliberately bounded. Successful file downloads
+    // stream without this ceiling; their error bodies remain bounded below.
+    std::size_t max_response_bytes = 16 * 1024 * 1024;
     struct AwsSignature {
         std::string access_key_id;
         std::string secret_access_key;
@@ -908,6 +933,10 @@ struct HttpRequest {
         connect_timeout = value;
         return std::move(*this);
     }
+    HttpRequest&& with_max_response_bytes(std::size_t value) && {
+        max_response_bytes = value;
+        return std::move(*this);
+    }
 };
 
 // Response headers use lowercase names. crc32c is populated only when the
@@ -924,16 +953,26 @@ struct HttpResponse {
 struct WriteSink {
     std::string* text = nullptr;
     std::ofstream* file = nullptr;
+    long* status = nullptr;
+    std::size_t max_response_bytes = 0;
+    std::size_t received = 0;
     bool checksum = false;
     std::uint32_t crc = 0;
     bool io_error = false;
+    bool limit_exceeded = false;
     std::exception_ptr exception;
 };
 
 struct HeaderSink {
     std::map<std::string, std::string, std::less<>>* headers = nullptr;
+    long* status = nullptr;
+    std::size_t received = 0;
+    bool limit_exceeded = false;
     std::exception_ptr exception;
 };
+
+inline constexpr std::size_t max_error_response_bytes = 64 * 1024;
+inline constexpr std::size_t max_response_header_bytes = 256 * 1024;
 
 inline std::size_t header_callback(char* data, std::size_t size, std::size_t count,
                                    void* userdata) noexcept {
@@ -942,7 +981,23 @@ inline std::size_t header_callback(char* data, std::size_t size, std::size_t cou
         if (size != 0 && count > std::numeric_limits<std::size_t>::max() / size)
             return 0;
         const std::size_t bytes = size * count;
+        if (bytes > max_response_header_bytes -
+                        std::min(sink.received, max_response_header_bytes)) {
+            sink.limit_exceeded = true;
+            return 0;
+        }
+        sink.received += bytes;
         std::string_view line(data, bytes);
+        if (starts_with(line, "HTTP/")) {
+            const auto space = line.find(' ');
+            if (space != std::string_view::npos && space + 4 <= line.size() &&
+                is_ascii_digit(line[space + 1]) && is_ascii_digit(line[space + 2]) &&
+                is_ascii_digit(line[space + 3])) {
+                *sink.status = static_cast<long>((line[space + 1] - '0') * 100 +
+                                                 (line[space + 2] - '0') * 10 +
+                                                 (line[space + 3] - '0'));
+            }
+        }
         const auto colon = line.find(':');
         if (colon != std::string_view::npos) {
             std::string name(line.substr(0, colon));
@@ -967,6 +1022,18 @@ inline std::size_t write_callback(char* data, std::size_t size, std::size_t coun
             return 0;
         }
         const std::size_t bytes = size * count;
+        const bool successful = sink.status && *sink.status >= 200 && *sink.status < 300;
+        const bool unlimited_file = sink.file && successful;
+        const std::size_t limit = successful
+                                      ? sink.max_response_bytes
+                                      : std::min(sink.max_response_bytes, max_error_response_bytes);
+        if (!unlimited_file &&
+            bytes > limit - std::min(sink.received, limit)) {
+            sink.limit_exceeded = true;
+            return 0;
+        }
+        if (!unlimited_file)
+            sink.received += bytes;
         if (sink.file) {
             if (bytes > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
                 sink.io_error = true;
@@ -1199,12 +1266,17 @@ inline HttpResponse http(HttpRequest request) {
         if (!output)
             throw Error("Cannot open download destination: " + temporary.string());
     }
-    WriteSink sink{request.download_file ? nullptr : &response.body,
-                   request.download_file ? &output : nullptr,
-                   request.calculate_crc32c || request.expected_crc32c.has_value(), 0};
+    WriteSink sink;
+    sink.text = request.download_file ? nullptr : &response.body;
+    sink.file = request.download_file ? &output : nullptr;
+    sink.status = &response.status;
+    sink.max_response_bytes = request.max_response_bytes;
+    sink.checksum = request.calculate_crc32c || request.expected_crc32c.has_value();
     curl_set(curl.get(), CURLOPT_WRITEFUNCTION, &write_callback);
     curl_set(curl.get(), CURLOPT_WRITEDATA, &sink);
-    HeaderSink header_sink{&response.headers};
+    HeaderSink header_sink;
+    header_sink.headers = &response.headers;
+    header_sink.status = &response.status;
     curl_set(curl.get(), CURLOPT_HEADERFUNCTION, &header_callback);
     curl_set(curl.get(), CURLOPT_HEADERDATA, &header_sink);
 
@@ -1220,6 +1292,15 @@ inline HttpResponse http(HttpRequest request) {
     }
     if (sink.checksum)
         response.crc32c = crc32c_base64(sink.crc);
+
+    if (header_sink.limit_exceeded)
+        throw Error("HTTP response headers exceeded the private byte limit", response.status);
+    if (sink.limit_exceeded) {
+        const std::string retained =
+            sink.text ? sink.text->substr(0, 8 * 1024) : read_small_file(temporary, 8 * 1024);
+        throw Error("HTTP response body exceeded the private byte limit", response.status,
+                    retained);
+    }
 
     const auto callback_error = [&]() -> std::optional<std::string> {
         if (sink.exception)
@@ -1286,9 +1367,9 @@ inline HttpResponse http(HttpRequest request) {
 
 // GCP application default credentials -----------------------------------------
 
-// The default chain is intentionally narrow: explicit bearer-token environment
-// variables, authorised-user ADC JSON, then the metadata server. Service-account
-// key and external-account JSON are left to a caller-supplied token callback.
+// Callers configure fixed bearer tokens or typed callbacks. For compatibility
+// with gcloud, the automatic chain may also read its generated authorised-user
+// ADC file before trying the metadata server; callers never have to author it.
 inline std::string metadata_host() {
     std::string host = env("GCE_METADATA_HOST");
     if (host.empty())
@@ -1351,12 +1432,12 @@ inline AccessToken metadata_token() {
     throw Error("GCP metadata token is unavailable");
 }
 
-inline AccessToken refresh_authorized_user(const Json& json) {
+inline AccessToken refresh_authorised_user(const Json& json) {
     const std::string client_id = field(json, "client_id");
     const std::string client_secret = field(json, "client_secret");
     const std::string refresh_token = field(json, "refresh_token");
     if (client_id.empty() || client_secret.empty() || refresh_token.empty())
-        throw Error("Malformed authorized_user ADC file");
+        throw Error("Malformed authorised-user ADC file");
     const std::string body = "grant_type=refresh_token&client_id=" + encode(client_id) +
                              "&client_secret=" + encode(client_secret) +
                              "&refresh_token=" + encode(refresh_token);
@@ -1391,22 +1472,37 @@ inline std::optional<std::filesystem::path> well_known_adc_path() {
     return std::nullopt;
 }
 
-inline Json read_json_file(const std::filesystem::path& path) {
+inline Json read_json_file(const std::filesystem::path& path,
+                           std::size_t max_bytes = JsonLimits{}.max_bytes) {
     std::ifstream input(path, std::ios::binary);
     if (!input)
         throw Error("Cannot open credential file: " + path.string());
-    std::ostringstream buffer;
-    buffer << input.rdbuf();
-    if (!input.good() && !input.eof())
-        throw Error("Cannot read credential file: " + path.string());
-    return parse_json(buffer.str());
+    std::string document;
+    std::array<char, 8192> buffer{};
+    while (true) {
+        input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
+        const auto count = input.gcount();
+        if (count > 0) {
+            const auto bytes = static_cast<std::size_t>(count);
+            if (bytes > max_bytes - std::min(document.size(), max_bytes))
+                throw Error("Credential file exceeded the private byte limit: " + path.string());
+            document.append(buffer.data(), bytes);
+        }
+        if (input.bad())
+            throw Error("Cannot read credential file: " + path.string());
+        if (input.eof())
+            break;
+        if (count == 0)
+            throw Error("Cannot read credential file: " + path.string());
+    }
+    return parse_json(document);
 }
 
 inline AccessToken token_from_adc_file(const std::filesystem::path& path) {
     const Json json = read_json_file(path);
     const std::string type = field(json, "type");
     if (type == "authorized_user")
-        return refresh_authorized_user(json);
+        return refresh_authorised_user(json);
     throw Error("Unsupported ADC credential type '" + type +
                 "'; inject a token callback for this credential type");
 }
@@ -4841,12 +4937,23 @@ inline std::optional<double> gcp_catalogue_price(const client_state& client,
                               std::nullopt});
 
     std::string page;
+    std::unordered_set<std::string> seen_pages;
+    std::size_t response_bytes = 0;
+    constexpr std::size_t max_catalogue_response_bytes = 256 * 1024 * 1024;
     do {
-        std::string url = endpoint + "/v1/services/6F81-5844-456A/skus?pageSize=5000";
+        // Small pages stay comfortably within the private response/tree limits,
+        // even when individual SKU descriptions contain many pricing tiers.
+        std::string url = endpoint + "/v1/services/6F81-5844-456A/skus?pageSize=200";
         if (!page.empty())
             url += "&pageToken=" + gcp::detail::encode(page);
-        const auto json = gcp::detail::parse_json(
-            call(client, gcp::detail::HttpRequest{}.with_url(std::move(url))).body);
+        const auto response =
+            call(client, gcp::detail::HttpRequest{}.with_url(std::move(url)));
+        if (response.body.size() >
+            max_catalogue_response_bytes -
+                std::min(response_bytes, max_catalogue_response_bytes))
+            throw error("GCP catalogue exceeded the aggregate response byte limit");
+        response_bytes += response.body.size();
+        const auto json = gcp::detail::parse_json(response.body);
         gcp::detail::for_each_json(json, "skus", [&](const gcp::detail::Json& sku) {
             if (!json_array_contains(sku, "serviceRegions", chosen.region))
                 return;
@@ -4882,7 +4989,14 @@ inline std::optional<double> gcp_catalogue_price(const client_state& client,
                 component.unit = price;
             }
         });
-        page = gcp::detail::field(json, "nextPageToken");
+        const std::string next = gcp::detail::field(json, "nextPageToken");
+        if (next.empty()) {
+            page.clear();
+            break;
+        }
+        if (!seen_pages.insert(next).second)
+            throw error("GCP catalogue pagination repeated a page token");
+        page = next;
     } while (!page.empty());
 
     double total = 0;
@@ -5578,17 +5692,19 @@ inline std::vector<log_entry> logs(
             const std::uint64_t start = offsets[key];
             std::string bytes;
             if (length > start) {
+                constexpr std::uint64_t chunk_bytes = 16 * 1024 * 1024;
+                const std::uint64_t end = start + std::min(chunk_bytes, length - start) - 1;
                 const auto response =
                     azure_call(*job.client,
                                gcp::detail::HttpRequest{}
                                    .with_url(azure_batch_url(*job.client, path))
                                    .with_headers({gcp::detail::header(
                                        "ocp-range", "bytes=" + std::to_string(start) + '-' +
-                                                        std::to_string(length - 1))})
+                                                        std::to_string(end))})
                                    .with_accept_json(false),
                                true, deadline);
                 bytes = response.body;
-                const auto expected = length - start;
+                const auto expected = end - start + 1;
                 if (bytes.size() != expected) {
                     if (response.status == 200 && bytes.size() == length && start <= bytes.size())
                         bytes.erase(0, static_cast<std::size_t>(start));
@@ -5596,17 +5712,25 @@ inline std::vector<log_entry> logs(
                         throw error(
                             "Azure Batch task-file range returned an unexpected byte count");
                 }
-                offsets[key] = length;
+                offsets[key] = end + 1;
             }
             std::uint64_t base = start;
             if (!tails[key].empty()) {
+                constexpr std::size_t max_log_line_bytes = 16 * 1024 * 1024;
+                const auto newline = bytes.find('\n');
+                const std::size_t continuation =
+                    newline == std::string::npos ? bytes.size() : newline;
+                if (continuation > max_log_line_bytes ||
+                    tails[key].size() > max_log_line_bytes - continuation)
+                    throw error("Azure Batch log line exceeded the private byte limit");
                 base = tail_offsets[key];
                 bytes.insert(0, tails[key]);
             }
+            const bool stream_final = final && offsets[key] == length;
             std::size_t position = 0;
             while (position < bytes.size()) {
                 const auto end = bytes.find('\n', position);
-                if (end == std::string::npos && !final)
+                if (end == std::string::npos && !stream_final)
                     break;
                 const auto line_length = (end == std::string::npos ? bytes.size() : end) - position;
                 std::string text = bytes.substr(position, line_length);
@@ -5620,7 +5744,10 @@ inline std::vector<log_entry> logs(
                     break;
                 position = end + 1;
             }
-            if (position < bytes.size() && !final) {
+            if (position < bytes.size() && !stream_final) {
+                constexpr std::size_t max_log_line_bytes = 16 * 1024 * 1024;
+                if (bytes.size() - position > max_log_line_bytes)
+                    throw error("Azure Batch log line exceeded the private byte limit");
                 tails[key] = bytes.substr(position);
                 tail_offsets[key] = base + position;
             } else {

@@ -34,14 +34,36 @@ options parse_options(int argc, char* argv[]) {
     return out;
 }
 
+void print_record(std::ostream& output, std::string_view key, std::string_view value) {
+    static constexpr char hex[] = "0123456789abcdef";
+    output << key << '=';
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (c == '\\')
+            output << "\\\\";
+        else if (c == '\n')
+            output << "\\n";
+        else if (c == '\r')
+            output << "\\r";
+        else if (c == '\t')
+            output << "\\t";
+        else if (c < 0x20 || c == 0x7f)
+            output << "\\x" << hex[c >> 4] << hex[c & 0x0f];
+        else
+            output << raw;
+    }
+    output << '\n';
+}
+
 void print_plan(const cloud::plan& plan) {
-    std::cout << "provider: " << plan.provider << '\n'
-              << "region:   " << plan.region << '\n'
-              << "machine:  " << plan.machine_type << '\n';
+    // One KEY=value fact per line keeps output stable for grep, awk, and sed.
+    print_record(std::cout, "provider", plan.provider);
+    print_record(std::cout, "region", plan.region);
+    print_record(std::cout, "machine", plan.machine_type);
     if (plan.estimated_hourly_cost)
-        std::cout << "price:    $" << *plan.estimated_hourly_cost << " per hour\n";
+        std::cout << "hourly_usd=" << *plan.estimated_hourly_cost << '\n';
     for (const auto& warning : plan.warnings)
-        std::cout << "warning:  " << warning << '\n';
+        print_record(std::cout, "warning", warning);
 }
 
 } // namespace
@@ -75,19 +97,19 @@ int main(int argc, char* argv[]) {
         cloud::client routed = client.route(job);
         print_plan(routed.plan(job));
         if (!chosen.submit) {
-            std::cout << "dry run only; pass --submit to run this job\n";
+            print_record(std::cout, "status", "dry-run");
             return 0;
         }
 
         const cloud::result result = routed.run(job).wait(
-            [](const cloud::log_entry& line) { std::cout << line.text << '\n'; });
+            [](const cloud::log_entry& line) { print_record(std::cout, "log", line.text); });
         if (!result.success()) {
-            std::cerr << "job failed: " << result.error() << '\n';
+            print_record(std::cerr, "error", result.error());
             return 1;
         }
         return 0;
     } catch (const std::exception& failure) {
-        std::cerr << "cloud-run: " << failure.what() << '\n';
+        print_record(std::cerr, "error", failure.what());
         return 2;
     }
 }

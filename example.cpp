@@ -38,6 +38,27 @@ options parse_options(int argc, char* argv[]) {
     return result;
 }
 
+void print_record(std::ostream& output, std::string_view key, std::string_view value) {
+    static constexpr char hex[] = "0123456789abcdef";
+    output << key << '=';
+    for (const char raw : value) {
+        const auto c = static_cast<unsigned char>(raw);
+        if (c == '\\')
+            output << "\\\\";
+        else if (c == '\n')
+            output << "\\n";
+        else if (c == '\r')
+            output << "\\r";
+        else if (c == '\t')
+            output << "\\t";
+        else if (c < 0x20 || c == 0x7f)
+            output << "\\x" << hex[c >> 4] << hex[c & 0x0f];
+        else
+            output << raw;
+    }
+    output << '\n';
+}
+
 } // namespace
 
 int main(int argc, char* argv[]) {
@@ -57,11 +78,11 @@ int main(int argc, char* argv[]) {
         spec.name = "simulation-42";
         spec.image = "ghcr.io/example/simulation:latest";
 
-        // Commands are shell-free tokens. The example deliberately uses a small,
-        // line-oriented text configuration rather than requiring user-authored
-        // JSON; both files remain easy to inspect with grep and ordinary tools.
-        spec.command = {"/usr/local/bin/simulate", "--config", "/input/config.txt",
-                        "--output", "/output/result.dat"};
+        // Commands are shell-free tokens. The illustrative input is a small
+        // KEY=value file, and the result is line-oriented text; both remain easy
+        // to inspect with grep and ordinary tools.
+        spec.command = {"/usr/local/bin/simulate", "--config", "/input/parameters.conf",
+                        "--output", "/output/result.txt"};
 
         // A mount names a storage collection rather than one object. Bucket or
         // container roots are the portable intersection: GCP may additionally
@@ -98,43 +119,47 @@ int main(int argc, char* argv[]) {
         // stays on that provider. Passing gcp/aws/azure above is the override.
         cloud::client client = router.route(spec);
         const cloud::plan plan = client.plan(spec);
-        std::cout << "provider: " << plan.provider << '\n'
-                  << "region:   " << plan.region << '\n'
-                  << "machine:  " << plan.machine_type << '\n';
+        // Stable KEY=value records are intentionally friendly to grep, awk,
+        // sed, and shell scripts.
+        print_record(std::cout, "provider", plan.provider);
+        print_record(std::cout, "region", plan.region);
+        print_record(std::cout, "machine", plan.machine_type);
         if (plan.estimated_hourly_cost)
-            std::cout << "price:    $" << *plan.estimated_hourly_cost << " per hour\n";
+            std::cout << "hourly_usd=" << *plan.estimated_hourly_cost << '\n';
+        for (const auto& warning : plan.warnings)
+            print_record(std::cout, "warning", warning);
 
         // Planning may perform read-only catalogue requests, but it never
         // allocates compute. Nothing below runs without the explicit --submit
         // flag because uploads and jobs can consume billable cloud resources.
         if (!chosen.submit) {
-            std::cout << "dry run only; pass --submit after configuring real resources\n";
+            print_record(std::cout, "status", "dry-run");
             return 0;
         }
 
         // cloud:// is resolved by the route: GCS on GCP, S3 on AWS, and Blob
         // Storage on Azure. Uploading before run() makes the same object visible
         // through the input mount without provider-specific application code.
-        client.storage().put_file("cloud://sim-input/config.txt", "./config.txt");
+        client.storage().put_file("cloud://sim-input/parameters.conf", "./parameters.conf");
 
         // The returned job handle owns provider-native polling, cancellation,
         // final log draining, and cleanup. Logging is delivered one line at a
         // time; it is intentionally not presented as a live byte stream.
         const cloud::result result = client.run(spec).wait([](const cloud::log_entry& line) {
-            std::cout << line.text << '\n';
+            print_record(std::cout, "log", line.text);
         });
         if (!result.success()) {
-            std::cerr << "job failed: " << result.error() << '\n';
+            print_record(std::cerr, "error", result.error());
             return 1;
         }
 
         // get_file() downloads to a temporary file, verifies library CRC32C
         // metadata when present, and then replaces the destination. The calling
         // code remains identical for every route.
-        client.storage().get_file("cloud://sim-output/result.dat", "./result.dat");
+        client.storage().get_file("cloud://sim-output/result.txt", "./result.txt");
         return 0;
     } catch (const std::exception& failure) {
-        std::cerr << "example: " << failure.what() << '\n';
+        print_record(std::cerr, "error", failure.what());
         return 2;
     }
 }

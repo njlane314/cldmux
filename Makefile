@@ -16,8 +16,13 @@ check: example examples
 	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. -isystem "$(TST_DIR)" \
 		test.cpp $(CURL_FLAGS) -pthread -o $(TEST)
 	$(TEST)
-	env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project CLOUD_GCP_REGION=europe-west4 \
-		$(RUN_EXAMPLE) gcp
+	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
+		CLOUD_GCP_REGION=europe-west4 $(RUN_EXAMPLE) gcp)"; \
+		printf '%s\n' "$$output"; \
+		printf '%s\n' "$$output" | grep -q '^provider=gcp$$'; \
+		printf '%s\n' "$$output" | grep -q '^region=europe-west4$$'; \
+		printf '%s\n' "$$output" | grep -q '^machine=e2-standard-4$$'; \
+		! printf '%s\n' "$$output" | grep -Ev '^[a-z_]+=.*$$'
 	@env -i PATH="$(PATH)" CLOUD_AWS_JOB_QUEUE=test-queue CLOUD_AWS_REGION=eu-west-1 \
 		$(RUN_EXAMPLE) aws >/dev/null
 	@env -i PATH="$(PATH)" CLOUD_AZURE_BATCH_ENDPOINT=https://test.westeurope.batch.azure.com \
@@ -26,6 +31,11 @@ check: example examples
 	@status=0; env -i PATH="$(PATH)" $(RUN_EXAMPLE) >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
 	@status=0; $(RUN_EXAMPLE) gcp extra >/dev/null 2>&1 || status=$$?; test $$status -eq 2
+	@status=0; bad="$$(printf 'bad\nprovider')"; \
+		output="$$( $(RUN_EXAMPLE) "$$bad" 2>&1)" || status=$$?; \
+		test $$status -eq 2; \
+		test "$$(printf '%s\n' "$$output" | wc -l | tr -d ' ')" -eq 1; \
+		printf '%s\n' "$$output" | grep -Fq '\n'
 	@status=0; $(RUN_EXAMPLE) gcp --submit --submit >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
 
