@@ -1,9 +1,9 @@
 # CLOUD
 
 [![Build](https://github.com/njlane314/cloud/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/njlane314/cloud/actions/workflows/ci.yml)
-![C++20](https://img.shields.io/badge/C%2B%2B-20-00599C)
+![C++17 to C++26](https://img.shields.io/badge/C%2B%2B-17%20to%2026-00599C)
 
-`cloud.h` is one C++20 header for running a container on temporary cloud
+`cloud.h` is one C++17-or-newer header for running a container on temporary cloud
 compute:
 
 Version 0.2 intentionally renames the sole public header from `cloud.hpp` to
@@ -30,30 +30,17 @@ out to provider CLIs.
 
 #include <chrono>
 #include <iostream>
-#include <optional>
 
 int main() {
     auto client = cloud::client::from_environment("cheapest");
-    const cloud::job_spec job{
-        .name = "hello-cloud",
-        .image = "ubuntu:24.04",
-        .command = {"/bin/echo", "hello"},
-        .workdir = {},
-        .service_account = {},
-        .mounts = {},
-        .resources =
-            {
-                .cpus = 4,
-                .memory_gb = 16,
-                .gpu = {},
-                .gpu_count = 1,
-                .spot = false,
-                .max_price_per_hour = std::nullopt,
-            },
-        .retries = 1,
-        .auto_delete = true,
-        .timeout = std::chrono::minutes(15),
-    };
+    cloud::job_spec job;
+    job.name = "hello-cloud";
+    job.image = "ubuntu:24.04";
+    job.command = {"/bin/echo", "hello"};
+    job.resources.cpus = 4;
+    job.resources.memory_gb = 16;
+    job.retries = 1;
+    job.timeout = std::chrono::minutes(15);
 
     const auto selected = client.plan(job);
     std::cout << selected.provider << ' ' << selected.region << ' '
@@ -64,7 +51,7 @@ int main() {
 Build with:
 
 ```sh
-c++ -std=c++20 -I. examples/run.cpp -lcurl -pthread -o cloud-run
+c++ -std=c++17 -I. examples/run.cpp -lcurl -pthread -o cloud-run
 ```
 
 The header is fully inline; do not define an implementation macro. The
@@ -144,14 +131,13 @@ queue whose compute environment contains only that model, plus the exact EC2
 type used for planning and prices:
 
 ```cpp
-config.aws.gpu_targets["l4"] = {
-    .job_queue = "arn:aws:batch:...:job-queue/l4",
-    .spot_job_queue = "arn:aws:batch:...:job-queue/l4-spot",
-    .machine_type = "g6.xlarge",
-    .cpus = 4,
-    .memory_gb = 16,
-    .gpus = 1,
-};
+auto& target = config.aws.gpu_targets["l4"];
+target.job_queue = "arn:aws:batch:...:job-queue/l4";
+target.spot_job_queue = "arn:aws:batch:...:job-queue/l4-spot";
+target.machine_type = "g6.xlarge";
+target.cpus = 4;
+target.memory_gb = 16;
+target.gpus = 1;
 ```
 
 Azure uses a one-node job-lifetime auto-pool:
@@ -372,19 +358,42 @@ optimisers. Provider-specific regions can be supplied directly. Multi-provider
 selection can give each backend its own location through `config.regions` and,
 for AWS Spot observations, `config.zones`.
 
+## C++ COMPATIBILITY
+
+C++17 is the minimum language version. The same public interface is checked in
+C++17, C++20, C++23, and C++26 modes; later modes do not enable a different API.
+The C++26 check verifies source compatibility with the evolving compiler mode,
+not that a compiler implements every C++26 library facility.
+
+The local C++26 target tries `-std=c++26` and then the older `-std=c++2c`
+spelling. It reports a skip when the selected compiler supports neither; choose
+a particular spelling with, for example,
+`make check-c++26 CXX26_STANDARD=c++2c`. CI uses Clang 18's `-std=c++2c` mode,
+so the C++26 check is required there rather than skipped.
+
 ## TEST
 
 ```sh
 make example
 make examples
 make check
+make check-c++20
+make check-c++23
+make check-c++26
+make check-standards
 make sanitize
 ```
 
-The test cases use the sibling [`tst`](https://github.com/njlane314/tst)
-single-header library and an in-process loopback fake server. They make no cloud
-API calls, need no credentials, and cannot incur cloud charges. Override
-`TST_DIR` when the header is not checked out at `../tst`.
+`make check` uses the C++17 baseline. `make check-standards` checks every
+supported language mode with the selected compiler; its C++26 step follows the
+graceful probing behaviour described above.
+
+In C++20 and newer modes, the test cases use the sibling
+[`tst`](https://github.com/njlane314/tst) single-header library. C++17 uses a
+small test-only fallback because `tst` uses C++20's `std::source_location`.
+Every mode uses the same cases and an in-process loopback fake server. They make
+no cloud API calls, need no credentials, and cannot incur cloud charges.
+Override `TST_DIR` when the header is not checked out at `../tst`.
 
 ## LICENSE
 

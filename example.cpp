@@ -45,50 +45,45 @@ int main(int argc, char* argv[]) {
     // Commands are passed as tokens, never through a shell. For GCP the first
     // token becomes the entrypoint; AWS and Azure preserve the image ENTRYPOINT
     // and pass these tokens as its command arguments.
-    cloud::job_spec spec{
-        .name = "simulation-42",
-        .image = "ghcr.io/example/simulation:latest",
-        .command = {"/usr/local/bin/simulate", "--config", "/input/config.json", "--output",
-                    "/output/result.json"},
-        .workdir = {},
+    // Ordinary member assignment makes the example valid in C++17 as well as
+    // every newer standard. The structures remain aggregates, so applications
+    // compiled as C++20 or later may use designated initialisers if preferred.
+    cloud::job_spec spec;
+    spec.name = "simulation-42";
+    spec.image = "ghcr.io/example/simulation:latest";
+    spec.command = {"/usr/local/bin/simulate", "--config", "/input/config.json", "--output",
+                    "/output/result.json"};
 
-        // GCP can run the container as a dedicated service account. The
-        // controller identity must be allowed to act as this account.
-        .service_account = "batch-runner@physics-project.iam.gserviceaccount.com",
+    // GCP can run the container as a dedicated service account. The controller
+    // identity must be allowed to act as this account.
+    spec.service_account = "batch-runner@physics-project.iam.gserviceaccount.com";
 
-        // cloud:// mounts currently map to GCS prefixes. The trailing slash is
-        // intentional: a mount names a directory-like prefix, not one object.
-        // The final boolean marks the input mount read-only.
-        .mounts =
-            {
-                {"cloud://sim-input/run-42/", "/input", true},
-                {"cloud://sim-output/run-42/", "/output"},
-            },
-
-        // The planner chooses the smallest supported native shape. Set gpu to
-        // t4, l4, a10, a100, or h100 to request an accelerator. AWS GPU jobs
-        // additionally need a dedicated queue mapping in config.aws.gpu_targets.
-        .resources =
-            {
-                .cpus = 4,
-                .memory_gb = 16,
-                .gpu = {},
-                .gpu_count = 1,
-                .spot = true,
-
-                // A ceiling fails closed if no trustworthy estimate exists.
-                // It is omitted here because public lookup is disabled above.
-                .max_price_per_hour = std::nullopt,
-            },
-
-        // Retries are delegated to the provider's Batch service. auto_delete
-        // removes the GCP/Azure job record after the terminal logs are drained;
-        // AWS retains its terminal record but deregisters the temporary job
-        // definition.
-        .retries = 2,
-        .auto_delete = true,
-        .timeout = std::chrono::hours(2),
+    // cloud:// mounts currently map to GCS prefixes. The trailing slash is
+    // intentional: a mount names a directory-like prefix, not one object.
+    // The final boolean marks the input mount read-only.
+    spec.mounts = {
+        {"cloud://sim-input/run-42/", "/input", true},
+        {"cloud://sim-output/run-42/", "/output"},
     };
+
+    // The planner chooses the smallest supported native shape. Set gpu to t4,
+    // l4, a10, a100, or h100 to request an accelerator. AWS GPU jobs
+    // additionally need a dedicated queue mapping in config.aws.gpu_targets.
+    spec.resources.cpus = 4;
+    spec.resources.memory_gb = 16;
+    spec.resources.gpu_count = 1;
+    spec.resources.spot = true;
+
+    // A ceiling fails closed if no trustworthy estimate exists. It is omitted
+    // here because public lookup is disabled above.
+    spec.resources.max_price_per_hour = std::nullopt;
+
+    // Retries are delegated to the provider's Batch service. auto_delete
+    // removes the GCP/Azure job record after the terminal logs are drained; AWS
+    // retains its terminal record but deregisters the temporary job definition.
+    spec.retries = 2;
+    spec.auto_delete = true;
+    spec.timeout = std::chrono::hours(2);
 
     // Planning validates the entire request and resolves a concrete region,
     // machine type, accelerator, and optional hourly estimate. It never

@@ -53,26 +53,21 @@ int main(int argc, char* argv[]) {
         // "cheapest" compares every configured provider. Supplying gcp, aws,
         // or azure is the explicit override; the job itself does not change.
         cloud::client client = cloud::client::from_environment(chosen.provider);
-        const cloud::job_spec job{
-            .name = "hello-cloud",
-            .image = "ubuntu:24.04",
-            .command = {"/bin/echo", "hello"},
-            .workdir = {},
-            .service_account = {},
-            .mounts = {},
-            .resources =
-                {
-                    .cpus = 4,
-                    .memory_gb = 16,
-                    .gpu = {},
-                    .gpu_count = 1,
-                    .spot = false,
-                    .max_price_per_hour = std::nullopt,
-                },
-            .retries = 1,
-            .auto_delete = true,
-            .timeout = std::chrono::minutes(15),
-        };
+
+        // Member assignment keeps this portable to C++17. C++20 and newer
+        // callers may still use designated initialisers for these aggregates.
+        cloud::job_spec job;
+        job.name = "hello-cloud";
+        job.image = "ubuntu:24.04";
+        job.command = {"/bin/echo", "hello"};
+        job.resources.cpus = 4;
+        job.resources.memory_gb = 16;
+        job.resources.gpu_count = 1;
+        job.resources.spot = false;
+        job.resources.max_price_per_hour = std::nullopt;
+        job.retries = 1;
+        job.auto_delete = true;
+        job.timeout = std::chrono::minutes(15);
 
         print_plan(client.plan(job));
         if (!chosen.submit) {

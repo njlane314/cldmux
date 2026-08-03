@@ -1,5 +1,5 @@
-// cloud.h - small, direct cloud jobs for C++20.
-// C++20, libcurl >= 7.84, and nothing else. Link with: -lcurl -pthread
+// cloud.h - small, direct cloud jobs for C++17 and newer.
+// C++17, libcurl >= 7.84, and nothing else. Link with: -lcurl -pthread
 //
 // GCP, AWS, and Azure Batch run one container job, expose its logs, and clean
 // up the controller resources. GCS storage and raw GCE controls are included.
@@ -263,6 +263,18 @@ inline bool is_ascii_space(char c) { return c == ' ' || (c >= '\t' && c <= '\r')
 inline bool is_json_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
 inline char ascii_lower(char c) {
     return is_ascii_upper(c) ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
+// std::basic_string[_view]::starts_with()/ends_with() arrived in C++20. Keep
+// their small, allocation-free equivalents private so every supported language
+// mode follows exactly the same path.
+inline bool starts_with(std::string_view value, std::string_view prefix) noexcept {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+inline bool ends_with(std::string_view value, std::string_view suffix) noexcept {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
 }
 
 inline std::string trim(std::string value) {
@@ -848,6 +860,50 @@ struct HttpRequest {
         std::string service;
     };
     std::optional<AwsSignature> aws_signature;
+
+    // These rvalue-qualified setters keep request construction readable without
+    // requiring C++20 designated initialisers. HttpRequest is an implementation
+    // detail, so the public aggregate-based API remains unchanged.
+    HttpRequest&& with_method(std::string value) && {
+        method = std::move(value);
+        return std::move(*this);
+    }
+    HttpRequest&& with_url(std::string value) && {
+        url = std::move(value);
+        return std::move(*this);
+    }
+    HttpRequest&& with_headers(std::vector<std::string> value) && {
+        headers = std::move(value);
+        return std::move(*this);
+    }
+    HttpRequest&& with_body(std::string value) && {
+        body = std::move(value);
+        return std::move(*this);
+    }
+    HttpRequest&& with_upload_file(std::shared_ptr<UploadSource> value) && {
+        upload_file = std::move(value);
+        return std::move(*this);
+    }
+    HttpRequest&& with_calculate_crc32c(bool value) && {
+        calculate_crc32c = value;
+        return std::move(*this);
+    }
+    HttpRequest&& with_accept_json(bool value) && {
+        accept_json = value;
+        return std::move(*this);
+    }
+    HttpRequest&& with_no_proxy(bool value) && {
+        no_proxy = value;
+        return std::move(*this);
+    }
+    HttpRequest&& with_timeout(std::chrono::milliseconds value) && {
+        timeout = value;
+        return std::move(*this);
+    }
+    HttpRequest&& with_connect_timeout(std::chrono::milliseconds value) && {
+        connect_timeout = value;
+        return std::move(*this);
+    }
 };
 
 // Response headers use lowercase names. crc32c is populated only when the
@@ -1223,7 +1279,7 @@ inline std::string metadata_host() {
     std::string host = env("GCE_METADATA_HOST");
     if (host.empty())
         host = "metadata.google.internal";
-    if (host.starts_with("http://") || host.starts_with("https://"))
+    if (starts_with(host, "http://") || starts_with(host, "https://"))
         return base_url(host);
     return "http://" + host;
 }
@@ -1232,14 +1288,14 @@ inline std::optional<std::string>
 metadata_get(std::string_view path,
              std::chrono::milliseconds timeout = std::chrono::milliseconds(800)) {
     try {
-        auto response = http(HttpRequest{
-            .method = "GET",
-            .url = metadata_host() + "/computeMetadata/v1/" + std::string(path),
-            .headers = {"Metadata-Flavor: Google"},
-            .no_proxy = true,
-            .timeout = timeout,
-            .connect_timeout = std::min(timeout, std::chrono::milliseconds(300)),
-        });
+        auto response =
+            http(HttpRequest{}
+                     .with_method("GET")
+                     .with_url(metadata_host() + "/computeMetadata/v1/" + std::string(path))
+                     .with_headers({"Metadata-Flavor: Google"})
+                     .with_no_proxy(true)
+                     .with_timeout(timeout)
+                     .with_connect_timeout(std::min(timeout, std::chrono::milliseconds(300))));
         if (response.status == 200)
             return trim(std::move(response.body));
     } catch (...) {
@@ -1250,15 +1306,15 @@ metadata_get(std::string_view path,
 inline AccessToken metadata_token() {
     for (int attempt = 0; attempt < 3; ++attempt) {
         try {
-            auto response = http(HttpRequest{
-                .method = "GET",
-                .url =
-                    metadata_host() + "/computeMetadata/v1/instance/service-accounts/default/token",
-                .headers = {"Metadata-Flavor: Google"},
-                .no_proxy = true,
-                .timeout = std::chrono::milliseconds(1500),
-                .connect_timeout = std::chrono::milliseconds(300),
-            });
+            auto response =
+                http(HttpRequest{}
+                         .with_method("GET")
+                         .with_url(metadata_host() +
+                                   "/computeMetadata/v1/instance/service-accounts/default/token")
+                         .with_headers({"Metadata-Flavor: Google"})
+                         .with_no_proxy(true)
+                         .with_timeout(std::chrono::milliseconds(1500))
+                         .with_connect_timeout(std::chrono::milliseconds(300)));
             if (response.status == 200) {
                 const Json json = parse_json(response.body);
                 const std::string token = field(json, "access_token");
@@ -1290,13 +1346,12 @@ inline AccessToken refresh_authorized_user(const Json& json) {
     const std::string body = "grant_type=refresh_token&client_id=" + encode(client_id) +
                              "&client_secret=" + encode(client_secret) +
                              "&refresh_token=" + encode(refresh_token);
-    auto response = http(HttpRequest{
-        .method = "POST",
-        .url = "https://oauth2.googleapis.com/token",
-        .headers = {"Content-Type: application/x-www-form-urlencoded"},
-        .body = body,
-        .timeout = std::chrono::milliseconds(30'000),
-    });
+    auto response = http(HttpRequest{}
+                             .with_method("POST")
+                             .with_url("https://oauth2.googleapis.com/token")
+                             .with_headers({"Content-Type: application/x-www-form-urlencoded"})
+                             .with_body(body)
+                             .with_timeout(std::chrono::milliseconds(30'000)));
     if (response.status < 200 || response.status >= 300)
         throw Error("OAuth token refresh failed", response.status, response.body);
     const Json token_json = parse_json(response.body);
@@ -1470,9 +1525,9 @@ public:
 
 private:
     void validate_endpoint(const std::string& endpoint, std::string_view option_name) const {
-        if (endpoint.starts_with("https://"))
+        if (starts_with(endpoint, "https://"))
             return;
-        if (endpoint.starts_with("http://") && config.allow_insecure_http)
+        if (starts_with(endpoint, "http://") && config.allow_insecure_http)
             return;
         throw Error("Config::" + std::string(option_name) +
                     " must use HTTPS (or set allow_insecure_http explicitly)");
@@ -1495,27 +1550,26 @@ private:
 };
 
 inline Object parse_object(const Json& json) {
-    return Object{
-        .name = field(json, "name"),
-        .generation = field(json, "generation"),
-        .size = unsigned_field(json, "size"),
-        .content_type = field(json, "contentType"),
-        .updated = field(json, "updated"),
-        .etag = field(json, "etag"),
-        .crc32c = field(json, "crc32c"),
-        .md5_hash = field(json, "md5Hash"),
-    };
+    Object result;
+    result.name = field(json, "name");
+    result.generation = field(json, "generation");
+    result.size = unsigned_field(json, "size");
+    result.content_type = field(json, "contentType");
+    result.updated = field(json, "updated");
+    result.etag = field(json, "etag");
+    result.crc32c = field(json, "crc32c");
+    result.md5_hash = field(json, "md5Hash");
+    return result;
 }
 
 inline Instance parse_instance(const Json& json) {
-    Instance result{
-        .id = field(json, "id"),
-        .name = field(json, "name"),
-        .zone = last_path_segment(field(json, "zone")),
-        .machine_type = last_path_segment(field(json, "machineType")),
-        .status = field(json, "status"),
-        .creation_timestamp = field(json, "creationTimestamp"),
-    };
+    Instance result;
+    result.id = field(json, "id");
+    result.name = field(json, "name");
+    result.zone = last_path_segment(field(json, "zone"));
+    result.machine_type = last_path_segment(field(json, "machineType"));
+    result.status = field(json, "status");
+    result.creation_timestamp = field(json, "creationTimestamp");
     for_each_json(json, "networkInterfaces", [&](const Json& interface) {
         if (result.internal_ip.empty())
             result.internal_ip = field(interface, "networkIP");
@@ -1563,12 +1617,10 @@ public:
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
 
     [[nodiscard]] Object stat(std::string_view object) const {
-        return detail::parse_object(core_->json(detail::HttpRequest{
-            .url =
-                storage("/storage/v1/b/" + detail::encode(name_) + "/o/" + detail::encode(object) +
-                        "?fields=name%2Cgeneration%2Csize%2CcontentType%2Cupdated%2Cetag%2Ccrc32c%"
-                        "2Cmd5Hash"),
-        }));
+        return detail::parse_object(core_->json(detail::HttpRequest{}.with_url(
+            storage("/storage/v1/b/" + detail::encode(name_) + "/o/" + detail::encode(object) +
+                    "?fields=name%2Cgeneration%2Csize%2CcontentType%2Cupdated%2Cetag%2Ccrc32c%"
+                    "2Cmd5Hash"))));
     }
 
     [[nodiscard]] ObjectList list(ListOptions options = {}) const {
@@ -1585,9 +1637,8 @@ public:
                     query += "&versions=true";
                 if (!page.empty())
                     query += "&pageToken=" + detail::encode(page);
-                return core_->json(detail::HttpRequest{
-                    .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o" + query),
-                });
+                return core_->json(detail::HttpRequest{}.with_url(
+                    storage("/storage/v1/b/" + detail::encode(name_) + "/o" + query)));
             },
             detail::parse_object,
             [&](const detail::Json& json) {
@@ -1601,12 +1652,12 @@ public:
     [[nodiscard]] Object put(std::string_view object, std::string_view bytes,
                              PutOptions options = {}) const {
         const std::string checksum = options.crc32c ? detail::crc32c(bytes) : std::string{};
-        Object result = detail::parse_object(core_->json(detail::HttpRequest{
-            .method = "POST",
-            .url = upload_url(object, options),
-            .headers = upload_headers(options, checksum),
-            .body = std::string(bytes),
-        }));
+        Object result =
+            detail::parse_object(core_->json(detail::HttpRequest{}
+                                                 .with_method("POST")
+                                                 .with_url(upload_url(object, options))
+                                                 .with_headers(upload_headers(options, checksum))
+                                                 .with_body(std::string(bytes))));
         if (!checksum.empty() && checksum != result.crc32c)
             throw Error("Cloud Storage upload checksum mismatch");
         return result;
@@ -1616,13 +1667,13 @@ public:
                                   PutOptions options = {}) const {
         const auto upload = detail::prepare_upload(source, options.crc32c);
         const std::string& checksum = upload->crc32c;
-        Object result = detail::parse_object(core_->json(detail::HttpRequest{
-            .method = "POST",
-            .url = upload_url(object, options),
-            .headers = upload_headers(options, checksum),
-            .upload_file = upload,
-            .timeout = core_->config.transfer_timeout,
-        }));
+        Object result =
+            detail::parse_object(core_->json(detail::HttpRequest{}
+                                                 .with_method("POST")
+                                                 .with_url(upload_url(object, options))
+                                                 .with_headers(upload_headers(options, checksum))
+                                                 .with_upload_file(upload)
+                                                 .with_timeout(core_->config.transfer_timeout)));
         if (!checksum.empty() && checksum != result.crc32c)
             throw Error("Cloud Storage upload checksum mismatch");
         return result;
@@ -1651,11 +1702,8 @@ public:
             query = "?generation=" + detail::encode(*generation) +
                     "&ifGenerationMatch=" + detail::encode(*generation);
         }
-        core_->call(detail::HttpRequest{
-            .method = "DELETE",
-            .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o/" +
-                           detail::encode(object) + query),
-        });
+        core_->call(detail::HttpRequest{}.with_method("DELETE").with_url(storage(
+            "/storage/v1/b/" + detail::encode(name_) + "/o/" + detail::encode(object) + query)));
     }
 
 private:
@@ -1696,13 +1744,13 @@ private:
         std::string query = "?alt=media";
         if (verify)
             query += "&generation=" + detail::encode(metadata.generation);
-        detail::HttpRequest request{
-            .url = storage("/download/storage/v1/b/" + detail::encode(name_) + "/o/" +
-                           detail::encode(object) + query),
-            .headers = {"Accept-Encoding: gzip"},
-            .calculate_crc32c = verify,
-            .accept_json = false,
-        };
+        detail::HttpRequest request =
+            detail::HttpRequest{}
+                .with_url(storage("/download/storage/v1/b/" + detail::encode(name_) + "/o/" +
+                                  detail::encode(object) + query))
+                .with_headers({"Accept-Encoding: gzip"})
+                .with_calculate_crc32c(verify)
+                .with_accept_json(false);
         configure(request, metadata);
         auto response = core_->call(std::move(request));
         if (verify && response.crc32c != metadata.crc32c)
@@ -1743,11 +1791,11 @@ public:
                 throw Error("Timed out waiting for Compute operation '" + name_ + "'");
             const auto remaining =
                 std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
-            const detail::Json json = core_->json(detail::HttpRequest{
-                .url = core_->compute_url(zone_, "/operations/" + detail::encode(name_)),
-                .timeout = std::max(std::chrono::milliseconds(1),
-                                    std::min(core_->config.timeout, remaining)),
-            });
+            const detail::Json json = core_->json(
+                detail::HttpRequest{}
+                    .with_url(core_->compute_url(zone_, "/operations/" + detail::encode(name_)))
+                    .with_timeout(std::max(std::chrono::milliseconds(1),
+                                           std::min(core_->config.timeout, remaining))));
             if (detail::field(json, "status") == "DONE") {
                 const std::string failure = detail::operation_error(json);
                 if (!failure.empty())
@@ -1783,7 +1831,7 @@ public:
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
 
     [[nodiscard]] Instance get() const {
-        return detail::parse_instance(core_->json(detail::HttpRequest{.url = instance_url()}));
+        return detail::parse_instance(core_->json(detail::HttpRequest{}.with_url(instance_url())));
     }
 
     [[nodiscard]] std::string status() const { return get().status; }
@@ -1813,15 +1861,14 @@ private:
         std::string url = instance_url();
         if (deleting) {
             url += "?requestId=" + detail::random_uuid();
-        } else if (action.starts_with("stop?")) {
+        } else if (detail::starts_with(action, "stop?")) {
             url += "/" + action;
         } else {
             url += "/" + action + "?requestId=" + detail::random_uuid();
         }
-        const detail::Json json = core_->json(detail::HttpRequest{
-            .method = deleting ? "DELETE" : "POST",
-            .url = std::move(url),
-        });
+        const detail::Json json = core_->json(detail::HttpRequest{}
+                                                  .with_method(deleting ? "DELETE" : "POST")
+                                                  .with_url(std::move(url)));
         return Operation(core_, detail::field(json, "name"), core_->zone());
     }
 
@@ -1843,18 +1890,18 @@ public:
                                                  std::string instance_template) const {
         if (name.empty() || instance_template.empty())
             throw Error("VM name and instance template must not be empty");
-        if (!instance_template.starts_with("projects/") &&
-            !instance_template.starts_with("global/"))
+        if (!detail::starts_with(instance_template, "projects/") &&
+            !detail::starts_with(instance_template, "global/"))
             instance_template = "global/instanceTemplates/" + instance_template;
         const std::string request_id = detail::random_uuid();
-        const detail::Json json = core_->json(detail::HttpRequest{
-            .method = "POST",
-            .url = core_->compute_url(core_->zone(), "/instances?sourceInstanceTemplate=" +
-                                                         detail::encode(instance_template) +
-                                                         "&requestId=" + request_id),
-            .headers = {"Content-Type: application/json"},
-            .body = "{\"name\":" + detail::json_quote(name) + "}",
-        });
+        const detail::Json json = core_->json(
+            detail::HttpRequest{}
+                .with_method("POST")
+                .with_url(core_->compute_url(core_->zone(), "/instances?sourceInstanceTemplate=" +
+                                                                detail::encode(instance_template) +
+                                                                "&requestId=" + request_id))
+                .with_headers({"Content-Type: application/json"})
+                .with_body("{\"name\":" + detail::json_quote(name) + "}"));
         return Operation(core_, detail::field(json, "name"), core_->zone());
     }
 
@@ -1865,9 +1912,8 @@ public:
                 std::string query = "?maxResults=500";
                 if (!page.empty())
                     query += "&pageToken=" + detail::encode(page);
-                return core_->json(detail::HttpRequest{
-                    .url = core_->compute_url(core_->zone(), "/instances" + query),
-                });
+                return core_->json(detail::HttpRequest{}.with_url(
+                    core_->compute_url(core_->zone(), "/instances" + query)));
             },
             detail::parse_instance, [](const detail::Json&) {});
     }
@@ -2212,7 +2258,7 @@ inline uri parse_uri(std::string_view value, std::string_view operation = {}) {
     // storage implementation currently consumes it. Object operations require a
     // key; list and mount operations may address the bucket root.
     constexpr std::string_view prefix = "cloud://";
-    if (!value.starts_with(prefix))
+    if (!gcp::detail::starts_with(value, prefix))
         throw error("Cloud URI must start with cloud://");
     value.remove_prefix(prefix.size());
     const auto slash = value.find('/');
@@ -2298,7 +2344,7 @@ inline provider selected_provider(const config& cfg, std::vector<std::string>* w
 inline std::string canonical_gpu(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), gcp::detail::ascii_lower);
     for (const std::string_view prefix : {std::string_view("nvidia-"), std::string_view("tesla-")})
-        if (value.starts_with(prefix))
+        if (gcp::detail::starts_with(value, prefix))
             value.erase(0, prefix.size());
     if (value == "t4" || value == "l4" || value == "a10" || value == "a100" || value == "h100")
         return value;
@@ -2317,15 +2363,63 @@ inline unsigned positive_environment_integer(std::string_view name) {
     return value;
 }
 
+// Floating-point from_chars is part of C++17, but arrived late in several
+// otherwise useful C++17 standard libraries. Validate the same narrow decimal
+// grammar first, then parse with the fixed classic locale supplied since C++98.
+inline std::optional<double> parse_decimal(std::string_view text) {
+    std::size_t position = 0;
+    if (position < text.size() && text[position] == '-')
+        ++position;
+    bool has_digit = false;
+    bool has_nonzero_digit = false;
+    while (position < text.size() && gcp::detail::is_ascii_digit(text[position])) {
+        has_digit = true;
+        has_nonzero_digit = has_nonzero_digit || text[position] != '0';
+        ++position;
+    }
+    if (position < text.size() && text[position] == '.') {
+        ++position;
+        while (position < text.size() && gcp::detail::is_ascii_digit(text[position])) {
+            has_digit = true;
+            has_nonzero_digit = has_nonzero_digit || text[position] != '0';
+            ++position;
+        }
+    }
+    if (!has_digit)
+        return std::nullopt;
+    if (position < text.size() && (text[position] == 'e' || text[position] == 'E')) {
+        ++position;
+        if (position < text.size() && (text[position] == '+' || text[position] == '-'))
+            ++position;
+        const std::size_t exponent = position;
+        while (position < text.size() && gcp::detail::is_ascii_digit(text[position]))
+            ++position;
+        if (position == exponent)
+            return std::nullopt;
+    }
+    if (position != text.size())
+        return std::nullopt;
+
+    std::istringstream input{std::string(text)};
+    input.imbue(std::locale::classic());
+    double value = 0;
+    input >> std::noskipws >> value;
+    // Stream range reporting for subnormal values varied across early C++17
+    // libraries. Such prices and resource quantities are not useful here, so
+    // reject every range failure and subnormal consistently.
+    if (!input || input.rdbuf()->sgetc() != std::char_traits<char>::eof() ||
+        !std::isfinite(value) || std::fpclassify(value) == FP_SUBNORMAL ||
+        (value == 0 && has_nonzero_digit))
+        return std::nullopt;
+    return value;
+}
+
 inline double positive_environment_decimal(std::string_view name) {
     const std::string text = gcp::detail::env(name);
-    double value = 0;
-    const auto [end, code] =
-        std::from_chars(text.data(), text.data() + text.size(), value, std::chars_format::general);
-    if (text.empty() || code != std::errc{} || end != text.data() + text.size() ||
-        !std::isfinite(value) || !(value > 0))
+    const auto value = parse_decimal(text);
+    if (!value || !(*value > 0))
         throw error(std::string(name) + " must be a positive decimal number");
-    return value;
+    return *value;
 }
 
 inline void environment_locations(config& out) {
@@ -2374,14 +2468,14 @@ inline void environment_aws_gpu_target(config& out) {
         throw error("AWS GPU environment configuration requires a model, machine type, CPU, "
                     "memory, GPU count, and at least one queue");
     const std::string canonical = canonical_gpu(model);
-    out.aws.gpu_targets[canonical] = {
-        .job_queue = queue,
-        .spot_job_queue = spot_queue,
-        .machine_type = machine,
-        .cpus = positive_environment_integer("CLOUD_AWS_GPU_CPUS"),
-        .memory_gb = positive_environment_decimal("CLOUD_AWS_GPU_MEMORY_GB"),
-        .gpus = positive_environment_integer("CLOUD_AWS_GPU_COUNT"),
-    };
+    aws_gpu_target target;
+    target.job_queue = queue;
+    target.spot_job_queue = spot_queue;
+    target.machine_type = machine;
+    target.cpus = positive_environment_integer("CLOUD_AWS_GPU_CPUS");
+    target.memory_gb = positive_environment_decimal("CLOUD_AWS_GPU_MEMORY_GB");
+    target.gpus = positive_environment_integer("CLOUD_AWS_GPU_COUNT");
+    out.aws.gpu_targets[canonical] = std::move(target);
 }
 
 inline void environment_gcp(config& out) {
@@ -2422,13 +2516,13 @@ inline void environment_aws(config& out, bool comparing_prices) {
 
 inline void validate_environment_azure_endpoint(const config& out, std::string endpoint) {
     constexpr std::string_view scheme = "https://";
-    if (!endpoint.starts_with(scheme))
+    if (!gcp::detail::starts_with(endpoint, scheme))
         throw error("CLOUD_AZURE_BATCH_ENDPOINT must use HTTPS");
     endpoint.erase(0, scheme.size());
     std::transform(endpoint.begin(), endpoint.end(), endpoint.begin(), gcp::detail::ascii_lower);
     const std::string azure_region = region(configured_region(out, "azure"), "azure");
     const std::string suffix = "." + azure_region + ".batch.azure.com";
-    if (!endpoint.ends_with(suffix) || endpoint.size() <= suffix.size())
+    if (!gcp::detail::ends_with(endpoint, suffix) || endpoint.size() <= suffix.size())
         throw error("CLOUD_AZURE_BATCH_ENDPOINT must be "
                     "https://ACCOUNT.REGION.batch.azure.com");
     endpoint.resize(endpoint.size() - suffix.size());
@@ -2758,7 +2852,7 @@ inline void validate_spec(const job_spec& spec) {
         throw error("Service account contains an invalid newline");
     for (const auto& item : spec.mounts) {
         const uri source = parse_uri(item.source);
-        if (!source.key.empty() && !source.key.ends_with('/'))
+        if (!source.key.empty() && !gcp::detail::ends_with(source.key, "/"))
             throw error("GCS job mounts require a bucket or directory prefix ending in '/'");
         if (item.target.empty() || item.target.front() != '/' ||
             item.target.find(':') != std::string::npos)
@@ -2801,8 +2895,8 @@ inline void validate_provider_spec(std::string_view provider, const config& cfg,
         throw error("Azure Batch auto-pools do not support job_spec::service_account");
     if (cfg.azure.batch_endpoint.empty())
         throw error("Azure jobs require config::azure.batch_endpoint");
-    if (!cfg.azure.batch_endpoint.starts_with("https://") &&
-        !(cfg.allow_insecure_http && cfg.azure.batch_endpoint.starts_with("http://")))
+    if (!gcp::detail::starts_with(cfg.azure.batch_endpoint, "https://") &&
+        !(cfg.allow_insecure_http && gcp::detail::starts_with(cfg.azure.batch_endpoint, "http://")))
         throw error("Azure batch_endpoint must use HTTPS (or explicitly allow insecure HTTP)");
     std::string endpoint = cfg.azure.batch_endpoint;
     std::transform(endpoint.begin(), endpoint.end(), endpoint.begin(), gcp::detail::ascii_lower);
@@ -2966,9 +3060,9 @@ inline bool retryable(long status) {
 
 inline void validate_endpoint(const client_state& client, std::string_view value,
                               std::string_view name) {
-    if (value.starts_with("https://"))
+    if (gcp::detail::starts_with(value, "https://"))
         return;
-    if (value.starts_with("http://") && client.config.allow_insecure_http)
+    if (gcp::detail::starts_with(value, "http://") && client.config.allow_insecure_http)
         return;
     throw error(std::string(name) + " must use HTTPS (or set allow_insecure_http explicitly)");
 }
@@ -2978,7 +3072,7 @@ inline std::string aws_endpoint(const client_state& client, std::string_view con
     std::string value =
         configured.empty()
             ? "https://" + std::string(service) + '.' + std::string(region) +
-                  (region.starts_with("cn-") ? ".amazonaws.com.cn" : ".amazonaws.com")
+                  (gcp::detail::starts_with(region, "cn-") ? ".amazonaws.com.cn" : ".amazonaws.com")
             : gcp::detail::base_url(std::string(configured));
     validate_endpoint(client, value, "AWS endpoint");
     return value;
@@ -3007,11 +3101,13 @@ aws_signature(const client_state& client, std::string region, std::string servic
     auto token = std::move(supplied.session_token);
     if (access.empty() || secret.empty())
         throw error("AWS credentials require an access key ID and secret access key");
-    return {.access_key_id = std::move(access),
-            .secret_access_key = std::move(secret),
-            .session_token = std::move(token),
-            .region = std::move(region),
-            .service = std::move(service)};
+    gcp::detail::HttpRequest::AwsSignature signature;
+    signature.access_key_id = std::move(access);
+    signature.secret_access_key = std::move(secret);
+    signature.session_token = std::move(token);
+    signature.region = std::move(region);
+    signature.service = std::move(service);
+    return signature;
 }
 
 inline void check_response(std::string_view provider, const gcp::detail::HttpResponse& response) {
@@ -3190,13 +3286,10 @@ inline gcp::detail::HttpResponse public_call(const client_state& client,
 inline double decimal(std::string text, std::string_view field_name) {
     if (text.empty())
         throw error("Missing decimal " + std::string(field_name));
-    double value = 0;
-    const auto [end, code] =
-        std::from_chars(text.data(), text.data() + text.size(), value, std::chars_format::general);
-    if (code != std::errc{} || end != text.data() + text.size() || !std::isfinite(value) ||
-        value < 0)
+    const auto value = parse_decimal(text);
+    if (!value || *value < 0)
         throw error("Invalid decimal " + std::string(field_name));
-    return value;
+    return *value;
 }
 
 inline std::string lowercase(std::string value) {
@@ -3238,7 +3331,7 @@ inline std::optional<double> gcp_sku_unit_price(const gcp::detail::Json& sku) {
 
 inline std::pair<double, double> gcp_machine_resources(const cloud::plan& chosen) {
     const auto suffix = [&](std::string_view marker) -> std::optional<unsigned> {
-        if (!chosen.machine_type.starts_with(marker))
+        if (!gcp::detail::starts_with(chosen.machine_type, marker))
             return std::nullopt;
         try {
             return static_cast<unsigned>(std::stoul(chosen.machine_type.substr(marker.size())));
@@ -3252,9 +3345,9 @@ inline std::pair<double, double> gcp_machine_resources(const cloud::plan& chosen
         return {*n, *n * 3.75};
     if (const auto n = suffix("g2-standard-"))
         return {*n, *n * 4.0};
-    if (chosen.machine_type.starts_with("a2-ultragpu-"))
+    if (gcp::detail::starts_with(chosen.machine_type, "a2-ultragpu-"))
         return {12.0 * chosen.accelerator_count, 170.0 * chosen.accelerator_count};
-    if (chosen.machine_type.starts_with("a3-highgpu-"))
+    if (gcp::detail::starts_with(chosen.machine_type, "a3-highgpu-"))
         return {26.0 * chosen.accelerator_count, 234.0 * chosen.accelerator_count};
     throw error("No GCP pricing composition for machine type " + chosen.machine_type);
 }
@@ -3266,8 +3359,8 @@ inline std::optional<double> gcp_catalog_price(const client_state& client,
     // A2 Ultra and A3 High shapes also carry mandatory billed Local SSD. Until
     // that inseparable component can be quoted on the same hourly basis, leave
     // the whole estimate unavailable so a configured price ceiling fails closed.
-    if (chosen.machine_type.starts_with("a2-ultragpu-") ||
-        chosen.machine_type.starts_with("a3-highgpu-"))
+    if (gcp::detail::starts_with(chosen.machine_type, "a2-ultragpu-") ||
+        gcp::detail::starts_with(chosen.machine_type, "a3-highgpu-"))
         return std::nullopt;
     const std::string endpoint = gcp::detail::base_url(client.config.billing_endpoint);
     validate_endpoint(client, endpoint, "GCP billing_endpoint");
@@ -3294,7 +3387,7 @@ inline std::optional<double> gcp_catalog_price(const client_state& client,
         if (!page.empty())
             url += "&pageToken=" + gcp::detail::encode(page);
         const auto json = gcp::detail::parse_json(
-            call(client, gcp::detail::HttpRequest{.url = std::move(url)}).body);
+            call(client, gcp::detail::HttpRequest{}.with_url(std::move(url))).body);
         gcp::detail::for_each_json(json, "skus", [&](const gcp::detail::Json& sku) {
             if (!json_array_contains(sku, "serviceRegions", chosen.region))
                 return;
@@ -3359,14 +3452,15 @@ inline std::optional<double> aws_catalog_price(const client_state& client,
             gcp::detail::encode(chosen.machine_type) +
             "&ProductDescription.1=Linux%2FUNIX&AvailabilityZone=" + gcp::detail::encode(zone) +
             "&StartTime=" + gcp::detail::encode(iso_time());
-        const auto response = aws_call(
-            client,
-            gcp::detail::HttpRequest{.method = "POST",
-                                     .url = endpoint + '/',
-                                     .headers = {"Content-Type: application/x-www-form-urlencoded"},
-                                     .body = body,
-                                     .accept_json = false},
-            chosen.region, "ec2");
+        const auto response =
+            aws_call(client,
+                     gcp::detail::HttpRequest{}
+                         .with_method("POST")
+                         .with_url(endpoint + '/')
+                         .with_headers({"Content-Type: application/x-www-form-urlencoded"})
+                         .with_body(body)
+                         .with_accept_json(false),
+                     chosen.region, "ec2");
         const std::string open = "<spotPrice>";
         const std::string close = "</spotPrice>";
         const auto begin = response.body.find(open);
@@ -3400,13 +3494,12 @@ inline std::optional<double> aws_catalog_price(const client_state& client,
         body += '}';
         const auto outer = gcp::detail::parse_json(
             aws_call(client,
-                     gcp::detail::HttpRequest{
-                         .method = "POST",
-                         .url = endpoint + '/',
-                         .headers = {"Content-Type: application/x-amz-json-1.1",
-                                     "X-Amz-Target: AWSPriceListService.GetProducts"},
-                         .body = body,
-                     },
+                     gcp::detail::HttpRequest{}
+                         .with_method("POST")
+                         .with_url(endpoint + '/')
+                         .with_headers({"Content-Type: application/x-amz-json-1.1",
+                                        "X-Amz-Target: AWSPriceListService.GetProducts"})
+                         .with_body(body),
                      client.config.aws.pricing_region, "pricing")
                 .body);
         const auto* products = outer.get("PriceList");
@@ -3458,8 +3551,8 @@ inline std::optional<double> azure_catalog_price(const client_state& client,
     std::string effective;
     const std::string now = iso_time();
     while (!url.empty()) {
-        const auto json =
-            gcp::detail::parse_json(public_call(client, gcp::detail::HttpRequest{.url = url}).body);
+        const auto json = gcp::detail::parse_json(
+            public_call(client, gcp::detail::HttpRequest{}.with_url(url)).body);
         gcp::detail::for_each_json(json, "Items", [&](const gcp::detail::Json& item) {
             const std::string arm_sku = gcp::detail::field(item, "armSkuName");
             if (gcp::detail::field(item, "currencyCode") != "USD" ||
@@ -3539,16 +3632,17 @@ inline cloud::plan priced_plan(const client_state& client, const job_spec& spec,
     auto out = make_provider_plan(client.config, spec, std::move(provider));
     const bool custom = static_cast<bool>(client.config.lookup_hourly_cost) ||
                         static_cast<bool>(client.config.estimate_hourly_cost);
-    if (client.config.lookup_hourly_cost)
-        out.estimated_hourly_cost =
-            client.config.lookup_hourly_cost({.provider = out.provider,
-                                              .region = out.region,
-                                              .zone = configured_zone(client.config, out.provider),
-                                              .machine_type = out.machine_type,
-                                              .accelerator = out.accelerator,
-                                              .accelerator_count = out.accelerator_count,
-                                              .spot = spec.resources.spot});
-    else if (client.config.estimate_hourly_cost) {
+    if (client.config.lookup_hourly_cost) {
+        price_request request;
+        request.provider = out.provider;
+        request.region = out.region;
+        request.zone = configured_zone(client.config, out.provider);
+        request.machine_type = out.machine_type;
+        request.accelerator = out.accelerator;
+        request.accelerator_count = out.accelerator_count;
+        request.spot = spec.resources.spot;
+        out.estimated_hourly_cost = client.config.lookup_hourly_cost(request);
+    } else if (client.config.estimate_hourly_cost) {
         if (!out.accelerator.empty())
             throw error(
                 "Accelerator pricing requires config::lookup_hourly_cost; the compatibility "
@@ -3705,23 +3799,20 @@ inline gcp::detail::Json get_job(
     const job_data& job,
     std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
     if (job.chosen.provider == "gcp") {
-        auto response =
-            call(*job.client,
-                 gcp::detail::HttpRequest{
-                     .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name,
-                 },
-                 deadline);
+        auto response = call(*job.client,
+                             gcp::detail::HttpRequest{}.with_url(
+                                 job.client->core()->config.batch_endpoint + "/v1/" + job.name),
+                             deadline);
         return gcp::detail::parse_json(response.body);
     }
     if (job.chosen.provider == "aws") {
         const auto response = aws_call(
             *job.client,
-            gcp::detail::HttpRequest{
-                .method = "POST",
-                .url = aws_batch_endpoint(*job.client, job.chosen.region) + "/v1/describejobs",
-                .headers = {"Content-Type: application/json"},
-                .body = "{\"jobs\":[" + gcp::detail::json_quote(job.id) + "]}",
-            },
+            gcp::detail::HttpRequest{}
+                .with_method("POST")
+                .with_url(aws_batch_endpoint(*job.client, job.chosen.region) + "/v1/describejobs")
+                .with_headers({"Content-Type: application/json"})
+                .with_body("{\"jobs\":[" + gcp::detail::json_quote(job.id) + "]}"),
             job.chosen.region, "batch", true, deadline);
         const auto outer = gcp::detail::parse_json(response.body);
         const auto* value = aws_job_object(outer);
@@ -3729,13 +3820,12 @@ inline gcp::detail::Json get_job(
             throw error("AWS Batch no longer returned job " + job.id);
         return *value;
     }
-    const auto response = azure_call(
-        *job.client,
-        gcp::detail::HttpRequest{
-            .url = azure_batch_url(*job.client, "/jobs/" + gcp::detail::encode(job.name) +
-                                                    "/tasks/" + gcp::detail::encode(job.auxiliary)),
-        },
-        true, deadline);
+    const auto response =
+        azure_call(*job.client,
+                   gcp::detail::HttpRequest{}.with_url(azure_batch_url(
+                       *job.client, "/jobs/" + gcp::detail::encode(job.name) + "/tasks/" +
+                                        gcp::detail::encode(job.auxiliary))),
+                   true, deadline);
     return gcp::detail::parse_json(response.body);
 }
 
@@ -3823,12 +3913,11 @@ inline std::optional<int> task_exit_code(const job_data& job) {
     }
     try {
         const auto deadline = std::chrono::steady_clock::now() + job.client->config.request_timeout;
-        auto response = call(*job.client,
-                             gcp::detail::HttpRequest{
-                                 .url = job.client->core()->config.batch_endpoint + "/v1/" +
-                                        job.name + "/taskGroups/group0/tasks/0",
-                             },
-                             deadline);
+        auto response = call(
+            *job.client,
+            gcp::detail::HttpRequest{}.with_url(job.client->core()->config.batch_endpoint + "/v1/" +
+                                                job.name + "/taskGroups/group0/tasks/0"),
+            deadline);
         const auto json = gcp::detail::parse_json(response.body);
         const auto* status = json.get("status");
         const auto* events = status ? status->get("statusEvents") : nullptr;
@@ -3849,6 +3938,17 @@ inline std::optional<int> task_exit_code(const job_data& job) {
     } catch (const error&) {
         return std::nullopt;
     }
+}
+
+inline log_entry make_log_entry(std::string timestamp, std::string receive_timestamp,
+                                std::string id, std::string text, std::string severity) {
+    log_entry entry;
+    entry.timestamp = std::move(timestamp);
+    entry.receive_timestamp = std::move(receive_timestamp);
+    entry.id = std::move(id);
+    entry.text = std::move(text);
+    entry.severity = std::move(severity);
+    return entry;
 }
 
 inline std::vector<log_entry> logs(
@@ -3885,13 +3985,12 @@ inline std::vector<log_entry> logs(
                 body += '}';
                 const auto response =
                     aws_call(*job.client,
-                             gcp::detail::HttpRequest{
-                                 .method = "POST",
-                                 .url = aws_logs_endpoint(*job.client, job.chosen.region) + '/',
-                                 .headers = {"Content-Type: application/x-amz-json-1.1",
-                                             "X-Amz-Target: Logs_20140328.GetLogEvents"},
-                                 .body = std::move(body),
-                             },
+                             gcp::detail::HttpRequest{}
+                                 .with_method("POST")
+                                 .with_url(aws_logs_endpoint(*job.client, job.chosen.region) + '/')
+                                 .with_headers({"Content-Type: application/x-amz-json-1.1",
+                                                "X-Amz-Target: Logs_20140328.GetLogEvents"})
+                                 .with_body(std::move(body)),
                              job.chosen.region, "logs", true, deadline);
                 const auto json = gcp::detail::parse_json(response.body);
                 std::size_t index = 0;
@@ -3899,12 +3998,10 @@ inline std::vector<log_entry> logs(
                     const std::string timestamp = gcp::detail::field(event, "timestamp");
                     const std::string received = gcp::detail::field(event, "ingestionTime");
                     const std::string text = gcp::detail::field(event, "message");
-                    out.push_back({.timestamp = timestamp,
-                                   .receive_timestamp = received,
-                                   .id = stream + ':' + token + ':' + timestamp + ':' + received +
-                                         ':' + std::to_string(index++),
-                                   .text = text,
-                                   .severity = "DEFAULT"});
+                    out.push_back(make_log_entry(timestamp, received,
+                                                 stream + ':' + token + ':' + timestamp + ':' +
+                                                     received + ':' + std::to_string(index++),
+                                                 text, "DEFAULT"));
                 });
                 const std::string next = gcp::detail::field(json, "nextForwardToken");
                 if (next.empty() || next == token) {
@@ -3966,10 +4063,10 @@ inline std::vector<log_entry> logs(
                 if (!text.empty() && text.back() == '\r')
                     text.pop_back();
                 const std::uint64_t offset = tail_offsets[old_key];
-                out.push_back({.timestamp = order(active_generation, stream, offset),
-                               .id = old_key + ':' + std::to_string(offset),
-                               .text = std::move(text),
-                               .severity = stream == "stderr.txt" ? "ERROR" : "DEFAULT"});
+                out.push_back(make_log_entry(order(active_generation, stream, offset), {},
+                                             old_key + ':' + std::to_string(offset),
+                                             std::move(text),
+                                             stream == "stderr.txt" ? "ERROR" : "DEFAULT"));
                 tail_offsets[old_key] = offsets[old_key];
             }
             active_epoch = epoch;
@@ -3984,11 +4081,10 @@ inline std::vector<log_entry> logs(
             gcp::detail::HttpResponse properties;
             try {
                 properties = azure_call(*job.client,
-                                        gcp::detail::HttpRequest{
-                                            .method = "HEAD",
-                                            .url = azure_batch_url(*job.client, path),
-                                            .accept_json = false,
-                                        },
+                                        gcp::detail::HttpRequest{}
+                                            .with_method("HEAD")
+                                            .with_url(azure_batch_url(*job.client, path))
+                                            .with_accept_json(false),
                                         true, deadline);
             } catch (const error& failure) {
                 if (failure.http_status() == 404)
@@ -4017,13 +4113,12 @@ inline std::vector<log_entry> logs(
             if (length > start) {
                 const auto response =
                     azure_call(*job.client,
-                               gcp::detail::HttpRequest{
-                                   .url = azure_batch_url(*job.client, path),
-                                   .headers = {gcp::detail::header(
+                               gcp::detail::HttpRequest{}
+                                   .with_url(azure_batch_url(*job.client, path))
+                                   .with_headers({gcp::detail::header(
                                        "ocp-range", "bytes=" + std::to_string(start) + '-' +
-                                                        std::to_string(length - 1))},
-                                   .accept_json = false,
-                               },
+                                                        std::to_string(length - 1))})
+                                   .with_accept_json(false),
                                true, deadline);
                 bytes = response.body;
                 const auto expected = length - start;
@@ -4050,10 +4145,10 @@ inline std::vector<log_entry> logs(
                 std::string text = bytes.substr(position, line_length);
                 if (!text.empty() && text.back() == '\r')
                     text.pop_back();
-                out.push_back({.timestamp = order(active_generation, stream, base + position),
-                               .id = key + ':' + std::to_string(base + position),
-                               .text = std::move(text),
-                               .severity = stream == "stderr.txt" ? "ERROR" : "DEFAULT"});
+                out.push_back(make_log_entry(order(active_generation, stream, base + position), {},
+                                             key + ':' + std::to_string(base + position),
+                                             std::move(text),
+                                             stream == "stderr.txt" ? "ERROR" : "DEFAULT"));
                 if (end == std::string::npos)
                     break;
                 position = end + 1;
@@ -4096,22 +4191,19 @@ inline std::vector<log_entry> logs(
         body += '}';
         auto response =
             call(*job.client,
-                 gcp::detail::HttpRequest{
-                     .method = "POST",
-                     .url = job.client->core()->config.logging_endpoint + "/v2/entries:list",
-                     .headers = {"Content-Type: application/json"},
-                     .body = std::move(body),
-                 },
+                 gcp::detail::HttpRequest{}
+                     .with_method("POST")
+                     .with_url(job.client->core()->config.logging_endpoint + "/v2/entries:list")
+                     .with_headers({"Content-Type: application/json"})
+                     .with_body(std::move(body)),
                  deadline);
         const auto json = gcp::detail::parse_json(response.body);
         gcp::detail::for_each_json(json, "entries", [&](const gcp::detail::Json& entry) {
-            log_entry line{
-                .timestamp = gcp::detail::field(entry, "timestamp"),
-                .receive_timestamp = gcp::detail::field(entry, "receiveTimestamp"),
-                .id = gcp::detail::field(entry, "insertId"),
-                .text = gcp::detail::field(entry, "textPayload"),
-                .severity = gcp::detail::field(entry, "severity"),
-            };
+            log_entry line = make_log_entry(gcp::detail::field(entry, "timestamp"),
+                                            gcp::detail::field(entry, "receiveTimestamp"),
+                                            gcp::detail::field(entry, "insertId"),
+                                            gcp::detail::field(entry, "textPayload"),
+                                            gcp::detail::field(entry, "severity"));
             if (line.text.empty())
                 if (const auto* payload = entry.get("jsonPayload"))
                     line.text = gcp::detail::field(*payload, "message");
@@ -4187,9 +4279,8 @@ inline void wait_operation(const client_state& client, const std::string& name,
         throw error("Malformed Batch operation: missing name");
     while (std::chrono::steady_clock::now() < deadline) {
         auto response = call(client,
-                             gcp::detail::HttpRequest{
-                                 .url = client.core()->config.batch_endpoint + "/v1/" + name,
-                             },
+                             gcp::detail::HttpRequest{}.with_url(
+                                 client.core()->config.batch_endpoint + "/v1/" + name),
                              deadline);
         const auto json = gcp::detail::parse_json(response.body);
         if (const auto* done = json.get("done"); done && done->boolean()) {
@@ -4216,13 +4307,12 @@ inline void delete_job(const job_data& job, std::string_view reason) {
             return;
         (void)aws_call(
             *job.client,
-            gcp::detail::HttpRequest{
-                .method = "POST",
-                .url = aws_batch_endpoint(*job.client, job.chosen.region) +
-                       "/v1/deregisterjobdefinition",
-                .headers = {"Content-Type: application/json"},
-                .body = "{\"jobDefinition\":" + gcp::detail::json_quote(job.auxiliary) + "}",
-            },
+            gcp::detail::HttpRequest{}
+                .with_method("POST")
+                .with_url(aws_batch_endpoint(*job.client, job.chosen.region) +
+                          "/v1/deregisterjobdefinition")
+                .with_headers({"Content-Type: application/json"})
+                .with_body("{\"jobDefinition\":" + gcp::detail::json_quote(job.auxiliary) + "}"),
             job.chosen.region, "batch", false, deadline);
         return;
     }
@@ -4232,13 +4322,12 @@ inline void delete_job(const job_data& job, std::string_view reason) {
             try {
                 (void)azure_call(
                     *job.client,
-                    gcp::detail::HttpRequest{
-                        .method = "POST",
-                        .url = azure_batch_url(
-                            *job.client, "/jobs/" + gcp::detail::encode(job.name) + "/terminate"),
-                        .headers = {"Content-Type: application/json"},
-                        .body = "{\"terminateReason\":" + gcp::detail::json_quote(reason) + "}",
-                    },
+                    gcp::detail::HttpRequest{}
+                        .with_method("POST")
+                        .with_url(azure_batch_url(
+                            *job.client, "/jobs/" + gcp::detail::encode(job.name) + "/terminate"))
+                        .with_headers({"Content-Type: application/json"})
+                        .with_body("{\"terminateReason\":" + gcp::detail::json_quote(reason) + "}"),
                     false, deadline);
                 termination_uncertain = false;
                 return true;
@@ -4263,10 +4352,8 @@ inline void delete_job(const job_data& job, std::string_view reason) {
             try {
                 const auto response =
                     azure_call(*job.client,
-                               gcp::detail::HttpRequest{
-                                   .url = azure_batch_url(*job.client,
-                                                          "/jobs/" + gcp::detail::encode(job.name)),
-                               },
+                               gcp::detail::HttpRequest{}.with_url(azure_batch_url(
+                                   *job.client, "/jobs/" + gcp::detail::encode(job.name))),
                                true, deadline);
                 const auto json = gcp::detail::parse_json(response.body);
                 if (lowercase(gcp::detail::field(json, "state")) == "completed") {
@@ -4288,13 +4375,11 @@ inline void delete_job(const job_data& job, std::string_view reason) {
             return;
         const auto request_delete = [&] {
             try {
-                (void)azure_call(*job.client,
-                                 gcp::detail::HttpRequest{
-                                     .method = "DELETE",
-                                     .url = azure_batch_url(
-                                         *job.client, "/jobs/" + gcp::detail::encode(job.name)),
-                                 },
-                                 false, deadline);
+                (void)azure_call(
+                    *job.client,
+                    gcp::detail::HttpRequest{}.with_method("DELETE").with_url(
+                        azure_batch_url(*job.client, "/jobs/" + gcp::detail::encode(job.name))),
+                    false, deadline);
                 return true;
             } catch (const error& failure) {
                 if (failure.http_status() == 404)
@@ -4310,10 +4395,8 @@ inline void delete_job(const job_data& job, std::string_view reason) {
             try {
                 const auto response =
                     azure_call(*job.client,
-                               gcp::detail::HttpRequest{
-                                   .url = azure_batch_url(*job.client,
-                                                          "/jobs/" + gcp::detail::encode(job.name)),
-                               },
+                               gcp::detail::HttpRequest{}.with_url(azure_batch_url(
+                                   *job.client, "/jobs/" + gcp::detail::encode(job.name))),
                                true, deadline);
                 const auto state =
                     lowercase(gcp::detail::field(gcp::detail::parse_json(response.body), "state"));
@@ -4333,12 +4416,10 @@ inline void delete_job(const job_data& job, std::string_view reason) {
     gcp::detail::HttpResponse response;
     try {
         response = call(*job.client,
-                        gcp::detail::HttpRequest{
-                            .method = "DELETE",
-                            .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name +
-                                   "?reason=" + gcp::detail::encode(reason) +
-                                   "&requestId=" + gcp::detail::random_uuid(),
-                        },
+                        gcp::detail::HttpRequest{}.with_method("DELETE").with_url(
+                            job.client->core()->config.batch_endpoint + "/v1/" + job.name +
+                            "?reason=" + gcp::detail::encode(reason) +
+                            "&requestId=" + gcp::detail::random_uuid()),
                         deadline);
     } catch (const error& failure) {
         if (failure.http_status() == 404)
@@ -4378,14 +4459,13 @@ inline gcp::detail::Json cancel_job(const job_data& job) {
         const auto request = [&](std::string_view operation) {
             try {
                 (void)aws_call(*job.client,
-                               gcp::detail::HttpRequest{
-                                   .method = "POST",
-                                   .url = aws_batch_endpoint(*job.client, job.chosen.region) +
-                                          "/v1/" + std::string(operation),
-                                   .headers = {"Content-Type: application/json"},
-                                   .body = "{\"jobId\":" + gcp::detail::json_quote(job.id) +
-                                           ",\"reason\":\"cloud.h cancellation\"}",
-                               },
+                               gcp::detail::HttpRequest{}
+                                   .with_method("POST")
+                                   .with_url(aws_batch_endpoint(*job.client, job.chosen.region) +
+                                             "/v1/" + std::string(operation))
+                                   .with_headers({"Content-Type: application/json"})
+                                   .with_body("{\"jobId\":" + gcp::detail::json_quote(job.id) +
+                                              ",\"reason\":\"cloud.h cancellation\"}"),
                                job.chosen.region, "batch", false, deadline);
                 mutation_uncertain = false;
             } catch (const error& failure) {
@@ -4417,14 +4497,13 @@ inline gcp::detail::Json cancel_job(const job_data& job) {
             try {
                 (void)azure_call(
                     *job.client,
-                    gcp::detail::HttpRequest{
-                        .method = "POST",
-                        .url = azure_batch_url(
+                    gcp::detail::HttpRequest{}
+                        .with_method("POST")
+                        .with_url(azure_batch_url(
                             *job.client, "/jobs/" + gcp::detail::encode(job.name) + "/tasks/" +
-                                             gcp::detail::encode(job.auxiliary) + "/terminate"),
-                        .headers = {"Content-Type: application/json"},
-                        .body = "{}",
-                    },
+                                             gcp::detail::encode(job.auxiliary) + "/terminate"))
+                        .with_headers({"Content-Type: application/json"})
+                        .with_body("{}"),
                     false, deadline);
                 termination_uncertain = false;
             } catch (const error& failure) {
@@ -4454,12 +4533,11 @@ inline gcp::detail::Json cancel_job(const job_data& job) {
     try {
         response = call(
             *job.client,
-            gcp::detail::HttpRequest{
-                .method = "POST",
-                .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name + ":cancel",
-                .headers = {"Content-Type: application/json"},
-                .body = "{\"requestId\":" + gcp::detail::json_quote(request_id) + "}",
-            },
+            gcp::detail::HttpRequest{}
+                .with_method("POST")
+                .with_url(job.client->core()->config.batch_endpoint + "/v1/" + job.name + ":cancel")
+                .with_headers({"Content-Type: application/json"})
+                .with_body("{\"requestId\":" + gcp::detail::json_quote(request_id) + "}"),
             deadline);
     } catch (const error& failure) {
         current = get_job(job, deadline);
@@ -4477,7 +4555,8 @@ inline gcp::detail::Json cancel_job(const job_data& job) {
 
 inline result make_result(const job_data& job, const gcp::detail::Json& json) {
     const job_state state = update(job, json);
-    result out{.state = state};
+    result out;
+    out.state = state;
     out.warnings = job.chosen.warnings;
     if (state == job_state::succeeded) {
         out.exit_code = 0;
@@ -4520,12 +4599,11 @@ find_aws_definitions(const client_state& client, std::string_view endpoint, std:
         body += '}';
         const auto json = gcp::detail::parse_json(
             aws_call(client,
-                     gcp::detail::HttpRequest{
-                         .method = "POST",
-                         .url = std::string(endpoint) + "/v1/describejobdefinitions",
-                         .headers = {"Content-Type: application/json"},
-                         .body = std::move(body),
-                     },
+                     gcp::detail::HttpRequest{}
+                         .with_method("POST")
+                         .with_url(std::string(endpoint) + "/v1/describejobdefinitions")
+                         .with_headers({"Content-Type: application/json"})
+                         .with_body(std::move(body)),
                      std::string(region), "batch", true, deadline)
                 .body);
         if (const auto* definitions = json.get("jobDefinitions"))
@@ -4561,12 +4639,11 @@ inline std::optional<std::string> find_aws_job(const client_state& client,
                              gcp::detail::json_quote(name) + "]}],\"maxResults\":100}";
     const auto json =
         gcp::detail::parse_json(aws_call(client,
-                                         gcp::detail::HttpRequest{
-                                             .method = "POST",
-                                             .url = std::string(endpoint) + "/v1/listjobs",
-                                             .headers = {"Content-Type: application/json"},
-                                             .body = body,
-                                         },
+                                         gcp::detail::HttpRequest{}
+                                             .with_method("POST")
+                                             .with_url(std::string(endpoint) + "/v1/listjobs")
+                                             .with_headers({"Content-Type: application/json"})
+                                             .with_body(body),
                                          std::string(region), "batch", true, deadline)
                                     .body);
     const auto* jobs = json.get("jobSummaryList");
@@ -4622,12 +4699,11 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
     try {
         const auto registered =
             gcp::detail::parse_json(aws_call(*client,
-                                             gcp::detail::HttpRequest{
-                                                 .method = "POST",
-                                                 .url = endpoint + "/v1/registerjobdefinition",
-                                                 .headers = {"Content-Type: application/json"},
-                                                 .body = definition_body,
-                                             },
+                                             gcp::detail::HttpRequest{}
+                                                 .with_method("POST")
+                                                 .with_url(endpoint + "/v1/registerjobdefinition")
+                                                 .with_headers({"Content-Type: application/json"})
+                                                 .with_body(definition_body),
                                              chosen.region, "batch", false)
                                         .body);
         definition = gcp::detail::field(registered, "jobDefinitionArn");
@@ -4659,15 +4735,14 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
                 bool cleanup_complete = true;
                 for (const auto& arn : found)
                     try {
-                        (void)aws_call(
-                            *client,
-                            gcp::detail::HttpRequest{
-                                .method = "POST",
-                                .url = endpoint + "/v1/deregisterjobdefinition",
-                                .headers = {"Content-Type: application/json"},
-                                .body = "{\"jobDefinition\":" + gcp::detail::json_quote(arn) + "}",
-                            },
-                            chosen.region, "batch", false, deadline);
+                        (void)aws_call(*client,
+                                       gcp::detail::HttpRequest{}
+                                           .with_method("POST")
+                                           .with_url(endpoint + "/v1/deregisterjobdefinition")
+                                           .with_headers({"Content-Type: application/json"})
+                                           .with_body("{\"jobDefinition\":" +
+                                                      gcp::detail::json_quote(arn) + "}"),
+                                       chosen.region, "batch", false, deadline);
                     } catch (...) {
                         cleanup_complete = false;
                     }
@@ -4698,12 +4773,11 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
     try {
         const auto submitted =
             gcp::detail::parse_json(aws_call(*client,
-                                             gcp::detail::HttpRequest{
-                                                 .method = "POST",
-                                                 .url = endpoint + "/v1/submitjob",
-                                                 .headers = {"Content-Type: application/json"},
-                                                 .body = submit_body,
-                                             },
+                                             gcp::detail::HttpRequest{}
+                                                 .with_method("POST")
+                                                 .with_url(endpoint + "/v1/submitjob")
+                                                 .with_headers({"Content-Type: application/json"})
+                                                 .with_body(submit_body),
                                              chosen.region, "batch", false)
                                         .body);
         id = gcp::detail::field(submitted, "jobId");
@@ -4714,15 +4788,14 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
             ambiguous_failure = failure.what();
         } else {
             try {
-                (void)aws_call(
-                    *client,
-                    gcp::detail::HttpRequest{
-                        .method = "POST",
-                        .url = endpoint + "/v1/deregisterjobdefinition",
-                        .headers = {"Content-Type: application/json"},
-                        .body = "{\"jobDefinition\":" + gcp::detail::json_quote(definition) + "}",
-                    },
-                    chosen.region, "batch", false);
+                (void)aws_call(*client,
+                               gcp::detail::HttpRequest{}
+                                   .with_method("POST")
+                                   .with_url(endpoint + "/v1/deregisterjobdefinition")
+                                   .with_headers({"Content-Type: application/json"})
+                                   .with_body("{\"jobDefinition\":" +
+                                              gcp::detail::json_quote(definition) + "}"),
+                               chosen.region, "batch", false);
             } catch (...) {
             }
             throw;
@@ -4813,12 +4886,11 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
         for (int attempt = 0; attempt < 3; ++attempt) {
             try {
                 (void)azure_call(*client,
-                                 gcp::detail::HttpRequest{
-                                     .method = "POST",
-                                     .url = collection_url,
-                                     .headers = {"Content-Type: application/json"},
-                                     .body = body,
-                                 },
+                                 gcp::detail::HttpRequest{}
+                                     .with_method("POST")
+                                     .with_url(collection_url)
+                                     .with_headers({"Content-Type: application/json"})
+                                     .with_body(body),
                                  false, deadline);
                 return;
             } catch (const error& failure) {
@@ -4827,7 +4899,7 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
                 last_failure = failure.what();
             }
             try {
-                (void)azure_call(*client, gcp::detail::HttpRequest{.url = resource_url}, true,
+                (void)azure_call(*client, gcp::detail::HttpRequest{}.with_url(resource_url), true,
                                  deadline);
                 return;
             } catch (const error& inspection) {
@@ -4863,13 +4935,10 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
                      task_body, "task");
     } catch (...) {
         try {
-            (void)azure_call(
-                *client,
-                gcp::detail::HttpRequest{
-                    .method = "DELETE",
-                    .url = azure_batch_url(*client, "/jobs/" + gcp::detail::encode(id)),
-                },
-                false);
+            (void)azure_call(*client,
+                             gcp::detail::HttpRequest{}.with_method("DELETE").with_url(
+                                 azure_batch_url(*client, "/jobs/" + gcp::detail::encode(id))),
+                             false);
         } catch (...) {
         }
         throw;
@@ -5168,12 +5237,11 @@ public:
         gcp::detail::HttpResponse created_response;
         try {
             created_response =
-                detail::call(*state_, gcp::detail::HttpRequest{
-                                          .method = "POST",
-                                          .url = create_url,
-                                          .headers = {"Content-Type: application/json"},
-                                          .body = body,
-                                      });
+                detail::call(*state_, gcp::detail::HttpRequest{}
+                                          .with_method("POST")
+                                          .with_url(create_url)
+                                          .with_headers({"Content-Type: application/json"})
+                                          .with_body(body));
         } catch (const error& failure) {
             if (!detail::retryable(failure.http_status()))
                 throw;
@@ -5183,12 +5251,11 @@ public:
             const auto deadline = std::chrono::steady_clock::now() + recovery;
             while (true) {
                 try {
-                    created_response = detail::call(
-                        *state_,
-                        gcp::detail::HttpRequest{
-                            .url = state_->core()->config.batch_endpoint + "/v1/" + name,
-                        },
-                        deadline);
+                    created_response =
+                        detail::call(*state_,
+                                     gcp::detail::HttpRequest{}.with_url(
+                                         state_->core()->config.batch_endpoint + "/v1/" + name),
+                                     deadline);
                     break;
                 } catch (const error& lookup) {
                     if (lookup.http_status() != 404 || std::chrono::steady_clock::now() >= deadline)

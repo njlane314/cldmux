@@ -1,6 +1,84 @@
 #include "cloud.h"
 
+#if __cplusplus >= 202002L
 #include <tst.hpp>
+#else
+// tst.hpp deliberately targets C++20 because it reports assertion locations
+// with std::source_location. This small test-only fallback keeps this library's
+// own C++17 build exercising the same cases without changing the sibling tst
+// project or weakening its public contract.
+#include <iostream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+
+namespace tst {
+
+namespace detail {
+
+struct failure : std::runtime_error {
+    explicit failure(std::string_view message) : std::runtime_error(std::string(message)) {}
+};
+
+template <class Action> bool run_one(std::string_view name, Action&& action) {
+    try {
+        std::forward<Action>(action)();
+    } catch (const failure& error) {
+        std::cout << "FAIL  " << name << '\n' << error.what() << '\n';
+        return false;
+    } catch (const std::exception& error) {
+        std::cout << "ERROR " << name << "\nunexpected exception: " << error.what() << '\n';
+        return false;
+    } catch (...) {
+        std::cout << "ERROR " << name << "\nunexpected non-standard exception\n";
+        return false;
+    }
+    std::cout << "PASS  " << name << '\n';
+    return true;
+}
+
+} // namespace detail
+
+template <class Condition>
+void check(Condition&& condition, std::string_view message = "check failed") {
+    if (!static_cast<bool>(std::forward<Condition>(condition)))
+        throw detail::failure(message);
+}
+
+template <class Error, class Action>
+void throws(Action&& action, std::string_view message = "expected exception was not thrown") {
+    try {
+        std::forward<Action>(action)();
+    } catch (const detail::failure&) {
+        throw;
+    } catch (const Error&) {
+        return;
+    }
+    throw detail::failure(message);
+}
+
+template <class Action> struct test {
+    std::string name;
+    Action action;
+};
+
+template <class Action> test<Action> make_test(std::string name, Action action) {
+    return {std::move(name), std::move(action)};
+}
+
+template <class... Tests> int run(Tests&&... tests) {
+    int passed = 0;
+    int failed = 0;
+    ((detail::run_one(tests.name, std::forward<Tests>(tests).action) ? ++passed : ++failed), ...);
+    std::cout << '\n' << passed << " passed, " << failed << " failed\n";
+    return failed != 0;
+}
+
+} // namespace tst
+
+#define TST_CASE(name, ...) ::tst::make_test(name, [&] { __VA_ARGS__; })
+#endif
 
 #include <arpa/inet.h>
 #include <atomic>
@@ -18,10 +96,22 @@
 #include <stdexcept>
 #include <sys/socket.h>
 #include <thread>
+#include <type_traits>
 #include <unistd.h>
 #include <utility>
 
 namespace {
+
+// C++20 added starts_with() and ends_with() to string_view. Keeping these
+// compatibility helpers local to the tests avoids changing their intent.
+bool starts_with(std::string_view value, std::string_view prefix) {
+    return value.size() >= prefix.size() && value.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool ends_with(std::string_view value, std::string_view suffix) {
+    return value.size() >= suffix.size() &&
+           value.compare(value.size() - suffix.size(), suffix.size(), suffix) == 0;
+}
 
 // Tests alter process-wide environment state, so every permitted name is saved
 // before use and restored even when an assertion throws.
@@ -288,7 +378,7 @@ private:
                          "<spotPrice>0.125</spotPrice></item></spotPriceHistorySet>"
                          "</DescribeSpotPriceHistoryResponse>"};
         }
-        if (method == "GET" && target.starts_with("/v1/services/6F81-5844-456A/skus")) {
+        if (method == "GET" && starts_with(target, "/v1/services/6F81-5844-456A/skus")) {
             ++gcp_price_reads;
             return {200, "{\"skus\":[" + gcp_sku("E2 Instance Core", "OnDemand", 10'000'000) + ',' +
                              gcp_sku("E2 Custom Instance Core", "OnDemand", 11'000'000) + ',' +
@@ -343,7 +433,7 @@ private:
                 "\"retailPrice\":0.05}],\"NextPageLink\":null}"};
         }
 
-        if (method == "POST" && target.starts_with("/jobs?api-version=")) {
+        if (method == "POST" && starts_with(target, "/jobs?api-version=")) {
             const int writes = ++azure_jobs;
             try {
                 (void)cloud::gcp::detail::parse_json(body);
@@ -406,7 +496,7 @@ private:
             ++azure_terminates;
             return {};
         }
-        if (method == "GET" && target.starts_with("/jobs/") &&
+        if (method == "GET" && starts_with(target, "/jobs/") &&
             target.find("/tasks/") == std::string_view::npos &&
             target.find("api-version=") != std::string_view::npos) {
             if (azure_deletes == 0)
@@ -416,7 +506,7 @@ private:
                 return {200, "{\"state\":\"deleting\"}"};
             return {404, "{\"code\":\"JobNotFound\"}"};
         }
-        if (method == "DELETE" && target.starts_with("/jobs/") &&
+        if (method == "DELETE" && starts_with(target, "/jobs/") &&
             target.find("api-version=") != std::string_view::npos) {
             ++azure_deletes;
             return {202, "{}"};
@@ -424,7 +514,7 @@ private:
 
         constexpr std::string_view object_path = "/storage/v1/b/test-bucket/o/object";
         constexpr std::string_view download_path = "/download/storage/v1/b/test-bucket/o/object";
-        if (method == "POST" && target.starts_with("/upload/storage/v1/b/test-bucket/o?")) {
+        if (method == "POST" && starts_with(target, "/upload/storage/v1/b/test-bucket/o?")) {
             if (query(target, "name") != "object")
                 return {400, "missing object name"};
             return {200, "{\"name\":\"object\",\"generation\":\"7\","
@@ -432,24 +522,24 @@ private:
                              std::to_string(body.size()) + "\",\"crc32c\":\"" +
                              cloud::gcp::detail::crc32c(body) + "\"}"};
         }
-        if (method == "GET" && target.starts_with(download_path)) {
+        if (method == "GET" && starts_with(target, download_path)) {
             if (query(target, "generation") != "7")
                 return {400, "missing generation"};
             return {200, corrupt_download ? "corrupt" : "payload"};
         }
-        if (method == "GET" && target.starts_with(object_path)) {
+        if (method == "GET" && starts_with(target, object_path)) {
             return {200, "{\"name\":\"object\",\"generation\":\"7\","
                          "\"size\":\"7\",\"crc32c\":\"" +
                              cloud::gcp::detail::crc32c("payload") + "\"}"};
         }
-        if (method == "GET" && target.starts_with("/storage/v1/b/test-bucket/o?")) {
+        if (method == "GET" && starts_with(target, "/storage/v1/b/test-bucket/o?")) {
             ++storage_lists;
             if (query(target, "pageToken") == "next")
                 return {200, "{\"items\":[{\"name\":\"second\"}]}"};
             return {200, "{\"items\":[{\"name\":\"first\"}],"
                          "\"prefixes\":[\"dir/\"],\"nextPageToken\":\"next\"}"};
         }
-        if (method == "DELETE" && target.starts_with(object_path))
+        if (method == "DELETE" && starts_with(target, object_path))
             return {};
 
         if (method == "GET" && target.find("/instances?") != std::string_view::npos) {
@@ -526,7 +616,7 @@ private:
             return {500, "{\"error\":{\"message\":\"task retry\"}}"};
 
         const std::string id = job_id(target);
-        if (method == "POST" && target.ends_with(":cancel")) {
+        if (method == "POST" && ends_with(target, ":cancel")) {
             cancelled_[id] = true;
             if (id.find("ambiguous-cancel") != std::string::npos) {
                 ++ambiguous_cancel_attempts;
@@ -797,14 +887,13 @@ void aws_lifecycle_tests() {
     aws_config.aws.secret_access_key = "secret";
     aws_config.aws.batch_endpoint = server.url();
     aws_config.aws.logs_endpoint = server.url();
-    aws_config.aws.gpu_targets["l4"] = {
-        .job_queue = "gpu-queue",
-        .spot_job_queue = {},
-        .machine_type = "g6.xlarge",
-        .cpus = 4,
-        .memory_gb = 16,
-        .gpus = 1,
-    };
+    cloud::aws_gpu_target gpu_target;
+    gpu_target.job_queue = "gpu-queue";
+    gpu_target.machine_type = "g6.xlarge";
+    gpu_target.cpus = 4;
+    gpu_target.memory_gb = 16;
+    gpu_target.gpus = 1;
+    aws_config.aws.gpu_targets["l4"] = std::move(gpu_target);
     aws_config.poll_interval = std::chrono::milliseconds(1);
     aws_config.final_log_delay = std::chrono::milliseconds(1);
     aws_config.final_log_timeout = std::chrono::milliseconds(20);
@@ -1254,11 +1343,19 @@ void environment_factory_tests() {
     environment.set("CLOUD_AWS_GPU_MEMORY_GB", "not-a-number");
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
                               "malformed AWS GPU decimal is rejected");
+
+    const auto scientific = cloud::detail::parse_decimal("1.25e2");
+    tst::check(scientific && *scientific == 125.0, "portable decimal exponent parsing");
+    for (const std::string_view invalid : {"", "+1", "1e", "1x", "nan", "inf", "1e-9999"})
+        tst::check(!cloud::detail::parse_decimal(invalid),
+                   "malformed decimal is rejected: " + std::string(invalid));
 }
 
 void planning_tests() {
     static_assert(cloud::gcp::version == CLOUD_H_VERSION);
     static_assert(CLOUD_H_VERSION_NUM == 0x000200);
+    static_assert(std::is_aggregate_v<cloud::resources>);
+    static_assert(std::is_aggregate_v<cloud::job_spec>);
 
     cloud::config config;
     config.project = "test-project";
@@ -1273,29 +1370,23 @@ void planning_tests() {
     };
     cloud::client client(std::move(config));
 
-    cloud::job_spec spec{
-        .name = "Analysis 42",
-        .image = "python:3.13",
-        .command = {"python", "analyse.py", "/input/input.csv"},
-        .workdir = ".",
-        .service_account = "batch-runner@test-project.iam.gserviceaccount.com",
-        .mounts =
-            {
-                {"cloud://inputs/run-42/", "/input", true},
-                {"cloud://results", "/output"},
-            },
-        .resources =
-            {
-                .cpus = 4,
-                .memory_gb = 16,
-                .gpu = {},
-                .spot = true,
-                .max_price_per_hour = 0.50,
-            },
-        .retries = 2,
-        .auto_delete = true,
-        .timeout = std::chrono::hours(2),
+    cloud::job_spec spec;
+    spec.name = "Analysis 42";
+    spec.image = "python:3.13";
+    spec.command = {"python", "analyse.py", "/input/input.csv"};
+    spec.workdir = ".";
+    spec.service_account = "batch-runner@test-project.iam.gserviceaccount.com";
+    spec.mounts = {
+        {"cloud://inputs/run-42/", "/input", true},
+        {"cloud://results", "/output"},
     };
+    spec.resources.cpus = 4;
+    spec.resources.memory_gb = 16;
+    spec.resources.spot = true;
+    spec.resources.max_price_per_hour = 0.50;
+    spec.retries = 2;
+    spec.auto_delete = true;
+    spec.timeout = std::chrono::hours(2);
 
     const auto plan = client.plan(spec);
     tst::check(plan.provider == "gcp", "provider");

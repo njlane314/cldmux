@@ -1,16 +1,20 @@
 CXX ?= c++
-CXXFLAGS ?= -std=c++20 -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror
+CXX_STANDARD ?= c++17
+CXX26_STANDARD ?=
+CXXFLAGS ?= -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror
 CURL_FLAGS := $(shell curl-config --cflags --libs)
 TST_DIR ?= ../tst
 TEST := /tmp/cloud-h-test
 EXAMPLE := /tmp/cloud-h-example
 RUN_EXAMPLE := /tmp/cloud-h-run
 
-.PHONY: check example examples sanitize
-check: example examples $(TST_DIR)/tst.hpp
+.PHONY: check check-standards check-c++17 check-c++20 check-c++23 check-c++26 \
+	example examples sanitize
+check: example examples
 	awk '/^```cpp$$/ {code=1; next} code && /^```/ {exit} code {print}' README.md | \
-		$(CXX) $(CXXFLAGS) -I. -x c++ -fsyntax-only -
-	$(CXX) $(CXXFLAGS) -I. -isystem "$(TST_DIR)" test.cpp $(CURL_FLAGS) -pthread -o $(TEST)
+		$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. -x c++ -fsyntax-only -
+	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. -isystem "$(TST_DIR)" \
+		test.cpp $(CURL_FLAGS) -pthread -o $(TEST)
 	$(TEST)
 	env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project CLOUD_GCP_REGION=europe-west4 \
 		$(RUN_EXAMPLE) gcp
@@ -25,13 +29,59 @@ check: example examples $(TST_DIR)/tst.hpp
 	@status=0; $(RUN_EXAMPLE) gcp --submit --submit >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
 
+check-standards:
+	$(MAKE) check-c++17
+	$(MAKE) check-c++20
+	$(MAKE) check-c++23
+	$(MAKE) check-c++26
+
+check-c++17:
+	$(MAKE) check CXX_STANDARD=c++17
+
+check-c++20:
+	$(MAKE) check CXX_STANDARD=c++20
+
+check-c++23:
+	$(MAKE) check CXX_STANDARD=c++23
+
+# Compiler flag spellings are still transitional. Try the final spelling first,
+# then the widely supported draft spelling, unless the caller chooses one.
+check-c++26:
+	@standard="$(CXX26_STANDARD)"; \
+	if test -n "$$standard"; then \
+		candidates="$$standard"; \
+	else \
+		candidates="c++26 c++2c"; \
+	fi; \
+	for candidate in $$candidates; do \
+		if printf '%s\n' 'int main() {}' | \
+			$(CXX) -std=$$candidate -x c++ -fsyntax-only - >/dev/null 2>&1; then \
+			standard="$$candidate"; \
+			break; \
+		fi; \
+	done; \
+	if test -z "$$standard" || ! printf '%s\n' 'int main() {}' | \
+		$(CXX) -std=$$standard -x c++ -fsyntax-only - >/dev/null 2>&1; then \
+		if test -n "$(CXX26_STANDARD)"; then \
+			echo "C++26 check skipped: $(CXX) does not support -std=$(CXX26_STANDARD)"; \
+		else \
+			echo "C++26 check skipped: $(CXX) supports neither -std=c++26 nor -std=c++2c"; \
+		fi; \
+		exit 0; \
+	fi; \
+	echo "Checking C++26 compatibility with -std=$$standard"; \
+	$(MAKE) check CXX_STANDARD=$$standard
+
 example:
-	$(CXX) $(CXXFLAGS) -I. example.cpp $(CURL_FLAGS) -pthread -o $(EXAMPLE)
+	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. example.cpp \
+		$(CURL_FLAGS) -pthread -o $(EXAMPLE)
 
 examples:
-	$(CXX) $(CXXFLAGS) -I. examples/run.cpp $(CURL_FLAGS) -pthread -o $(RUN_EXAMPLE)
+	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. examples/run.cpp \
+		$(CURL_FLAGS) -pthread -o $(RUN_EXAMPLE)
 
-sanitize: $(TST_DIR)/tst.hpp
-	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer \
+sanitize:
+	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -fsanitize=address,undefined \
+		-fno-omit-frame-pointer \
 		-I. -isystem "$(TST_DIR)" test.cpp $(CURL_FLAGS) -pthread -o $(TEST)-san
 	$(TEST)-san
