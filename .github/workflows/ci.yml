@@ -69,7 +69,7 @@ jobs:
           TST_DIR=.deps/tst
       - if: matrix.sanitise
         run: >-
-          make sanitize
+          make sanitise
           CXX=${{ matrix.cxx }}
           CXX_STANDARD=${{ matrix.standard }}
           TST_DIR=.deps/tst

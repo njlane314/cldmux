@@ -1,4 +1,3 @@
-#include "cloud.h"
 #include "examples/support.h"
 
 #if __cplusplus >= 202002L
@@ -2747,7 +2746,7 @@ void environment_factory_tests() {
 
 void planning_tests() {
     static_assert(cloud::gcp::version == CLOUD_H_VERSION);
-    static_assert(CLOUD_H_VERSION_NUM == 0x000303);
+    static_assert(CLOUD_H_VERSION_NUM == 0x000400);
     static_assert(std::is_aggregate_v<cloud::resources>);
     static_assert(std::is_aggregate_v<cloud::job_spec>);
     static_assert(std::is_aggregate_v<cloud::run_diagnostics>);

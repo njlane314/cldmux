@@ -1,7 +1,11 @@
 #ifndef CLOUD_EXAMPLE_SUPPORT_H_INCLUDED
 #define CLOUD_EXAMPLE_SUPPORT_H_INCLUDED
 
+#if defined(CLOUD_TEST_AMALGAMATED)
 #include "cloud.h"
+#else
+#include <cloud/cloud.hpp>
+#endif
 
 #include <charconv>
 #include <chrono>

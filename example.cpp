@@ -72,7 +72,7 @@ int main(int argc, char* argv[]) {
             router.diagnose(spec, chosen.expected_attempt_runtime);
         cloud::client client = router.route(report.selected_plan.provider);
 
-        // cloud.h owns the stable KEY=value syntax, including validation,
+        // The cloud library owns the stable KEY=value syntax, including validation,
         // control-character escaping, and locale-independent numbers. The
         // returned record set is deliberately mutable: this program adds an
         // application label, and could use set(), rename(), or erase() to adapt
