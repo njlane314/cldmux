@@ -15,7 +15,7 @@ local data → plan → upload → run → poll logs → collect output → dele
 
 The job-facing model is provider-independent. GCP Batch, AWS Batch, and Azure
 Batch run container jobs; their native logging APIs feed one `cloud::job`
-handle. GPU planning and opt-in public-catalog price lookup are built in.
+handle. GPU planning and opt-in public-catalogue price lookup are built in.
 Cloud Storage and raw instance control remain deliberately GCP-only and report
 that boundary through `supports()`.
 
@@ -28,70 +28,100 @@ out to provider CLIs.
 ```cpp
 #include "cloud.h"
 
+#include <chrono>
 #include <iostream>
+#include <optional>
 
 int main() {
-    cloud::config config;
-    config.project = "physics-project";
-    config.region = "europe";       // maps to europe-west4
-    config.zone = "europe-west4-a"; // only needed for raw compute()
-    config.auth = cloud::auth::default_chain();
-
-    cloud::client client(std::move(config));
-
-    client.storage().put_file("cloud://sim-input/run-42/config.json", "./config.json");
-
-    cloud::job_spec spec{
-        .name = "simulation-42",
-        .image = "ghcr.io/example/simulation:latest",
-        .command = {"/usr/local/bin/simulate", "--config", "/input/config.json", "--output",
-                    "/output/result.json"},
+    auto client = cloud::client::from_environment("cheapest");
+    const cloud::job_spec job{
+        .name = "hello-cloud",
+        .image = "ubuntu:24.04",
+        .command = {"/bin/echo", "hello"},
         .workdir = {},
-        .service_account = "batch-runner@physics-project.iam.gserviceaccount.com",
-        .mounts =
-            {
-                {"cloud://sim-input/run-42/", "/input", true},
-                {"cloud://sim-output/run-42/", "/output"},
-            },
+        .service_account = {},
+        .mounts = {},
         .resources =
             {
                 .cpus = 4,
                 .memory_gb = 16,
                 .gpu = {},
                 .gpu_count = 1,
-                .spot = true,
+                .spot = false,
                 .max_price_per_hour = std::nullopt,
             },
-        .retries = 2,
+        .retries = 1,
         .auto_delete = true,
-        .timeout = std::chrono::hours(2),
+        .timeout = std::chrono::minutes(15),
     };
 
-    const auto plan = client.plan(spec);
-    std::cout << plan.provider << ' ' << plan.region << ' ' << plan.machine_type << '\n';
-
-    auto job = client.run(spec);
-    const auto result =
-        job.wait([](const cloud::log_entry& line) { std::cout << line.text << '\n'; });
-
-    if (!result.success()) {
-        std::cerr << result.error() << '\n';
-        return 1;
-    }
-
-    client.storage().get_file("cloud://sim-output/run-42/result.json", "./result.json");
+    const auto selected = client.plan(job);
+    std::cout << selected.provider << ' ' << selected.region << ' '
+              << selected.machine_type << '\n';
 }
 ```
 
 Build with:
 
 ```sh
-c++ -std=c++20 example.cpp -lcurl -pthread
+c++ -std=c++20 -I. examples/run.cpp -lcurl -pthread -o cloud-run
 ```
 
 The header is fully inline; do not define an implementation macro. The
-[annotated example](example.cpp) expands this workflow and defaults to a safe
-planning-only run; submission requires an explicit `--submit` argument.
+minimal [`examples/run.cpp`](examples/run.cpp) keeps one provider-neutral job
+definition. It defaults to a safe, planning-only price comparison; only
+`--submit` permits billable execution. The heavily commented
+[`example.cpp`](example.cpp) explains the fuller GCP storage workflow.
+
+## AUTOMATIC ROUTING
+
+The first argument chooses the policy without changing or recompiling the job:
+
+```sh
+cloud-run                  # compare configured providers and choose the cheapest
+cloud-run cheapest         # the same explicit policy
+cloud-run gcp              # override the router
+cloud-run aws
+cloud-run azure --submit   # submit only after the explicit flag
+```
+
+`client::from_environment("cheapest")` checks configured providers in stable
+GCP, AWS, Azure order, enables public-catalogue prices, and selects the lowest
+USD compute estimate. At least two providers must be configured. Every included
+provider must validate the same job and return a comparable price; one failed
+plan or missing quote aborts the decision instead of biasing it towards a
+partial set. `run()` repeats the comparison immediately before submission.
+
+Passing `gcp`, `aws`, or `azure` is the override. It loads only that provider
+and leaves catalogue lookup disabled, so `plan()` remains local. Provider
+infrastructure stays outside the program:
+
+| Provider | Required environment | Optional environment |
+|---|---|---|
+| GCP | `CLOUD_GCP_PROJECT` | `CLOUD_GCP_REGION`, `CLOUD_GCP_ZONE` |
+| AWS | at least one CPU, Spot, or complete GPU queue | `CLOUD_AWS_REGION`, `CLOUD_AWS_MACHINE_TYPE`, `CLOUD_AWS_SPOT_MACHINE_TYPE`, `CLOUD_AWS_ZONE`, `CLOUD_AWS_LOG_GROUP` |
+| Azure | `CLOUD_AZURE_BATCH_ENDPOINT` | `CLOUD_AZURE_REGION`, `CLOUD_AZURE_BATCH_TOKEN` for submission |
+
+`CLOUD_REGION` and `CLOUD_ZONE` are shared fallbacks. For cheapest AWS routing,
+an on-demand CPU path needs `CLOUD_AWS_JOB_QUEUE` and
+`CLOUD_AWS_MACHINE_TYPE`; a Spot CPU path needs `CLOUD_AWS_SPOT_JOB_QUEUE`,
+`CLOUD_AWS_SPOT_MACHINE_TYPE`, and `CLOUD_AWS_ZONE`. Both need
+`AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`. An exact AWS machine type is a
+declaration that its queue is constrained to that type; otherwise the estimate
+cannot be trusted. GCP uses its existing credential chain, while Azure retail
+pricing is unauthenticated.
+
+`CLOUD_AZURE_BATCH_ENDPOINT` accepts the public Batch form
+`https://ACCOUNT.REGION.batch.azure.com` only. The Azure Batch token is read
+lazily if Azure wins and the job is submitted. Configure a trusted private
+proxy or sovereign-cloud endpoint through explicit `cloud::config`, where the
+destination is visible in code.
+
+One exact AWS GPU target can be supplied without adding provider logic to the
+program: set `CLOUD_AWS_GPU_MODEL`, `CLOUD_AWS_GPU_MACHINE_TYPE`,
+`CLOUD_AWS_GPU_CPUS`, `CLOUD_AWS_GPU_MEMORY_GB`, `CLOUD_AWS_GPU_COUNT`, and at
+least one of `CLOUD_AWS_GPU_JOB_QUEUE` or `CLOUD_AWS_GPU_SPOT_JOB_QUEUE`.
+Multiple AWS GPU targets should use an explicit `cloud::config`.
 
 Select AWS with an existing Batch queue. Spot is a queue property, so it needs
 a distinct queue:
@@ -177,20 +207,20 @@ event timestamps. The quiet period and maximum final drain are configurable
 through `final_log_delay` and `final_log_timeout`. Even the final drain is best
 effort.
 
-A `job` and all of its copies share one mutable controller state. Serialize
+A `job` and all of its copies share one mutable controller state. Serialise
 calls to `status()`, `logs()`, `wait()`, and `cancel()`; concurrent calls on the
 same job are unsupported.
 
 ## COST POLICY
 
-Public-catalog lookup is opt-in because it performs network requests during
+Public-catalogue lookup is opt-in because it performs network requests during
 planning:
 
 ```cpp
 config.prices = cloud::price_source::public_catalog;
 ```
 
-It queries the GCP Cloud Billing catalog, the signed AWS Price List API (or EC2
+It queries GCP Cloud Billing pricing data, the signed AWS Price List API (or EC2
 Spot price history), and the unauthenticated Azure Retail Prices API. Prices
 are USD compute list-price estimates and are cached for one hour, or five
 minutes for Spot. `price_cache_ttl` and `spot_price_cache_ttl` are configurable.
@@ -221,9 +251,9 @@ without an available estimate fails closed. Estimates are advisory, never
 guarantees; `run()` plans again, so an earlier returned plan is not a
 reservation or binding quote. Egress is reported as unknown.
 
-`selection::lowest_cost` queries every configured provider, requires at least
-two runnable providers with estimates, compares the same USD compute-only
-basis, and follows provider order for ties. A missing quote fails closed.
+`selection::lowest_cost` validates and prices every configured provider,
+requires at least two of them, compares the same USD compute-only basis, and
+follows provider order for ties. Any failed plan or missing quote fails closed.
 
 ## GCP STORAGE AND RAW COMPUTE
 
@@ -266,7 +296,7 @@ template. The Google-specific primitives are also exposed under `cloud::gcp`.
 ## AUTHENTICATION AND SAFETY
 
 The GCP default chain checks fixed bearer-token environment variables, an
-authorized-user Application Default Credentials file, then the GCE metadata
+authorised-user Application Default Credentials file, then the GCE metadata
 service. An explicit token callback can supply federation, impersonation, or a
 different credential system. Service-account key JSON and external-account ADC
 JSON are not parsed by this small header.
@@ -284,14 +314,14 @@ the callback is the boundary for those flows.
 
 The library never invokes `gcloud`, `aws`, or `az`, and never logs credentials.
 API endpoints require TLS unless insecure HTTP is explicitly enabled for a
-test. GCP mutations carry request IDs; AWS uses unique randomized names plus
+test. GCP mutations carry request IDs; AWS uses unique randomised names plus
 read-after-ambiguity reconciliation; Azure uses fixed IDs plus inspection before
 replay. Destructive operations target one named resource, and the library
 creates no firewall rules or inbound ports. On GCP, project SSH keys are blocked
 on Batch VMs, but those VMs can still receive external IP addresses unless the
 project supplies a private network/NAT policy. AWS inherits networking from the
 configured queue/compute environment; Azure uses the Batch auto-pool network
-behavior configured for the account.
+behaviour configured for the account.
 
 For GCP, enable the Batch, Compute Engine, Cloud Logging, and Cloud Storage APIs
 first. The referenced buckets, instance templates, and custom service accounts
@@ -302,7 +332,7 @@ Agent Reporter, Logs Writer, and least-privilege read/write access to its
 mounted GCS prefixes; private images may also require registry access.
 
 For AWS, create queues and compute environments first; GPU queues must use a
-GPU-optimized AMI and constrain capacity to the declared model. The controller
+GPU-optimised AMI and constrain capacity to the declared model. The controller
 needs Batch registration/submission/inspection/cancellation permissions and
 CloudWatch Logs read access. For Azure, grant Batch data-plane access to the
 Batch account and ensure the configured VM size/image is available in the
@@ -327,7 +357,7 @@ The capability matrix is:
 | Container jobs, Spot, logs, accelerators, estimates | yes | yes | yes |
 | Object storage, storage mounts, raw instances | yes | no | no |
 
-`supports()` reports implemented library behavior, not account permissions,
+`supports()` reports implemented library behaviour, not account permissions,
 regional quota, queue configuration, or current SKU capacity.
 
 CPU tables cover GCP E2 and Azure Dsv5 through 32 vCPU/128 GiB. Canonical GPU
@@ -338,7 +368,7 @@ model/count/resource combinations fail rather than substitute a different GPU.
 
 Generic `europe`, `us`, and `asia` aliases map to a documented default region
 for each provider; they are convenience defaults, not latency or carbon
-optimizers. Provider-specific regions can be supplied directly. Multi-provider
+optimisers. Provider-specific regions can be supplied directly. Multi-provider
 selection can give each backend its own location through `config.regions` and,
 for AWS Spot observations, `config.zones`.
 
@@ -346,6 +376,7 @@ for AWS Spot observations, `config.zones`.
 
 ```sh
 make example
+make examples
 make check
 make sanitize
 ```

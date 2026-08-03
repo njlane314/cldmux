@@ -5,12 +5,15 @@
 #include <arpa/inet.h>
 #include <atomic>
 #include <cctype>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <initializer_list>
 #include <iostream>
 #include <limits>
 #include <map>
 #include <netinet/in.h>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <sys/socket.h>
@@ -19,6 +22,66 @@
 #include <utility>
 
 namespace {
+
+// Tests alter process-wide environment state, so every permitted name is saved
+// before use and restored even when an assertion throws.
+class environment_guard {
+public:
+    environment_guard(std::initializer_list<std::string_view> names) {
+        for (const std::string_view name : names) {
+            const std::string key(name);
+            const char* value = std::getenv(key.c_str());
+            saved_.push_back({key, value ? std::optional<std::string>(value) : std::nullopt});
+        }
+        for (const auto& item : saved_)
+            if (::unsetenv(item.name.c_str()) != 0) {
+                restore();
+                throw std::runtime_error("cannot clear test environment variable " + item.name);
+            }
+    }
+
+    environment_guard(const environment_guard&) = delete;
+    environment_guard& operator=(const environment_guard&) = delete;
+
+    ~environment_guard() { restore(); }
+
+    void set(std::string_view name, std::string_view value) {
+        const auto& item = saved(name);
+        const std::string text(value);
+        if (::setenv(item.name.c_str(), text.c_str(), 1) != 0)
+            throw std::runtime_error("cannot set test environment variable " + item.name);
+    }
+
+    void unset(std::string_view name) {
+        const auto& item = saved(name);
+        if (::unsetenv(item.name.c_str()) != 0)
+            throw std::runtime_error("cannot clear test environment variable " + item.name);
+    }
+
+private:
+    void restore() noexcept {
+        for (const auto& item : saved_) {
+            if (item.value)
+                (void)::setenv(item.name.c_str(), item.value->c_str(), 1);
+            else
+                (void)::unsetenv(item.name.c_str());
+        }
+    }
+    struct saved_variable {
+        std::string name;
+        std::optional<std::string> value;
+    };
+
+    [[nodiscard]] const saved_variable& saved(std::string_view name) const {
+        const auto found = std::find_if(saved_.begin(), saved_.end(),
+                                        [&](const auto& item) { return item.name == name; });
+        if (found == saved_.end())
+            throw std::logic_error("unsaved test environment variable " + std::string(name));
+        return *found;
+    }
+
+    std::vector<saved_variable> saved_;
+};
 
 class fake_server {
 public:
@@ -878,19 +941,19 @@ void pricing_tests() {
     auto gcp_l4_price = price_spec;
     gcp_l4_price.resources.gpu = "l4";
     tst::check(std::fabs(*gcp_priced.plan(gcp_l4_price).estimated_hourly_cost - 0.628) < 1e-12,
-               "GCP GPU catalog price ignores custom, sole-tenancy, and commitment SKUs");
+               "GCP GPU catalogue price ignores custom, sole-tenancy, and commitment SKUs");
     (void)gcp_priced.plan(gcp_l4_price);
     tst::check(server.gcp_price_reads == 2, "GCP price cache");
 
     auto gcp_bundled_disk_price = price_spec;
     gcp_bundled_disk_price.resources.gpu = "a100";
     tst::check(!gcp_priced.plan(gcp_bundled_disk_price).estimated_hourly_cost,
-               "GCP bundled Local SSD shape has no incomplete catalog quote");
+               "GCP bundled Local SSD shape has no incomplete catalogue quote");
     gcp_bundled_disk_price.resources.max_price_per_hour = 100;
     tst::throws<cloud::error>([&] { (void)gcp_priced.plan(gcp_bundled_disk_price); },
                               "GCP bundled Local SSD price ceiling fails closed");
     tst::check(server.gcp_price_reads == 2,
-               "GCP bundled Local SSD shape skips component catalog lookup");
+               "GCP bundled Local SSD shape skips component catalogue lookup");
 
     cloud::config rich_lookup;
     rich_lookup.provider = "gcp";
@@ -985,6 +1048,212 @@ void pricing_tests() {
     };
     cloud::client cheapest(std::move(cheapest_config));
     tst::check(cheapest.plan(price_spec).provider == "azure", "lowest-cost provider selection");
+}
+
+void environment_factory_tests() {
+    environment_guard environment{
+        "CLOUD_REGION",
+        "CLOUD_ZONE",
+        "CLOUD_GCP_PROJECT",
+        "CLOUD_GCP_REGION",
+        "CLOUD_GCP_ZONE",
+        "CLOUD_AWS_JOB_QUEUE",
+        "CLOUD_AWS_SPOT_JOB_QUEUE",
+        "CLOUD_AWS_MACHINE_TYPE",
+        "CLOUD_AWS_SPOT_MACHINE_TYPE",
+        "CLOUD_AWS_LOG_GROUP",
+        "CLOUD_AWS_REGION",
+        "CLOUD_AWS_ZONE",
+        "CLOUD_AWS_GPU_MODEL",
+        "CLOUD_AWS_GPU_JOB_QUEUE",
+        "CLOUD_AWS_GPU_SPOT_JOB_QUEUE",
+        "CLOUD_AWS_GPU_MACHINE_TYPE",
+        "CLOUD_AWS_GPU_CPUS",
+        "CLOUD_AWS_GPU_MEMORY_GB",
+        "CLOUD_AWS_GPU_COUNT",
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "CLOUD_AZURE_BATCH_ENDPOINT",
+        "CLOUD_AZURE_REGION",
+        "CLOUD_AZURE_BATCH_TOKEN",
+    };
+
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("unknown"); },
+                              "environment factory rejects an unknown provider");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("gcp"); },
+                              "environment factory requires a GCP project");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
+                              "environment factory requires an AWS queue");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("azure"); },
+                              "environment factory requires an Azure endpoint");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("cheapest"); },
+                              "cheapest routing rejects an empty environment");
+    environment.set("CLOUD_GCP_PROJECT", "bad/project");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("gcp"); },
+                              "environment factory validates the GCP project");
+    environment.unset("CLOUD_GCP_PROJECT");
+
+    cloud::job_spec spec;
+    spec.image = "image";
+    spec.command = {"run"};
+    spec.resources.cpus = 4;
+    spec.resources.memory_gb = 16;
+
+    environment.set("CLOUD_REGION", "us");
+    environment.set("CLOUD_ZONE", "shared-zone");
+    environment.set("CLOUD_GCP_PROJECT", "test-project");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("cheapest"); },
+                              "cheapest routing requires at least two providers");
+    environment.set("CLOUD_GCP_REGION", "europe-west4");
+    environment.set("CLOUD_GCP_ZONE", "europe-west4-a");
+
+    const cloud::config gcp_config = cloud::detail::config_from_environment("gcp");
+    tst::check(gcp_config.provider && *gcp_config.provider == "gcp" &&
+                   gcp_config.project == "test-project" && gcp_config.region == "us" &&
+                   gcp_config.zone == "shared-zone" &&
+                   cloud::detail::configured_region(gcp_config, "gcp") == "europe-west4" &&
+                   cloud::detail::configured_zone(gcp_config, "gcp") == "europe-west4-a",
+               "GCP environment mapping");
+    const auto gcp_plan = cloud::client::from_environment("gcp").plan(spec);
+    tst::check(gcp_plan.provider == "gcp" && gcp_plan.region == "europe-west4" &&
+                   gcp_plan.machine_type == "e2-standard-4" && !gcp_plan.estimated_hourly_cost,
+               "GCP environment client plans locally");
+
+    environment.set("CLOUD_AWS_JOB_QUEUE", "cpu-queue");
+    environment.set("CLOUD_AWS_SPOT_JOB_QUEUE", "cpu-spot-queue");
+    environment.set("CLOUD_AWS_MACHINE_TYPE", "m6i.xlarge");
+    environment.set("CLOUD_AWS_SPOT_MACHINE_TYPE", "m6i.xlarge");
+    environment.set("CLOUD_AWS_LOG_GROUP", "/aws/batch/cloud-test");
+    environment.set("CLOUD_AWS_REGION", "eu-west-1");
+    environment.set("CLOUD_AWS_ZONE", "eu-west-1a");
+
+    const cloud::config aws_config = cloud::detail::config_from_environment("aws");
+    tst::check(aws_config.provider && *aws_config.provider == "aws" &&
+                   aws_config.aws.job_queue == "cpu-queue" &&
+                   aws_config.aws.spot_job_queue == "cpu-spot-queue" &&
+                   aws_config.aws.machine_type == "m6i.xlarge" &&
+                   aws_config.aws.spot_machine_type == "m6i.xlarge" &&
+                   aws_config.aws.log_group == "/aws/batch/cloud-test" &&
+                   cloud::detail::configured_region(aws_config, "aws") == "eu-west-1" &&
+                   cloud::detail::configured_zone(aws_config, "aws") == "eu-west-1a",
+               "AWS environment mapping");
+    const auto aws_plan = cloud::client::from_environment("aws").plan(spec);
+    tst::check(aws_plan.provider == "aws" && aws_plan.region == "eu-west-1" &&
+                   aws_plan.machine_type == "m6i.xlarge" && !aws_plan.estimated_hourly_cost,
+               "AWS environment client plans locally");
+
+    environment.unset("CLOUD_AWS_JOB_QUEUE");
+    environment.unset("CLOUD_AWS_MACHINE_TYPE");
+    auto spot_spec = spec;
+    spot_spec.resources.spot = true;
+    const auto spot_plan = cloud::client::from_environment("aws").plan(spot_spec);
+    tst::check(spot_plan.machine_type == "m6i.xlarge" && spot_plan.region == "eu-west-1",
+               "AWS environment permits a Spot-only route");
+    environment.set("CLOUD_AWS_JOB_QUEUE", "cpu-queue");
+    environment.set("CLOUD_AWS_MACHINE_TYPE", "m6i.xlarge");
+
+    environment.set("CLOUD_AZURE_REGION", "westeurope");
+    environment.set("CLOUD_AZURE_BATCH_ENDPOINT", "https://evil.example");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("azure"); },
+                              "Azure environment rejects an arbitrary token destination");
+    environment.set("CLOUD_AZURE_BATCH_ENDPOINT", "https://test.westeurope.batch.azure.com/jobs");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("azure"); },
+                              "Azure environment rejects an endpoint path");
+    environment.set("CLOUD_AZURE_BATCH_ENDPOINT", "https://test.westeurope.batch.azure.com");
+
+    const cloud::config azure_config = cloud::detail::config_from_environment("azure");
+    tst::check(azure_config.provider && *azure_config.provider == "azure" &&
+                   azure_config.azure.batch_endpoint == "https://test.westeurope.batch.azure.com" &&
+                   azure_config.azure.auth &&
+                   cloud::detail::configured_region(azure_config, "azure") == "westeurope",
+               "Azure environment mapping");
+    const auto azure_plan = cloud::client::from_environment("azure").plan(spec);
+    tst::check(azure_plan.provider == "azure" && azure_plan.region == "westeurope" &&
+                   azure_plan.machine_type == "Standard_D4s_v5" &&
+                   !azure_plan.estimated_hourly_cost,
+               "Azure environment client plans locally");
+
+    environment.set("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+    environment.set("AWS_SECRET_ACCESS_KEY", "secret");
+    cloud::config cheapest_config = cloud::detail::config_from_environment("cheapest");
+    tst::check(cheapest_config.providers == std::vector<cloud::provider>{"gcp", "aws", "azure"} &&
+                   cheapest_config.selection == cloud::selection::lowest_cost &&
+                   cheapest_config.prices == cloud::price_source::public_catalog,
+               "cheapest environment uses stable provider order");
+
+    std::vector<cloud::provider> compared;
+    cheapest_config.lookup_hourly_cost = [&](const cloud::price_request& request) {
+        compared.push_back(request.provider);
+        return std::optional<double>(request.provider == "azure" ? 0.10
+                                     : request.provider == "aws" ? 0.20
+                                                                 : 0.30);
+    };
+    const auto cheapest_plan = cloud::client(std::move(cheapest_config)).plan(spec);
+    tst::check(compared == std::vector<cloud::provider>{"gcp", "aws", "azure"} &&
+                   cheapest_plan.provider == "azure" && cheapest_plan.estimated_hourly_cost == 0.10,
+               "cheapest environment compares without a network request");
+
+    cloud::config tied_config = cloud::detail::config_from_environment("cheapest");
+    tied_config.lookup_hourly_cost = [](const cloud::price_request&) {
+        return std::optional<double>(0.25);
+    };
+    tst::check(cloud::client(std::move(tied_config)).plan(spec).provider == "gcp",
+               "cheapest price ties follow configured order");
+
+    cloud::config missing_quote = cloud::detail::config_from_environment("cheapest");
+    missing_quote.lookup_hourly_cost = [](const cloud::price_request& request) {
+        return request.provider == "aws" ? std::nullopt : std::optional<double>(0.25);
+    };
+    tst::throws<cloud::error>([&] { (void)cloud::client(missing_quote).plan(spec); },
+                              "cheapest routing rejects a partial quote set");
+
+    cloud::config failed_provider = cloud::detail::config_from_environment("cheapest");
+    failed_provider.lookup_hourly_cost = [](const cloud::price_request& request) {
+        if (request.provider == "azure")
+            throw cloud::error("price provider failed");
+        return std::optional<double>(0.25);
+    };
+    tst::throws<cloud::error>([&] { (void)cloud::client(failed_provider).plan(spec); },
+                              "cheapest routing rejects a failed provider");
+
+    environment.set("CLOUD_AWS_GPU_MODEL", "nvidia-l4");
+    environment.set("CLOUD_AWS_GPU_JOB_QUEUE", "l4-queue");
+    environment.set("CLOUD_AWS_GPU_SPOT_JOB_QUEUE", "l4-spot-queue");
+    environment.set("CLOUD_AWS_GPU_MACHINE_TYPE", "g6.xlarge");
+    environment.set("CLOUD_AWS_GPU_CPUS", "4");
+    environment.set("CLOUD_AWS_GPU_MEMORY_GB", "16");
+    environment.set("CLOUD_AWS_GPU_COUNT", "1");
+    environment.unset("CLOUD_AWS_JOB_QUEUE");
+    environment.unset("CLOUD_AWS_SPOT_JOB_QUEUE");
+    environment.unset("CLOUD_AWS_MACHINE_TYPE");
+    environment.unset("CLOUD_AWS_SPOT_MACHINE_TYPE");
+
+    const cloud::config gpu_config = cloud::detail::config_from_environment("aws");
+    const auto target = gpu_config.aws.gpu_targets.find("l4");
+    tst::check(target != gpu_config.aws.gpu_targets.end() &&
+                   target->second.job_queue == "l4-queue" &&
+                   target->second.spot_job_queue == "l4-spot-queue" &&
+                   target->second.machine_type == "g6.xlarge" && target->second.cpus == 4 &&
+                   target->second.memory_gb == 16 && target->second.gpus == 1,
+               "complete AWS GPU environment mapping");
+    auto gpu_spec = spec;
+    gpu_spec.resources.gpu = "L4";
+    const auto gpu_plan = cloud::client::from_environment("aws").plan(gpu_spec);
+    tst::check(gpu_plan.machine_type == "g6.xlarge" && gpu_plan.accelerator == "l4",
+               "AWS GPU-only environment client planning");
+
+    environment.unset("CLOUD_AWS_GPU_MEMORY_GB");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
+                              "partial AWS GPU environment is rejected");
+    environment.set("CLOUD_AWS_GPU_MEMORY_GB", "16");
+    environment.set("CLOUD_AWS_GPU_CPUS", "4x");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
+                              "malformed AWS GPU integer is rejected");
+    environment.set("CLOUD_AWS_GPU_CPUS", "4");
+    environment.set("CLOUD_AWS_GPU_MEMORY_GB", "not-a-number");
+    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
+                              "malformed AWS GPU decimal is rejected");
 }
 
 void planning_tests() {
@@ -1158,9 +1427,11 @@ void planning_tests() {
 } // namespace
 
 int main() {
-    return tst::run(TST_CASE("plans and validates GCP workloads", planning_tests()),
-                    TST_CASE("runs GCP lifecycle, storage, and compute", gcp_lifecycle_tests()),
-                    TST_CASE("runs AWS Batch and recovery", aws_lifecycle_tests()),
-                    TST_CASE("runs Azure Batch and log recovery", azure_lifecycle_tests()),
-                    TST_CASE("looks up prices and selects providers", pricing_tests()));
+    return tst::run(
+        TST_CASE("plans and validates GCP workloads", planning_tests()),
+        TST_CASE("constructs clients from the environment", environment_factory_tests()),
+        TST_CASE("runs GCP lifecycle, storage, and compute", gcp_lifecycle_tests()),
+        TST_CASE("runs AWS Batch and recovery", aws_lifecycle_tests()),
+        TST_CASE("runs Azure Batch and log recovery", azure_lifecycle_tests()),
+        TST_CASE("looks up prices and selects providers", pricing_tests()));
 }

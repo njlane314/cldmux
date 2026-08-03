@@ -17,7 +17,7 @@
 //   4. Public storage, compute, job, and client handles
 //
 // plan() never allocates compute. It can perform read-only pricing requests
-// when public catalog lookup is enabled. run(), storage(), and compute() can
+// when public catalogue lookup is enabled. run(), storage(), and compute() can
 // mutate cloud resources and therefore require suitable credentials and IAM.
 
 #ifndef NJLANE314_CLOUD_H_INCLUDED
@@ -826,7 +826,7 @@ inline void ensure_curl() {
 
 // One internal HTTP request. Bodies and file streams are mutually exclusive;
 // downloads may request streaming CRC32C verification before the destination is
-// committed. AwsSignature delegates SigV4 canonicalization to libcurl.
+// committed. AwsSignature delegates SigV4 canonicalisation to libcurl.
 struct HttpRequest {
     std::string method = "GET";
     std::string url;
@@ -1217,7 +1217,7 @@ inline HttpResponse http(HttpRequest request) {
 // GCP application default credentials -----------------------------------------
 
 // The default chain is intentionally narrow: explicit bearer-token environment
-// variables, authorized-user ADC JSON, then the metadata server. Service-account
+// variables, authorised-user ADC JSON, then the metadata server. Service-account
 // key and external-account JSON are left to a caller-supplied token callback.
 inline std::string metadata_host() {
     std::string host = env("GCE_METADATA_HOST");
@@ -1373,8 +1373,8 @@ inline std::string compact_error_body(std::string body) {
 
 // Authenticated GCP REST core --------------------------------------------------
 
-// Core centralizes lazy project/zone discovery, bearer headers, a single 401
-// refresh, endpoint validation, and HTTP error normalization. Public Bucket,
+// Core centralises lazy project/zone discovery, bearer headers, a single 401
+// refresh, endpoint validation, and HTTP error normalisation. Public Bucket,
 // Vm, Operation, and Cloud handles share it through std::shared_ptr.
 class Core {
 public:
@@ -1905,11 +1905,11 @@ using provider = std::string;
 // lowest_cost requires comparable hourly prices and at least two candidates.
 enum class selection { ordered, lowest_cost };
 
-// Catalog pricing is opt-in because it adds read-only network requests during
+// Catalogue pricing is opt-in because it adds read-only network requests during
 // plan(). Caller callbacks below take precedence over this setting.
 enum class price_source { none, public_catalog };
 
-// Capability flags describe implemented library behavior only. They do not
+// Capability flags describe implemented library behaviour only. They do not
 // imply credentials, quota, regional availability, or configured AWS queues.
 enum class feature {
     object_storage,
@@ -2027,8 +2027,8 @@ struct plan {
     std::vector<std::string> warnings;
 };
 
-// Provider lifecycle states are normalized to this small common state machine.
-// unknown means the response was valid but did not map to a recognized state.
+// Provider lifecycle states are normalised to this small common state machine.
+// unknown means the response was valid but did not map to a recognised state.
 #define CLOUD_H_JOB_STATES(X)                                                                      \
     X(queued, "QUEUED")                                                                            \
     X(scheduled, "SCHEDULED")                                                                      \
@@ -2119,7 +2119,7 @@ struct aws_config {
     // capacity; planning fails rather than overcommitting it.
     std::map<std::string, aws_gpu_target, std::less<>> gpu_targets;
     // Optional exact types for dedicated CPU queues. Without these, Batch still
-    // runs jobs but no exact EC2 catalog price is claimed.
+    // runs jobs but no exact EC2 catalogue price is claimed.
     std::string machine_type;
     std::string spot_machine_type;
     std::string log_group = "/aws/batch/job";
@@ -2169,7 +2169,7 @@ struct config {
     cloud::azure_config azure;
 
     // Price precedence is lookup_hourly_cost, compatibility estimator, then the
-    // opt-in public catalog. Supplying either callback suppresses catalog lookup.
+    // opt-in public catalogue. Supplying either callback suppresses catalogue lookup.
     cloud::price_source prices = cloud::price_source::none;
     price_lookup lookup_hourly_cost;
     price_estimator estimate_hourly_cost;
@@ -2251,7 +2251,7 @@ inline std::string configured_zone(const config& cfg, std::string_view provider)
 
 inline std::string region(std::string value, std::string_view provider) {
     // Friendly continental aliases are deterministic conveniences, not latency,
-    // carbon, quota, or capacity optimizers.
+    // carbon, quota, or capacity optimisers.
     if (value == "europe")
         value = provider == "gcp" ? "europe-west4" : provider == "aws" ? "eu-west-1" : "westeurope";
     if (value == "us")
@@ -2305,6 +2305,198 @@ inline std::string canonical_gpu(std::string value) {
     throw error("Unsupported accelerator \"" + value + "\"; use t4, l4, a10, a100, or h100");
 }
 
+// Environment-backed construction deliberately has a narrow contract. It
+// supplies infrastructure and credentials to the same provider-neutral client;
+// job definitions remain ordinary job_spec values.
+inline unsigned positive_environment_integer(std::string_view name) {
+    const std::string text = gcp::detail::env(name);
+    unsigned value = 0;
+    const auto [end, code] = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (text.empty() || code != std::errc{} || end != text.data() + text.size() || value == 0)
+        throw error(std::string(name) + " must be a positive integer");
+    return value;
+}
+
+inline double positive_environment_decimal(std::string_view name) {
+    const std::string text = gcp::detail::env(name);
+    double value = 0;
+    const auto [end, code] =
+        std::from_chars(text.data(), text.data() + text.size(), value, std::chars_format::general);
+    if (text.empty() || code != std::errc{} || end != text.data() + text.size() ||
+        !std::isfinite(value) || !(value > 0))
+        throw error(std::string(name) + " must be a positive decimal number");
+    return value;
+}
+
+inline void environment_locations(config& out) {
+    if (const std::string value = gcp::detail::env("CLOUD_REGION"); !value.empty())
+        out.region = value;
+    if (const std::string value = gcp::detail::env("CLOUD_ZONE"); !value.empty())
+        out.zone = value;
+    if (const std::string value = gcp::detail::env("CLOUD_GCP_REGION"); !value.empty())
+        out.regions["gcp"] = value;
+    if (const std::string value = gcp::detail::env("CLOUD_AWS_REGION"); !value.empty())
+        out.regions["aws"] = value;
+    if (const std::string value = gcp::detail::env("CLOUD_AZURE_REGION"); !value.empty())
+        out.regions["azure"] = value;
+    if (const std::string value = gcp::detail::env("CLOUD_GCP_ZONE"); !value.empty())
+        out.zones["gcp"] = value;
+    if (const std::string value = gcp::detail::env("CLOUD_AWS_ZONE"); !value.empty())
+        out.zones["aws"] = value;
+}
+
+inline bool environment_aws_configured() {
+    return !gcp::detail::env("CLOUD_AWS_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLOUD_AWS_SPOT_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLOUD_AWS_GPU_MODEL").empty() ||
+           !gcp::detail::env("CLOUD_AWS_GPU_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLOUD_AWS_GPU_SPOT_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLOUD_AWS_GPU_MACHINE_TYPE").empty() ||
+           !gcp::detail::env("CLOUD_AWS_GPU_CPUS").empty() ||
+           !gcp::detail::env("CLOUD_AWS_GPU_MEMORY_GB").empty() ||
+           !gcp::detail::env("CLOUD_AWS_GPU_COUNT").empty();
+}
+
+inline void environment_aws_gpu_target(config& out) {
+    const std::string model = gcp::detail::env("CLOUD_AWS_GPU_MODEL");
+    const std::string queue = gcp::detail::env("CLOUD_AWS_GPU_JOB_QUEUE");
+    const std::string spot_queue = gcp::detail::env("CLOUD_AWS_GPU_SPOT_JOB_QUEUE");
+    const std::string machine = gcp::detail::env("CLOUD_AWS_GPU_MACHINE_TYPE");
+    const std::string cpus = gcp::detail::env("CLOUD_AWS_GPU_CPUS");
+    const std::string memory = gcp::detail::env("CLOUD_AWS_GPU_MEMORY_GB");
+    const std::string count = gcp::detail::env("CLOUD_AWS_GPU_COUNT");
+    const bool present = !model.empty() || !queue.empty() || !spot_queue.empty() ||
+                         !machine.empty() || !cpus.empty() || !memory.empty() || !count.empty();
+    if (!present)
+        return;
+    if (model.empty() || machine.empty() || cpus.empty() || memory.empty() || count.empty() ||
+        (queue.empty() && spot_queue.empty()))
+        throw error("AWS GPU environment configuration requires a model, machine type, CPU, "
+                    "memory, GPU count, and at least one queue");
+    const std::string canonical = canonical_gpu(model);
+    out.aws.gpu_targets[canonical] = {
+        .job_queue = queue,
+        .spot_job_queue = spot_queue,
+        .machine_type = machine,
+        .cpus = positive_environment_integer("CLOUD_AWS_GPU_CPUS"),
+        .memory_gb = positive_environment_decimal("CLOUD_AWS_GPU_MEMORY_GB"),
+        .gpus = positive_environment_integer("CLOUD_AWS_GPU_COUNT"),
+    };
+}
+
+inline void environment_gcp(config& out) {
+    out.project = gcp::detail::env("CLOUD_GCP_PROJECT");
+    if (out.project.empty())
+        throw error("GCP environment configuration requires CLOUD_GCP_PROJECT");
+    validate_project(out.project);
+}
+
+inline void environment_aws(config& out, bool comparing_prices) {
+    out.aws.job_queue = gcp::detail::env("CLOUD_AWS_JOB_QUEUE");
+    out.aws.spot_job_queue = gcp::detail::env("CLOUD_AWS_SPOT_JOB_QUEUE");
+    out.aws.machine_type = gcp::detail::env("CLOUD_AWS_MACHINE_TYPE");
+    out.aws.spot_machine_type = gcp::detail::env("CLOUD_AWS_SPOT_MACHINE_TYPE");
+    if (const std::string value = gcp::detail::env("CLOUD_AWS_LOG_GROUP"); !value.empty())
+        out.aws.log_group = value;
+    environment_aws_gpu_target(out);
+    if (out.aws.job_queue.empty() && out.aws.spot_job_queue.empty() && out.aws.gpu_targets.empty())
+        throw error("AWS environment configuration requires at least one CPU, Spot, or GPU "
+                    "Batch queue");
+    const std::string zone = configured_zone(out, "aws");
+    const bool priced_cpu = !out.aws.job_queue.empty() && !out.aws.machine_type.empty();
+    const bool priced_spot =
+        !out.aws.spot_job_queue.empty() && !out.aws.spot_machine_type.empty() && !zone.empty();
+    const bool priced_gpu =
+        std::any_of(out.aws.gpu_targets.begin(), out.aws.gpu_targets.end(), [&](const auto& item) {
+            return !item.second.job_queue.empty() ||
+                   (!item.second.spot_job_queue.empty() && !zone.empty());
+        });
+    if (comparing_prices && !priced_cpu && !priced_spot && !priced_gpu)
+        throw error("AWS price comparison requires a queue with an exact machine type; Spot "
+                    "pricing also requires CLOUD_AWS_ZONE");
+    if (comparing_prices && (gcp::detail::env("AWS_ACCESS_KEY_ID").empty() ||
+                             gcp::detail::env("AWS_SECRET_ACCESS_KEY").empty()))
+        throw error("AWS price comparison requires AWS_ACCESS_KEY_ID and "
+                    "AWS_SECRET_ACCESS_KEY");
+}
+
+inline void validate_environment_azure_endpoint(const config& out, std::string endpoint) {
+    constexpr std::string_view scheme = "https://";
+    if (!endpoint.starts_with(scheme))
+        throw error("CLOUD_AZURE_BATCH_ENDPOINT must use HTTPS");
+    endpoint.erase(0, scheme.size());
+    std::transform(endpoint.begin(), endpoint.end(), endpoint.begin(), gcp::detail::ascii_lower);
+    const std::string azure_region = region(configured_region(out, "azure"), "azure");
+    const std::string suffix = "." + azure_region + ".batch.azure.com";
+    if (!endpoint.ends_with(suffix) || endpoint.size() <= suffix.size())
+        throw error("CLOUD_AZURE_BATCH_ENDPOINT must be "
+                    "https://ACCOUNT.REGION.batch.azure.com");
+    endpoint.resize(endpoint.size() - suffix.size());
+    if (endpoint.size() < 3 || endpoint.size() > 24 ||
+        !std::all_of(endpoint.begin(), endpoint.end(), [](char c) {
+            return gcp::detail::is_ascii_lower(c) || gcp::detail::is_ascii_digit(c);
+        }))
+        throw error("CLOUD_AZURE_BATCH_ENDPOINT contains an invalid Batch account name");
+}
+
+inline void environment_azure(config& out) {
+    out.azure.batch_endpoint =
+        gcp::detail::base_url(gcp::detail::env("CLOUD_AZURE_BATCH_ENDPOINT"));
+    if (out.azure.batch_endpoint.empty())
+        throw error("Azure environment configuration requires CLOUD_AZURE_BATCH_ENDPOINT");
+    // Restrict bearer-token destinations in the minimal environment contract.
+    // Explicit cloud::config remains the escape hatch for a trusted proxy or a
+    // sovereign-cloud endpoint with a different DNS suffix.
+    validate_environment_azure_endpoint(out, out.azure.batch_endpoint);
+    // Azure catalogue pricing is public, so the Batch token is read only if an
+    // Azure job is actually submitted. A zero expiry receives the conservative
+    // refresh lifetime used by the shared credential cache.
+    out.azure.auth = auth::from([](std::string_view) {
+        std::string token = gcp::detail::env("CLOUD_AZURE_BATCH_TOKEN");
+        if (token.empty())
+            throw error("Azure submission requires CLOUD_AZURE_BATCH_TOKEN");
+        return access_token{std::move(token), {}, {}};
+    });
+}
+
+inline config config_from_environment(std::string_view requested) {
+    config out;
+    environment_locations(out);
+
+    if (requested == "gcp") {
+        environment_gcp(out);
+    } else if (requested == "aws") {
+        environment_aws(out, false);
+    } else if (requested == "azure") {
+        environment_azure(out);
+    } else if (requested == "cheapest") {
+        out.providers.clear();
+        out.selection = selection::lowest_cost;
+        out.prices = price_source::public_catalog;
+        if (!gcp::detail::env("CLOUD_GCP_PROJECT").empty()) {
+            environment_gcp(out);
+            out.providers.push_back("gcp");
+        }
+        if (environment_aws_configured()) {
+            environment_aws(out, true);
+            out.providers.push_back("aws");
+        }
+        if (!gcp::detail::env("CLOUD_AZURE_BATCH_ENDPOINT").empty()) {
+            environment_azure(out);
+            out.providers.push_back("azure");
+        }
+        if (out.providers.size() < 2)
+            throw error("cheapest routing requires at least two configured cloud providers");
+        return out;
+    } else {
+        throw error("Unknown cloud provider \"" + std::string(requested) +
+                    "\"; use cheapest, gcp, aws, or azure");
+    }
+
+    out.provider = std::string(requested);
+    return out;
+}
+
 struct machine_choice {
     std::string name;
     std::string accelerator;
@@ -2351,10 +2543,12 @@ inline machine_choice machine(std::string_view provider, const config& cfg,
         }
         const std::string exact = requested.spot ? cfg.aws.spot_machine_type : cfg.aws.machine_type;
         if (exact.empty()) {
-            warnings.push_back("AWS Batch queue may choose several EC2 types; exact catalog "
+            warnings.push_back("AWS Batch queue may choose several EC2 types; exact catalogue "
                                "pricing is unavailable");
             return {"batch-managed", {}, 0};
         }
+        warnings.push_back("AWS machine type relies on the configured queue containing only " +
+                           exact + " instances");
         return {exact, {}, 0};
     }
 
@@ -2719,9 +2913,9 @@ inline std::string job_id(std::string value) {
     return value + '-' + suffix.substr(0, 16);
 }
 
-// Provider transports and public catalog pricing ------------------------------
+// Provider transports and public catalogue pricing ----------------------------
 
-// Shared immutable configuration plus the few synchronized caches. Handles keep
+// Shared immutable configuration plus the few synchronised caches. Handles keep
 // this state alive, so callbacks and credential caches outlive the client object
 // from which a job/storage/compute handle was copied.
 struct client_state {
@@ -3132,7 +3326,7 @@ inline std::optional<double> gcp_catalog_price(const client_state& client,
                 if (!price)
                     continue;
                 if (component.unit && std::fabs(*component.unit - *price) > 1e-12)
-                    throw error("GCP catalog returned ambiguous prices for " + component.label);
+                    throw error("GCP catalogue returned ambiguous prices for " + component.label);
                 component.unit = price;
             }
         });
@@ -3240,7 +3434,7 @@ inline std::optional<double> aws_catalog_price(const client_state& client,
                             continue;
                         const double price = decimal(usd, "AWS on-demand price");
                         if (found && std::fabs(*found - price) > 1e-12)
-                            throw error("AWS catalog returned ambiguous hourly prices");
+                            throw error("AWS catalogue returned ambiguous hourly prices");
                         found = price;
                     }
                 }
@@ -4551,7 +4745,7 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
         }
     }
     if (id.empty()) {
-        // The randomized job name is an audit handle. Keep the definition active:
+        // The randomised job name is an audit handle. Keep the definition active:
         // an accepted but not-yet-visible job can still depend on it.
         throw error("AWS Batch submission outcome is unknown for job name " + name +
                     (ambiguous_failure.empty() ? std::string{} : ": " + ambiguous_failure));
@@ -4781,7 +4975,7 @@ private:
 class job {
 public:
     // Copies share this controller state. status(), logs(), wait(), and cancel()
-    // must therefore be serialized by the caller. Provider log backends can expose
+    // must therefore be serialised by the caller. Provider log backends can expose
     // final entries late, so terminal draining is bounded and best effort. Once a
     // result is cached, status() and logs() return that terminal snapshot.
     [[nodiscard]] const std::string& id() const noexcept { return data_->id; }
@@ -4799,7 +4993,7 @@ public:
     }
 
     [[nodiscard]] result wait(log_sink sink = {}) const {
-        // Poll incremental logs and normalized state until terminal or the total
+        // Poll incremental logs and normalised state until terminal or the total
         // controller deadline. Terminal state triggers a quiet-period log drain,
         // result caching, and provider-specific cleanup. At deadline, cancel first.
         // Sink/control exceptions trigger best-effort cancellation and cleanup when
@@ -4938,15 +5132,22 @@ public:
         : state_(std::make_shared<detail::client_state>(std::move(value))), storage_(state_),
           compute_(state_) {}
 
+    // Construct one provider-neutral client from the documented CLOUD_*
+    // environment contract. "cheapest" compares every configured provider;
+    // an explicit provider name is the override and keeps planning local.
+    [[nodiscard]] static client from_environment(std::string_view provider_name) {
+        return client(detail::config_from_environment(provider_name));
+    }
+
     [[nodiscard]] cloud::plan plan(const job_spec& spec) const {
         // Does not mutate provider resources; it may invoke a caller pricing
-        // callback or query a read-only public catalog API.
+        // callback or query a read-only public catalogue API.
         return detail::make_plan(*state_, spec);
     }
 
     [[nodiscard]] cloud::job run(const job_spec& spec) const {
         // Replan immediately before submission so validation and price ceilings
-        // are current. GCP uses one randomized audit name plus requestId and, after
+        // are current. GCP uses one randomised audit name plus requestId and, after
         // an ambiguous create response, recovers with GET-by-name instead of replaying.
         const cloud::plan chosen = plan(spec);
         const std::string id = detail::job_id(spec.name);

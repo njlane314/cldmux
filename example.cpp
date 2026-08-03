@@ -22,7 +22,7 @@ int main(int argc, char* argv[]) {
     config.zone = "europe-west4-a"; // Needed by raw GCE, not this Batch plan.
 
     // The default GCP chain checks an explicit environment bearer token,
-    // authorized-user ADC, and finally the GCE metadata service. See the README
+    // authorised-user ADC, and finally the GCE metadata service. See the README
     // for the corresponding AWS credential and Azure OAuth configuration.
     config.auth = cloud::auth::default_chain();
 
@@ -92,7 +92,7 @@ int main(int argc, char* argv[]) {
 
     // Planning validates the entire request and resolves a concrete region,
     // machine type, accelerator, and optional hourly estimate. It never
-    // allocates compute; public pricing only adds read-only catalog requests.
+    // allocates compute; public pricing only adds read-only catalogue requests.
     const cloud::plan plan = client.plan(spec);
     std::cout << "provider: " << plan.provider << '\n'
               << "region:   " << plan.region << '\n'
@@ -110,7 +110,7 @@ int main(int argc, char* argv[]) {
 
     // run() plans once more immediately before submission so validation and
     // price ceilings are fresh. The returned handle owns provider-specific
-    // polling, cancellation, final log draining, and cleanup behavior.
+    // polling, cancellation, final log draining, and cleanup behaviour.
     cloud::job job = client.run(spec);
     const cloud::result result = job.wait([](const cloud::log_entry& line) {
         // Cloud logging services provide line-level polling, not a byte stream.
