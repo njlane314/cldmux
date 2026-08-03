@@ -242,6 +242,37 @@ Callbacks return a finite, non-negative USD hourly rate or `std::nullopt`.
 `resources::max_price_per_hour` fails closed when the estimate is absent or too
 high. An earlier plan is never a reservation; `run()` prices again.
 
+## EMPIRICAL ROUTING
+
+[`apps/empirical.cpp`](apps/empirical.cpp) is a higher-level application which
+learns elapsed time for an author-versioned workload key and scores each named
+candidate with:
+
+```text
+cost proxy = routing quote snapshot × routing runtime / 3600 + known data cost
+```
+
+```sh
+c++ -std=c++17 -Iinclude -I. apps/empirical.cpp -lcurl -pthread -o cloud-empirical
+cloud-empirical render-v2 --candidates=gcp,aws,azure \
+    --data-cost=gcp:0.01 --data-cost=aws:0.02 --data-cost=azure:0
+cloud-empirical render-v2 --provider=aws --data-cost=aws:0.02 --submit
+```
+
+The mean is used only when every candidate reaches the sample threshold;
+otherwise all use `--expected-elapsed`. `--provider` overrides selection and can
+seed observations. Every candidate needs `--data-cost`, including an explicit
+zero. `--hourly-quote` overrides catalogue lookup; see `--help` for all options.
+
+Dry run is the default. `--submit` measures monotonic time from `run()` through
+`wait()` return, flushing the recovery job ID between them, and appends one
+line of whitespace-separated `KEY=value` fields to the
+single-writer, non-JSON ledger. This includes queueing, retries, log collection,
+and cleanup attempts, while the quote remains the earlier routing snapshot;
+the result is not billable runtime, a quote, or an invoice. Failed terminal
+attempts are retained for audit but excluded from the version-one mean. Change
+the workload key whenever runtime-relevant behaviour changes.
+
 ## STORAGE AND RAW COMPUTE
 
 `cloud://bucket/key` maps to GCS, S3, or Azure Blob Storage through the routed
@@ -338,7 +369,7 @@ Use the generated single header when vendoring one file:
 ```
 
 ```text
-apps/                        user application implementations
+apps/empirical.cpp           observed-runtime routing application
 include/cloud/               canonical modular headers
 include/cloud/detail/        transport, pricing, storage, and submission
 include/cloud/detail/providers/
@@ -372,9 +403,9 @@ make sanitise
 
 `make check` compiles every modular header, tests the generator, checks both
 generated headers byte-for-byte, runs modular and single-header suites, probes
-multi-translation-unit use, and builds the example in both forms. Tests use a
-loopback fake server, make no cloud API calls, need no credentials, and cannot
-incur charges.
+multi-translation-unit use, and builds the example and empirical application in
+both forms. Tests use a loopback fake server and injected empirical quotes; they
+make no cloud API calls, need no credentials, and cannot incur charges.
 
 ## LICENCE
 

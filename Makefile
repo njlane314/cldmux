@@ -23,18 +23,23 @@ TEST_SAN_MODULAR := /tmp/cloud-modular-test-san
 TEST_SAN_AMALGAMATED := /tmp/cloud-amalgamated-test-san
 EXAMPLE_MODULAR := /tmp/cloud-example-modular
 EXAMPLE_AMALGAMATED := /tmp/cloud-example-amalgamated
+EMPIRICAL_MODULAR := /tmp/cloud-empirical-modular
+EMPIRICAL_AMALGAMATED := /tmp/cloud-empirical-amalgamated
+EMPIRICAL_SAN_MODULAR := /tmp/cloud-empirical-san-modular
+EMPIRICAL_SAN_AMALGAMATED := /tmp/cloud-empirical-san-amalgamated
 ODR_MODULAR := /tmp/cloud-odr-modular
 ODR_AMALGAMATED := /tmp/cloud-odr-amalgamated
 
 .PHONY: check check-readme check-headers check-tool check-modular \
 	check-amalgamation check-amalgamated check-odr check-odr-modular \
-	check-odr-amalgamated check-cli check-standards check-c++17 check-c++20 \
-	check-c++23 amalgamate example example-amalgamated sanitise
+	check-odr-amalgamated check-cli check-empirical check-standards check-c++17 \
+	check-c++20 check-c++23 amalgamate example example-amalgamated empirical \
+	empirical-amalgamated sanitise
 
 check: check-readme check-headers check-tool check-modular check-amalgamated \
-	check-odr check-cli example-amalgamated
+	check-odr check-cli check-empirical example-amalgamated empirical-amalgamated
 	@! grep -n "$$(printf '\t')" cloud.h single_include/cloud.h \
-		$$(find include tests tools -type f) example.cpp test.cpp README.md
+		$$(find apps include tests tools -type f) example.cpp test.cpp README.md
 
 check-readme:
 	awk '/^```cpp$$/ {code=1; next} code && /^```/ {exit} code {print}' README.md | \
@@ -120,6 +125,18 @@ example-amalgamated: check-amalgamation
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
 		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. example.cpp \
 		$(CURL_LIBS) -pthread -o $(EXAMPLE_AMALGAMATED)
+
+empirical:
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -Iinclude -I. \
+		apps/empirical.cpp $(CURL_LIBS) -pthread -o $(EMPIRICAL_MODULAR)
+
+empirical-amalgamated: check-amalgamation
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
+		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. apps/empirical.cpp \
+		$(CURL_LIBS) -pthread -o $(EMPIRICAL_AMALGAMATED)
+
+check-empirical: empirical
+	sh tests/empirical.sh $(EMPIRICAL_MODULAR)
 
 check-cli: example
 	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
@@ -212,3 +229,12 @@ sanitise: check-amalgamation
 		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. -isystem "$(TST_DIR)" \
 		test.cpp $(CURL_LIBS) -pthread -o $(TEST_SAN_AMALGAMATED)
 	$(TEST_SAN_AMALGAMATED)
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
+		-fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude -I. \
+		apps/empirical.cpp $(CURL_LIBS) -pthread -o $(EMPIRICAL_SAN_MODULAR)
+	sh tests/empirical.sh $(EMPIRICAL_SAN_MODULAR)
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
+		-fsanitize=address,undefined -fno-omit-frame-pointer \
+		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. apps/empirical.cpp \
+		$(CURL_LIBS) -pthread -o $(EMPIRICAL_SAN_AMALGAMATED)
+	sh tests/empirical.sh $(EMPIRICAL_SAN_AMALGAMATED)
