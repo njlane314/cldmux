@@ -2,6 +2,9 @@
 
 #include <arpa/inet.h>
 #include <atomic>
+#include <cctype>
+#include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <limits>
 #include <map>
@@ -71,6 +74,8 @@ class fake_server {
   std::atomic<int> deletes{0};
   std::atomic<int> cursor_queries{0};
   std::atomic<int> overlap_queries{0};
+  std::atomic<int> storage_lists{0};
+  std::atomic<bool> corrupt_download{false};
   std::atomic<bool> request_id_changed{false};
 
  private:
@@ -99,6 +104,44 @@ class fake_server {
 
   reply route(std::string_view method, std::string_view target,
               std::string_view body) {
+    constexpr std::string_view object_path =
+        "/storage/v1/b/test-bucket/o/object";
+    constexpr std::string_view download_path =
+        "/download/storage/v1/b/test-bucket/o/object";
+    if (method == "POST" &&
+        target.starts_with("/upload/storage/v1/b/test-bucket/o?")) {
+      if (query(target, "name") != "object") return {400, "missing object name"};
+      return {200, "{\"name\":\"object\",\"generation\":\"7\","
+                   "\"size\":\"" + std::to_string(body.size()) +
+                   "\",\"crc32c\":\"" +
+                   cloud::gcp::detail::crc32c(body) + "\"}"};
+    }
+    if (method == "GET" && target.starts_with(download_path)) {
+      if (query(target, "generation") != "7") return {400, "missing generation"};
+      return {200, corrupt_download ? "corrupt" : "payload"};
+    }
+    if (method == "GET" && target.starts_with(object_path)) {
+      return {200, "{\"name\":\"object\",\"generation\":\"7\","
+                   "\"size\":\"7\",\"crc32c\":\"" +
+                   cloud::gcp::detail::crc32c("payload") + "\"}"};
+    }
+    if (method == "GET" &&
+        target.starts_with("/storage/v1/b/test-bucket/o?")) {
+      ++storage_lists;
+      if (query(target, "pageToken") == "next")
+        return {200, "{\"items\":[{\"name\":\"second\"}]}"};
+      return {200, "{\"items\":[{\"name\":\"first\"}],"
+                   "\"prefixes\":[\"dir/\"],\"nextPageToken\":\"next\"}"};
+    }
+    if (method == "DELETE" && target.starts_with(object_path)) return {};
+
+    if (method == "GET" && target.find("/instances?") != std::string_view::npos) {
+      if (query(target, "pageToken") == "next")
+        return {200, "{\"items\":[{\"name\":\"vm-b\",\"status\":\"RUNNING\"}]}"};
+      return {200, "{\"items\":[{\"name\":\"vm-a\",\"status\":\"STOPPED\"}],"
+                   "\"nextPageToken\":\"next\"}"};
+    }
+
     if (method == "POST" && target.find("/jobs?") != std::string_view::npos) {
       const std::string id = query(target, "jobId");
       const std::string request = query(target, "requestId");
@@ -136,6 +179,13 @@ class fake_server {
             "{\"entries\":[{\"timestamp\":\"2026-01-01T00:00:05Z\","
             "\"receiveTimestamp\":\"2026-01-01T00:00:05Z\","
             "\"insertId\":\"cancel\",\"textPayload\":\"cancelled\"}]}"};
+      }
+      if (id.find("sink-failure") != std::string::npos) {
+        if (log_attempts_[id]++ == 0) return {200, "{\"entries\":[]}"};
+        return {200,
+            "{\"entries\":[{\"timestamp\":\"2026-01-01T00:00:06Z\","
+            "\"receiveTimestamp\":\"2026-01-01T00:00:06Z\","
+            "\"insertId\":\"sink\",\"textPayload\":\"late\"}]}"};
       }
       if (id.find("retry-success") == std::string::npos)
         return {200, "{\"entries\":[]}"};
@@ -289,6 +339,7 @@ void lifecycle_tests() {
   cloud::config config;
   config.project = "test-project";
   config.region = "europe-west4";
+  config.zone = "europe-west4-a";
   config.auth = cloud::auth::bearer("test");
   config.allow_insecure_http = true;
   config.storage_endpoint = server.url();
@@ -364,12 +415,77 @@ void lifecycle_tests() {
   check(failed.state == cloud::job_state::failed && !failed.exit_code &&
             elapsed < std::chrono::milliseconds(500),
         "failed-task exit lookup respects its deadline");
+
+  spec.name = "sink-failure";
+  spec.auto_delete = true;
+  bool sink_failure = false;
+  try {
+    (void)client.run(spec).wait([](const auto&) {
+      throw std::runtime_error("sink failure");
+    });
+  } catch (const std::runtime_error& failure) {
+    sink_failure = std::string_view(failure.what()) == "sink failure";
+  }
+  check(sink_failure, "final-drain callback exceptions propagate");
+
+  const auto stored =
+      client.storage().put("cloud://test-bucket/object", "payload");
+  check(stored.name == "object" && stored.size == 7,
+        "storage upload metadata");
+  check(client.storage().get("cloud://test-bucket/object") == "payload",
+        "verified storage download");
+  check(client.storage().stat("cloud://test-bucket/object").generation == "7",
+        "storage stat forwarding");
+
+  const int lists_before = server.storage_lists;
+  const auto objects = client.storage().list("cloud://test-bucket");
+  check(objects.objects.size() == 2 && objects.objects[0].name == "first" &&
+            objects.objects[1].name == "second" &&
+            objects.prefixes == std::vector<std::string>{"dir/"} &&
+            server.storage_lists == lists_before + 2,
+        "storage pagination");
+  cloud::list_options limited;
+  limited.limit = 1;
+  const int limited_before = server.storage_lists;
+  check(client.storage().list("cloud://test-bucket", limited).objects.size() ==
+                1 &&
+            server.storage_lists == limited_before + 1,
+        "storage pagination limit");
+
+  const auto destination = std::filesystem::temp_directory_path() /
+                           ("cloud-hpp-test-" +
+                            cloud::gcp::detail::random_uuid());
+  cloud::gcp::detail::TemporaryPathGuard file_guard(destination);
+  client.storage().get_file("cloud://test-bucket/object", destination);
+  check(cloud::gcp::detail::read_small_file(destination) == "payload",
+        "verified file download");
+  {
+    std::ofstream file_output(destination, std::ios::binary | std::ios::trunc);
+    file_output << "preserved";
+  }
+  server.corrupt_download = true;
+  throws([&] { client.storage().get_file("cloud://test-bucket/object", destination); },
+         "file download rejects a corrupt checksum");
+  server.corrupt_download = false;
+  check(cloud::gcp::detail::read_small_file(destination) == "preserved",
+        "corrupt file download preserves destination");
+  client.storage().remove("cloud://test-bucket/object");
+  throws([&] { (void)client.storage().get("cloud://test-bucket"); },
+         "storage object path validation");
+
+  const auto instances = client.compute().instances();
+  check(instances.size() == 2 && instances[0].name == "vm-a" &&
+            instances[1].name == "vm-b",
+        "compute pagination");
 }
 
 }  // namespace
 
 int main() {
   try {
+    static_assert(cloud::gcp::version == CLOUD_HPP_VERSION);
+    static_assert(CLOUD_HPP_VERSION_NUM == 0x000100);
+
     cloud::config config;
     config.project = "test-project";
     config.region = "europe";
@@ -440,6 +556,36 @@ int main() {
               cloud::gcp::detail::parse_json("{\"x\":\"\\u03bb\"}"), "x") ==
               "\xce\xbb",
           "JSON unicode");
+    const auto json = cloud::gcp::detail::parse_json(
+        "{\"items\":[{},{}],\"number\":-1.25e+2}");
+    check(json.get("items") && json.get("items")->array().size() == 2 &&
+              cloud::gcp::detail::field(json, "number") == "-1.25e+2",
+          "templated JSON collections and numbers");
+    throws([] { (void)cloud::gcp::detail::parse_json("[\v]"); },
+           "JSON whitespace is locale independent");
+    for (const std::string_view invalid : {"1.", "1e", "-"})
+      throws([=] { (void)cloud::gcp::detail::parse_json(invalid); },
+             "malformed JSON number rejected");
+    check(!cloud::gcp::detail::is_ascii_alnum(static_cast<char>(0xe5)),
+          "identifier grammar is ASCII");
+    check(cloud::detail::parse_state("QUEUED") == cloud::job_state::queued &&
+              cloud::detail::parse_state("SCHEDULED") ==
+                  cloud::job_state::scheduled &&
+              cloud::detail::parse_state("RUNNING") ==
+                  cloud::job_state::running &&
+              cloud::detail::parse_state("SUCCEEDED") ==
+                  cloud::job_state::succeeded &&
+              cloud::detail::parse_state("FAILED") ==
+                  cloud::job_state::failed &&
+              cloud::detail::parse_state("CANCELLATION_IN_PROGRESS") ==
+                  cloud::job_state::cancelling &&
+              cloud::detail::parse_state("CANCELLED") ==
+                  cloud::job_state::cancelled &&
+              cloud::detail::parse_state("DELETION_IN_PROGRESS") ==
+                  cloud::job_state::deleting &&
+              cloud::detail::parse_state("NOT_A_STATE") ==
+                  cloud::job_state::unknown,
+          "Batch state table");
 
     const std::string id = cloud::detail::job_id("42 / VERY Long Job Name !!!");
     check(id.size() <= 63 && std::isalpha(static_cast<unsigned char>(id.front())),

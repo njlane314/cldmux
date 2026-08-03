@@ -8,12 +8,18 @@
 #ifndef CLOUD_HPP_INCLUDED
 #define CLOUD_HPP_INCLUDED
 
+#define CLOUD_HPP_VERSION "0.1.0"
+#define CLOUD_HPP_VERSION_NUM 0x000100
+
+/*
+ * Headers
+ */
+
 #include <curl/curl.h>
 
 #include <algorithm>
 #include <array>
 #include <chrono>
-#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -47,12 +53,15 @@
 namespace cloud { namespace detail { struct client_state; } }
 namespace cloud::gcp {
 
-inline constexpr std::string_view version = "0.1.0";
+inline constexpr std::string_view version = CLOUD_HPP_VERSION;
+
+/*
+ * GCP configuration and public types
+ */
 
 class Error : public std::runtime_error {
  public:
-  explicit Error(std::string message, long http_status = 0,
-                 std::string response = {})
+  explicit Error(std::string message, long http_status = 0, std::string response = {})
       : std::runtime_error(std::move(message)),
         http_status_(http_status),
         response_(std::move(response)) {}
@@ -67,8 +76,7 @@ class Error : public std::runtime_error {
 
 struct AccessToken {
   std::string value;
-  std::chrono::system_clock::time_point expires_at =
-      std::chrono::system_clock::time_point::max();
+  std::chrono::system_clock::time_point expires_at = std::chrono::system_clock::time_point::max();
   std::string quota_project;
 };
 
@@ -83,13 +91,8 @@ class Credentials {
 
   Credentials() : Credentials(automatic()) {}
 
-  static Credentials automatic() {
-    return from([] { return detail::automatic_token(); });
-  }
-
-  static Credentials metadata() {
-    return from([] { return detail::metadata_token(); });
-  }
+  static Credentials automatic() { return from([] { return detail::automatic_token(); }); }
+  static Credentials metadata() { return from([] { return detail::metadata_token(); }); }
 
   static Credentials bearer(std::string token) {
     if (token.empty()) throw Error("Bearer token must not be empty");
@@ -103,6 +106,8 @@ class Credentials {
     return Credentials(std::make_shared<State>(std::move(provider)));
   }
 
+  // Copies share one cache. Tokens refresh five minutes early so a request
+  // does not start with a credential likely to expire in flight.
   [[nodiscard]] AccessToken access_token() const {
     std::lock_guard lock(state_->mutex);
     const auto now = std::chrono::system_clock::now();
@@ -204,14 +209,29 @@ class Bucket;
 class Vm;
 class Operation;
 
+/*
+ * Transport, JSON, and authentication
+ */
+
 namespace detail {
 
+// Cloud identifiers and JSON are ASCII grammars. Unlike <cctype>, these
+// helpers are independent of the process-wide C locale and accept plain char.
+inline bool is_ascii_digit(char c) { return c >= '0' && c <= '9'; }
+inline bool is_ascii_lower(char c) { return c >= 'a' && c <= 'z'; }
+inline bool is_ascii_upper(char c) { return c >= 'A' && c <= 'Z'; }
+inline bool is_ascii_alpha(char c) { return is_ascii_lower(c) || is_ascii_upper(c); }
+inline bool is_ascii_alnum(char c) { return is_ascii_alpha(c) || is_ascii_digit(c); }
+inline bool is_ascii_space(char c) { return c == ' ' || (c >= '\t' && c <= '\r'); }
+inline bool is_json_space(char c) { return c == ' ' || c == '\t' || c == '\n' || c == '\r'; }
+inline char ascii_lower(char c) {
+  return is_ascii_upper(c) ? static_cast<char>(c + ('a' - 'A')) : c;
+}
+
 inline std::string trim(std::string value) {
-  const auto not_space = [](unsigned char c) { return !std::isspace(c); };
-  value.erase(value.begin(),
-              std::find_if(value.begin(), value.end(), not_space));
-  value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(),
-              value.end());
+  const auto not_space = [](char c) { return !is_ascii_space(c); };
+  value.erase(value.begin(), std::find_if(value.begin(), value.end(), not_space));
+  value.erase(std::find_if(value.rbegin(), value.rend(), not_space).base(), value.end());
   return value;
 }
 
@@ -222,8 +242,7 @@ inline std::string env(std::string_view name) {
 }
 
 inline std::string header(std::string_view name, std::string_view value) {
-  if (value.find('\r') != std::string_view::npos ||
-      value.find('\n') != std::string_view::npos)
+  if (value.find('\r') != std::string_view::npos || value.find('\n') != std::string_view::npos)
     throw Error("Invalid newline in HTTP header value");
   return std::string(name) + ": " + std::string(value);
 }
@@ -239,10 +258,8 @@ inline std::string encode(std::string_view input) {
   out.reserve(input.size() + input.size() / 4);
   for (const char raw : input) {
     const auto c = static_cast<unsigned char>(raw);
-    const bool unreserved = (c >= 'A' && c <= 'Z') ||
-                            (c >= 'a' && c <= 'z') ||
-                            (c >= '0' && c <= '9') || c == '-' || c == '_' ||
-                            c == '.' || c == '~';
+    const bool unreserved = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                            (c >= '0' && c <= '9') || c == '-' || c == '_' || c == '.' || c == '~';
     if (unreserved) {
       out.push_back(static_cast<char>(c));
     } else {
@@ -288,14 +305,10 @@ class Json {
   struct Number { std::string text; };
   using Array = std::vector<Json>;
   using Object = std::map<std::string, Json, std::less<>>;
+  using Value = std::variant<std::nullptr_t, bool, std::string, Number, Array, Object>;
 
   Json() : value_(nullptr) {}
-  explicit Json(std::nullptr_t) : value_(nullptr) {}
-  explicit Json(bool value) : value_(value) {}
-  explicit Json(std::string value) : value_(std::move(value)) {}
-  explicit Json(Number value) : value_(std::move(value)) {}
-  explicit Json(Array value) : value_(std::move(value)) {}
-  explicit Json(Object value) : value_(std::move(value)) {}
+  explicit Json(Value value) : value_(std::move(value)) {}
 
   [[nodiscard]] bool is_object() const { return std::holds_alternative<Object>(value_); }
 
@@ -324,7 +337,7 @@ class Json {
   }
 
  private:
-  std::variant<std::nullptr_t, bool, std::string, Number, Array, Object> value_;
+  Value value_;
 };
 
 class JsonParser {
@@ -341,13 +354,11 @@ class JsonParser {
 
  private:
   [[noreturn]] void fail(std::string_view why) const {
-    throw Error("Invalid JSON at byte " + std::to_string(position_) + ": " +
-                std::string(why));
+    throw Error("Invalid JSON at byte " + std::to_string(position_) + ": " + std::string(why));
   }
 
   void whitespace() {
-    while (position_ < input_.size() &&
-           std::isspace(static_cast<unsigned char>(input_[position_]))) ++position_;
+    while (position_ < input_.size() && is_json_space(input_[position_])) ++position_;
   }
 
   char take() {
@@ -365,15 +376,20 @@ class JsonParser {
     whitespace();
     if (position_ >= input_.size()) fail("expected value");
     switch (input_[position_]) {
-      case 'n': if (consume("null")) return Json(nullptr); break;
-      case 't': if (consume("true")) return Json(true); break;
-      case 'f': if (consume("false")) return Json(false); break;
+      case 'n':
+        if (consume("null")) return Json(nullptr);
+        break;
+      case 't':
+        if (consume("true")) return Json(true);
+        break;
+      case 'f':
+        if (consume("false")) return Json(false);
+        break;
       case '"': return Json(parse_string());
       case '[': return parse_array();
       case '{': return parse_object();
       default:
-        if (input_[position_] == '-' || std::isdigit(static_cast<unsigned char>(input_[position_])))
-          return parse_number();
+        if (input_[position_] == '-' || is_ascii_digit(input_[position_])) return parse_number();
     }
     fail("expected value");
   }
@@ -381,19 +397,13 @@ class JsonParser {
   static void append_utf8(std::string& out, std::uint32_t cp) {
     if (cp <= 0x7f) {
       out.push_back(static_cast<char>(cp));
-    } else if (cp <= 0x7ff) {
-      out.push_back(static_cast<char>(0xc0 | (cp >> 6)));
-      out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
-    } else if (cp <= 0xffff) {
-      out.push_back(static_cast<char>(0xe0 | (cp >> 12)));
-      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
-      out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
-    } else {
-      out.push_back(static_cast<char>(0xf0 | (cp >> 18)));
-      out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3f)));
-      out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3f)));
-      out.push_back(static_cast<char>(0x80 | (cp & 0x3f)));
+      return;
     }
+    static constexpr unsigned char lead[] = {0, 0, 0xc0, 0xe0, 0xf0};
+    const int bytes = cp <= 0x7ff ? 2 : cp <= 0xffff ? 3 : 4;
+    out.push_back(static_cast<char>(lead[bytes] | (cp >> (6 * (bytes - 1)))));
+    for (int shift = 6 * (bytes - 2); shift >= 0; shift -= 6)
+      out.push_back(static_cast<char>(0x80 | ((cp >> shift) & 0x3f)));
   }
 
   std::uint32_t hex4() {
@@ -401,10 +411,14 @@ class JsonParser {
     for (int i = 0; i < 4; ++i) {
       const char c = take();
       value <<= 4;
-      if (c >= '0' && c <= '9') value |= static_cast<unsigned>(c - '0');
-      else if (c >= 'a' && c <= 'f') value |= static_cast<unsigned>(c - 'a' + 10);
-      else if (c >= 'A' && c <= 'F') value |= static_cast<unsigned>(c - 'A' + 10);
-      else fail("invalid unicode escape");
+      if (c >= '0' && c <= '9')
+        value |= static_cast<unsigned>(c - '0');
+      else if (c >= 'a' && c <= 'f')
+        value |= static_cast<unsigned>(c - 'a' + 10);
+      else if (c >= 'A' && c <= 'F')
+        value |= static_cast<unsigned>(c - 'A' + 10);
+      else
+        fail("invalid unicode escape");
     }
     return value;
   }
@@ -454,67 +468,59 @@ class JsonParser {
     if (input_[position_] == '0') {
       ++position_;
     } else {
-      if (!std::isdigit(static_cast<unsigned char>(input_[position_]))) fail("invalid number");
-      while (position_ < input_.size() &&
-             std::isdigit(static_cast<unsigned char>(input_[position_]))) ++position_;
+      digits("invalid number");
     }
     if (position_ < input_.size() && input_[position_] == '.') {
       ++position_;
-      if (position_ >= input_.size() ||
-          !std::isdigit(static_cast<unsigned char>(input_[position_]))) fail("invalid number");
-      while (position_ < input_.size() &&
-             std::isdigit(static_cast<unsigned char>(input_[position_]))) ++position_;
+      digits("invalid number");
     }
     if (position_ < input_.size() && (input_[position_] == 'e' || input_[position_] == 'E')) {
       ++position_;
-      if (position_ < input_.size() && (input_[position_] == '+' || input_[position_] == '-')) ++position_;
-      if (position_ >= input_.size() ||
-          !std::isdigit(static_cast<unsigned char>(input_[position_]))) fail("invalid exponent");
-      while (position_ < input_.size() &&
-             std::isdigit(static_cast<unsigned char>(input_[position_]))) ++position_;
+      if (position_ < input_.size() && (input_[position_] == '+' || input_[position_] == '-'))
+        ++position_;
+      digits("invalid exponent");
     }
     return Json(Json::Number{std::string(input_.substr(begin, position_ - begin))});
   }
 
-  Json parse_array() {
+  void digits(std::string_view error) {
+    if (position_ >= input_.size() || !is_ascii_digit(input_[position_])) fail(error);
+    while (position_ < input_.size() && is_ascii_digit(input_[position_])) ++position_;
+  }
+
+  template <typename Collection, typename Append>
+  Json parse_collection(char close, std::string_view separator_error, Collection out,
+                        Append append) {
     take();
-    Json::Array out;
     whitespace();
-    if (position_ < input_.size() && input_[position_] == ']') {
+    if (position_ < input_.size() && input_[position_] == close) {
       ++position_;
       return Json(std::move(out));
     }
     while (true) {
-      out.push_back(parse_value());
+      append(out);
       whitespace();
       const char separator = take();
-      if (separator == ']') return Json(std::move(out));
-      if (separator != ',') fail("expected ',' or ']'");
+      if (separator == close) return Json(std::move(out));
+      if (separator != ',') fail(separator_error);
       whitespace();
     }
   }
 
+  Json parse_array() {
+    return parse_collection(']', "expected ',' or ']'", Json::Array{},
+                            [&](auto& out) { out.push_back(parse_value()); });
+  }
+
   Json parse_object() {
-    take();
-    Json::Object out;
-    whitespace();
-    if (position_ < input_.size() && input_[position_] == '}') {
-      ++position_;
-      return Json(std::move(out));
-    }
-    while (true) {
+    return parse_collection('}', "expected ',' or '}'", Json::Object{}, [&](auto& out) {
       if (position_ >= input_.size() || input_[position_] != '"') fail("expected object key");
       std::string key = parse_string();
       whitespace();
       if (take() != ':') fail("expected ':'");
       whitespace();
       out.emplace(std::move(key), parse_value());
-      whitespace();
-      const char separator = take();
-      if (separator == '}') return Json(std::move(out));
-      if (separator != ',') fail("expected ',' or '}'");
-      whitespace();
-    }
+    });
   }
 
   std::string_view input_;
@@ -526,6 +532,27 @@ inline Json parse_json(std::string_view text) { return JsonParser(text).parse();
 inline std::string field(const Json& value, std::string_view key) {
   const Json* child = value.get(key);
   return child ? child->text() : std::string{};
+}
+
+template <typename Function>
+inline void for_each_json(const Json& value, std::string_view key, Function function) {
+  if (const auto* items = value.get(key))
+    for (const auto& item : items->array()) function(item);
+}
+
+template <typename Item, typename Fetch, typename Parse, typename Visit>
+inline std::vector<Item> paginate(std::size_t limit, Fetch fetch, Parse parse, Visit visit) {
+  std::vector<Item> result;
+  std::string page;
+  do {
+    const Json json = fetch(page);
+    for_each_json(json, "items", [&](const Json& item) {
+      if (!limit || result.size() < limit) result.push_back(parse(item));
+    });
+    visit(json);
+    page = limit && result.size() >= limit ? std::string{} : field(json, "nextPageToken");
+  } while (!page.empty());
+  return result;
 }
 
 inline std::uint64_t unsigned_field(const Json& value, std::string_view key) {
@@ -543,13 +570,11 @@ inline std::string last_path_segment(std::string value) {
   return slash == std::string::npos ? value : value.substr(slash + 1);
 }
 
-inline std::uint32_t crc32c_update(std::uint32_t crc, const unsigned char* data,
-                                   std::size_t size) {
+inline std::uint32_t crc32c_update(std::uint32_t crc, const unsigned char* data, std::size_t size) {
   crc = ~crc;
   for (std::size_t i = 0; i < size; ++i) {
     crc ^= data[i];
-    for (int bit = 0; bit < 8; ++bit)
-      crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1u)));
+    for (int bit = 0; bit < 8; ++bit) crc = (crc >> 1) ^ (0x82f63b78u & (0u - (crc & 1u)));
   }
   return ~crc;
 }
@@ -573,8 +598,8 @@ inline std::string crc32c_base64(std::uint32_t crc) {
 }
 
 inline std::string crc32c(std::string_view data) {
-  return crc32c_base64(crc32c_update(
-      0, reinterpret_cast<const unsigned char*>(data.data()), data.size()));
+  return crc32c_base64(
+      crc32c_update(0, reinterpret_cast<const unsigned char*>(data.data()), data.size()));
 }
 
 struct UploadSource {
@@ -584,18 +609,16 @@ struct UploadSource {
   std::string crc32c;
 };
 
-inline std::shared_ptr<UploadSource> prepare_upload(
-    const std::filesystem::path& path, bool checksum) {
+inline std::shared_ptr<UploadSource> prepare_upload(const std::filesystem::path& path,
+                                                    bool checksum) {
   auto stream = std::make_shared<std::ifstream>(path, std::ios::binary);
   if (!*stream) throw Error("Cannot open upload file: " + path.string());
   stream->seekg(0, std::ios::end);
   const std::streampos end = stream->tellg();
-  if (end == std::streampos(-1))
-    throw Error("Cannot determine upload file size: " + path.string());
+  if (end == std::streampos(-1)) throw Error("Cannot determine upload file size: " + path.string());
   const std::streamoff length = end;
-  if (length < 0 ||
-      static_cast<std::uintmax_t>(length) >
-          static_cast<std::uintmax_t>(std::numeric_limits<curl_off_t>::max()))
+  if (length < 0 || static_cast<std::uintmax_t>(length) >
+                        static_cast<std::uintmax_t>(std::numeric_limits<curl_off_t>::max()))
     throw Error("Upload file is too large for libcurl: " + path.string());
   stream->seekg(0, std::ios::beg);
   if (!*stream) throw Error("Cannot seek upload file: " + path.string());
@@ -607,20 +630,17 @@ inline std::shared_ptr<UploadSource> prepare_upload(
     while (stream->read(buffer.data(), static_cast<std::streamsize>(buffer.size())) ||
            stream->gcount() > 0) {
       const auto count = stream->gcount();
-      crc = crc32c_update(crc,
-          reinterpret_cast<const unsigned char*>(buffer.data()),
-          static_cast<std::size_t>(count));
+      crc = crc32c_update(crc, reinterpret_cast<const unsigned char*>(buffer.data()),
+                          static_cast<std::size_t>(count));
     }
-    if (stream->bad())
-      throw Error("Failed while checksumming upload file: " + path.string());
+    if (stream->bad()) throw Error("Failed while checksumming upload file: " + path.string());
     digest = crc32c_base64(crc);
     stream->clear();
     stream->seekg(0, std::ios::beg);
     if (!*stream) throw Error("Cannot rewind upload file: " + path.string());
   }
   return std::make_shared<UploadSource>(
-      UploadSource{path, std::move(stream), static_cast<curl_off_t>(length),
-                   std::move(digest)});
+      UploadSource{path, std::move(stream), static_cast<curl_off_t>(length), std::move(digest)});
 }
 
 inline std::string random_uuid() {
@@ -658,8 +678,7 @@ struct CurlGlobal {
   ~CurlGlobal() = default;
 };
 
-static_assert(LIBCURL_VERSION_NUM >= 0x075400,
-              "cloud.hpp requires libcurl 7.84.0 or newer");
+static_assert(LIBCURL_VERSION_NUM >= 0x075400, "cloud.hpp requires libcurl 7.84.0 or newer");
 
 inline void ensure_curl() { static CurlGlobal global; (void)global; }
 
@@ -703,8 +722,7 @@ inline std::size_t write_callback(char* data, std::size_t size, std::size_t coun
     }
     const std::size_t bytes = size * count;
     if (sink.file) {
-      if (bytes > static_cast<std::size_t>(
-                      std::numeric_limits<std::streamsize>::max())) {
+      if (bytes > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
         sink.io_error = true;
         return 0;
       }
@@ -717,8 +735,7 @@ inline std::size_t write_callback(char* data, std::size_t size, std::size_t coun
       sink.text->append(data, bytes);
     }
     if (sink.checksum)
-      sink.crc = crc32c_update(sink.crc,
-          reinterpret_cast<const unsigned char*>(data), bytes);
+      sink.crc = crc32c_update(sink.crc, reinterpret_cast<const unsigned char*>(data), bytes);
     return bytes;
   } catch (...) {
     sink.exception = std::current_exception();
@@ -745,8 +762,7 @@ inline std::size_t read_callback(char* data, std::size_t size, std::size_t count
     if (source.remaining <= 0) return 0;
     if (static_cast<std::uintmax_t>(source.remaining) < capacity)
       capacity = static_cast<std::size_t>(source.remaining);
-    if (capacity > static_cast<std::size_t>(
-                       std::numeric_limits<std::streamsize>::max())) {
+    if (capacity > static_cast<std::size_t>(std::numeric_limits<std::streamsize>::max())) {
       source.io_error = true;
       return CURL_READFUNC_ABORT;
     }
@@ -770,8 +786,7 @@ inline std::size_t read_callback(char* data, std::size_t size, std::size_t count
 
 inline void curl_check(CURLcode code, std::string_view action) {
   if (code != CURLE_OK)
-    throw Error("libcurl " + std::string(action) + " failed: " +
-                curl_easy_strerror(code));
+    throw Error("libcurl " + std::string(action) + " failed: " + curl_easy_strerror(code));
 }
 
 template <typename Value>
@@ -779,8 +794,7 @@ inline void curl_set(CURL* curl, CURLoption option, Value value) {
   curl_check(curl_easy_setopt(curl, option, value), "configuration");
 }
 
-inline long curl_milliseconds(std::chrono::milliseconds value,
-                              std::string_view name) {
+inline long curl_milliseconds(std::chrono::milliseconds value, std::string_view name) {
   if (value <= std::chrono::milliseconds::zero() ||
       value.count() > std::numeric_limits<long>::max())
     throw Error(std::string(name) + " must be a positive libcurl duration");
@@ -788,8 +802,7 @@ inline long curl_milliseconds(std::chrono::milliseconds value,
 }
 
 inline curl_off_t curl_size(std::size_t value) {
-  if (value > static_cast<std::size_t>(
-                  std::numeric_limits<curl_off_t>::max()))
+  if (value > static_cast<std::size_t>(std::numeric_limits<curl_off_t>::max()))
     throw Error("HTTP request body is too large for libcurl");
   return static_cast<curl_off_t>(value);
 }
@@ -812,8 +825,7 @@ inline void remove_noexcept(const std::filesystem::path& path) noexcept {
 class TemporaryPathGuard {
  public:
   TemporaryPathGuard() = default;
-  explicit TemporaryPathGuard(std::filesystem::path path)
-      : path_(std::move(path)), active_(true) {}
+  explicit TemporaryPathGuard(std::filesystem::path path) : path_(std::move(path)), active_(true) {}
   TemporaryPathGuard(const TemporaryPathGuard&) = delete;
   TemporaryPathGuard& operator=(const TemporaryPathGuard&) = delete;
   ~TemporaryPathGuard() {
@@ -828,8 +840,7 @@ class TemporaryPathGuard {
 
 inline HttpResponse http(HttpRequest request) {
   ensure_curl();
-  std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(),
-                                                           &curl_easy_cleanup);
+  std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), &curl_easy_cleanup);
   if (!curl) throw Error("curl_easy_init failed");
 
   char error_buffer[CURL_ERROR_SIZE] = {};
@@ -840,16 +851,14 @@ inline HttpResponse http(HttpRequest request) {
 #if LIBCURL_VERSION_NUM >= 0x075500
   curl_set(curl.get(), CURLOPT_PROTOCOLS_STR, "http,https");
 #else
-  curl_set(curl.get(), CURLOPT_PROTOCOLS,
-           static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+  curl_set(curl.get(), CURLOPT_PROTOCOLS, static_cast<long>(CURLPROTO_HTTP | CURLPROTO_HTTPS));
 #endif
   curl_set(curl.get(), CURLOPT_TIMEOUT_MS,
-           curl_milliseconds(request.timeout.value_or(
-                                 std::chrono::milliseconds(60'000)),
+           curl_milliseconds(request.timeout.value_or(std::chrono::milliseconds(60'000)),
                              "HTTP timeout"));
   curl_set(curl.get(), CURLOPT_CONNECTTIMEOUT_MS,
            curl_milliseconds(request.connect_timeout, "HTTP connect timeout"));
-  curl_set(curl.get(), CURLOPT_USERAGENT, "cloud.hpp/0.1.0");
+  curl_set(curl.get(), CURLOPT_USERAGENT, "cloud.hpp/" CLOUD_HPP_VERSION);
   if (request.no_proxy) curl_set(curl.get(), CURLOPT_NOPROXY, "*");
 
   curl_slist* raw_headers = nullptr;
@@ -862,7 +871,7 @@ inline HttpResponse http(HttpRequest request) {
     raw_headers = appended;
   }
   std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(raw_headers,
-                                                                    &curl_slist_free_all);
+                                                                      &curl_slist_free_all);
   if (headers) curl_set(curl.get(), CURLOPT_HTTPHEADER, headers.get());
 
   ReadSource upload_source;
@@ -870,8 +879,7 @@ inline HttpResponse http(HttpRequest request) {
     auto& upload = *request.upload_file->stream;
     upload.clear();
     upload.seekg(0, std::ios::beg);
-    if (!upload)
-      throw Error("Cannot rewind upload file: " + request.upload_file->path.string());
+    if (!upload) throw Error("Cannot rewind upload file: " + request.upload_file->path.string());
     upload_source.stream = &upload;
     upload_source.remaining = request.upload_file->size;
     curl_set(curl.get(), CURLOPT_POST, 1L);
@@ -946,8 +954,7 @@ inline HttpResponse http(HttpRequest request) {
   if (request.download_file) {
     if (response.status < 200 || response.status >= 300) {
       response.body = read_small_file(temporary);
-    } else if (request.expected_crc32c &&
-               response.crc32c != *request.expected_crc32c) {
+    } else if (request.expected_crc32c && response.crc32c != *request.expected_crc32c) {
       throw Error("Cloud Storage download checksum mismatch");
     } else {
       std::error_code ec;
@@ -986,9 +993,8 @@ inline std::string metadata_host() {
   return "http://" + host;
 }
 
-inline std::optional<std::string> metadata_get(std::string_view path,
-                                               std::chrono::milliseconds timeout =
-                                                   std::chrono::milliseconds(800)) {
+inline std::optional<std::string> metadata_get(
+    std::string_view path, std::chrono::milliseconds timeout = std::chrono::milliseconds(800)) {
   try {
     auto response = http(HttpRequest{
         .method = "GET",
@@ -1009,8 +1015,7 @@ inline AccessToken metadata_token() {
     try {
       auto response = http(HttpRequest{
           .method = "GET",
-          .url = metadata_host() +
-                 "/computeMetadata/v1/instance/service-accounts/default/token",
+          .url = metadata_host() + "/computeMetadata/v1/instance/service-accounts/default/token",
           .headers = {"Metadata-Flavor: Google"},
           .no_proxy = true,
           .timeout = std::chrono::milliseconds(1500),
@@ -1021,17 +1026,13 @@ inline AccessToken metadata_token() {
         const std::string token = field(json, "access_token");
         const auto seconds = unsigned_field(json, "expires_in");
         if (token.empty() || seconds == 0) throw Error("Malformed metadata token response");
-        return AccessToken{token,
-                           std::chrono::system_clock::now() +
-                               std::chrono::seconds(seconds),
-                           {}};
+        return AccessToken{
+            token, std::chrono::system_clock::now() + std::chrono::seconds(seconds), {}};
       }
       if (response.status != 429 && response.status < 500)
         throw Error("Metadata token request failed", response.status, response.body);
     } catch (const Error& error) {
-      if (error.http_status() > 0 && error.http_status() != 429 &&
-          error.http_status() < 500)
-        throw;
+      if (error.http_status() > 0 && error.http_status() != 429 && error.http_status() < 500) throw;
       if (attempt == 2) throw;
     }
     std::this_thread::sleep_for(std::chrono::milliseconds(100 * (1 << attempt)));
@@ -1045,10 +1046,9 @@ inline AccessToken refresh_authorized_user(const Json& json) {
   const std::string refresh_token = field(json, "refresh_token");
   if (client_id.empty() || client_secret.empty() || refresh_token.empty())
     throw Error("Malformed authorized_user ADC file");
-  const std::string body =
-      "grant_type=refresh_token&client_id=" + encode(client_id) +
-      "&client_secret=" + encode(client_secret) +
-      "&refresh_token=" + encode(refresh_token);
+  const std::string body = "grant_type=refresh_token&client_id=" + encode(client_id) +
+                           "&client_secret=" + encode(client_secret) +
+                           "&refresh_token=" + encode(refresh_token);
   auto response = http(HttpRequest{
       .method = "POST",
       .url = "https://oauth2.googleapis.com/token",
@@ -1062,8 +1062,7 @@ inline AccessToken refresh_authorized_user(const Json& json) {
   const std::string token = field(token_json, "access_token");
   const auto seconds = unsigned_field(token_json, "expires_in");
   if (token.empty() || seconds == 0) throw Error("Malformed OAuth token response");
-  return AccessToken{token,
-                     std::chrono::system_clock::now() + std::chrono::seconds(seconds),
+  return AccessToken{token, std::chrono::system_clock::now() + std::chrono::seconds(seconds),
                      field(json, "quota_project_id")};
 }
 
@@ -1072,8 +1071,7 @@ inline std::optional<std::filesystem::path> well_known_adc_path() {
     return std::filesystem::path(config) / "application_default_credentials.json";
 #ifdef _WIN32
   if (const std::string appdata = env("APPDATA"); !appdata.empty())
-    return std::filesystem::path(appdata) / "gcloud" /
-           "application_default_credentials.json";
+    return std::filesystem::path(appdata) / "gcloud" / "application_default_credentials.json";
 #else
   if (const std::string home = env("HOME"); !home.empty())
     return std::filesystem::path(home) / ".config" / "gcloud" /
@@ -1087,8 +1085,7 @@ inline Json read_json_file(const std::filesystem::path& path) {
   if (!input) throw Error("Cannot open credential file: " + path.string());
   std::ostringstream buffer;
   buffer << input.rdbuf();
-  if (!input.good() && !input.eof())
-    throw Error("Cannot read credential file: " + path.string());
+  if (!input.good() && !input.eof()) throw Error("Cannot read credential file: " + path.string());
   return parse_json(buffer.str());
 }
 
@@ -1102,11 +1099,9 @@ inline AccessToken token_from_adc_file(const std::filesystem::path& path) {
 
 inline AccessToken automatic_token() {
   if (std::string token = env("GCP_ACCESS_TOKEN"); !token.empty())
-    return AccessToken{std::move(token),
-                       std::chrono::system_clock::time_point::max(), {}};
+    return AccessToken{std::move(token), std::chrono::system_clock::time_point::max(), {}};
   if (std::string token = env("GOOGLE_OAUTH_ACCESS_TOKEN"); !token.empty())
-    return AccessToken{std::move(token),
-                       std::chrono::system_clock::time_point::max(), {}};
+    return AccessToken{std::move(token), std::chrono::system_clock::time_point::max(), {}};
 
   if (const std::string explicit_path = env("GOOGLE_APPLICATION_CREDENTIALS");
       !explicit_path.empty())
@@ -1156,8 +1151,7 @@ class Core {
     if (resolved_project.empty()) resolved_project = env("GCLOUD_PROJECT");
     if (resolved_project.empty()) resolved_project = env("GCP_PROJECT");
     if (resolved_project.empty()) {
-      if (const auto value = metadata_get("project/project-id"))
-        resolved_project = *value;
+      if (const auto value = metadata_get("project/project-id")) resolved_project = *value;
     }
     if (resolved_project.empty())
       throw Error("No GCP project configured; set Config::project or GOOGLE_CLOUD_PROJECT");
@@ -1189,8 +1183,7 @@ class Core {
       std::string quota = config.quota_project;
       if (quota.empty()) quota = env("GOOGLE_CLOUD_QUOTA_PROJECT");
       if (quota.empty()) quota = token.quota_project;
-      if (!quota.empty())
-        current.headers.push_back(header("X-Goog-User-Project", quota));
+      if (!quota.empty()) current.headers.push_back(header("X-Goog-User-Project", quota));
       return http(std::move(current));
     };
 
@@ -1203,11 +1196,17 @@ class Core {
     return response;
   }
 
+  Json json(HttpRequest request) const { return parse_json(call(std::move(request)).body); }
+
+  std::string compute_url(std::string_view zone, std::string path) const {
+    return config.compute_endpoint + "/compute/v1/projects/" + encode(project()) + "/zones/" +
+           encode(zone) + std::move(path);
+  }
+
   Config config;
 
  private:
-  void validate_endpoint(const std::string& endpoint,
-                         std::string_view option_name) const {
+  void validate_endpoint(const std::string& endpoint, std::string_view option_name) const {
     if (endpoint.starts_with("https://")) return;
     if (endpoint.starts_with("http://") && config.allow_insecure_http) return;
     throw Error("Config::" + std::string(option_name) +
@@ -1217,8 +1216,8 @@ class Core {
   static void check(const HttpResponse& response) {
     if (response.status >= 200 && response.status < 300) return;
     const std::string body = compact_error_body(response.body);
-    std::string message = "Google Cloud request failed with HTTP " +
-                          std::to_string(response.status);
+    std::string message =
+        "Google Cloud request failed with HTTP " + std::to_string(response.status);
     if (!body.empty()) message += ": " + body;
     throw Error(std::move(message), response.status, body);
   }
@@ -1250,162 +1249,123 @@ inline Instance parse_instance(const Json& json) {
       .status = field(json, "status"),
       .creation_timestamp = field(json, "creationTimestamp"),
   };
-  if (const Json* interfaces = json.get("networkInterfaces")) {
-    for (const auto& interface : interfaces->array()) {
-      if (result.internal_ip.empty()) result.internal_ip = field(interface, "networkIP");
-      if (const Json* configs = interface.get("accessConfigs")) {
-        for (const auto& config : configs->array()) {
-          if (result.external_ip.empty()) result.external_ip = field(config, "natIP");
-        }
-      }
-    }
-  }
+  for_each_json(json, "networkInterfaces", [&](const Json& interface) {
+    if (result.internal_ip.empty()) result.internal_ip = field(interface, "networkIP");
+    for_each_json(interface, "accessConfigs", [&](const Json& config) {
+      if (result.external_ip.empty()) result.external_ip = field(config, "natIP");
+    });
+  });
   return result;
 }
 
 inline std::string operation_error(const Json& json) {
   const Json* error = json.get("error");
   std::string result;
-  if (error) {
-    if (const Json* errors = error->get("errors")) {
-      for (const auto& item : errors->array()) {
-        std::string message = field(item, "message");
-        if (message.empty()) message = field(item, "code");
-        if (!message.empty()) {
-          if (!result.empty()) result += "; ";
-          result += message;
-        }
+  if (error)
+    for_each_json(*error, "errors", [&](const Json& item) {
+      std::string message = field(item, "message");
+      if (message.empty()) message = field(item, "code");
+      if (!message.empty()) {
+        if (!result.empty()) result += "; ";
+        result += message;
       }
-    }
-  }
+    });
   if (result.empty()) result = field(json, "httpErrorMessage");
   const std::string status_code = field(json, "httpErrorStatusCode");
   if (result.empty() && !status_code.empty() && status_code != "0")
     result = "HTTP status " + status_code;
-  if (result.empty() && error && error->is_object())
-    result = "unknown operation error";
+  if (result.empty() && error && error->is_object()) result = "unknown operation error";
   return result;
 }
 
 }  // namespace detail
+
+/*
+ * Storage and Compute primitives
+ */
 
 class Bucket {
  public:
   [[nodiscard]] const std::string& name() const noexcept { return name_; }
 
   [[nodiscard]] Object stat(std::string_view object) const {
-    auto response = core_->call(detail::HttpRequest{
-        .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o/" +
-                       detail::encode(object) +
-                       "?fields=name%2Cgeneration%2Csize%2CcontentType%2Cupdated%2Cetag%2Ccrc32c%2Cmd5Hash"),
-    });
-    return detail::parse_object(detail::parse_json(response.body));
+    return detail::parse_object(core_->json(detail::HttpRequest{
+        .url = storage(
+            "/storage/v1/b/" + detail::encode(name_) + "/o/" + detail::encode(object) +
+            "?fields=name%2Cgeneration%2Csize%2CcontentType%2Cupdated%2Cetag%2Ccrc32c%2Cmd5Hash"),
+    }));
   }
 
   [[nodiscard]] ObjectList list(ListOptions options = {}) const {
     ObjectList result;
-    std::string page_token;
-    do {
-      std::string query = "?maxResults=1000";
-      if (!options.prefix.empty()) query += "&prefix=" + detail::encode(options.prefix);
-      if (!options.delimiter.empty()) query += "&delimiter=" + detail::encode(options.delimiter);
-      if (options.versions) query += "&versions=true";
-      if (!page_token.empty()) query += "&pageToken=" + detail::encode(page_token);
-      auto response = core_->call(detail::HttpRequest{
-          .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o" + query),
-      });
-      const detail::Json json = detail::parse_json(response.body);
-      if (const auto* items = json.get("items")) {
-        for (const auto& item : items->array()) {
-          result.objects.push_back(detail::parse_object(item));
-          if (options.limit && result.objects.size() >= options.limit) break;
-        }
-      }
-      if (const auto* prefixes = json.get("prefixes")) {
-        for (const auto& prefix : prefixes->array()) result.prefixes.push_back(prefix.text());
-      }
-      page_token = options.limit && result.objects.size() >= options.limit
-                       ? std::string{}
-                       : detail::field(json, "nextPageToken");
-    } while (!page_token.empty());
+    result.objects = detail::paginate<Object>(
+        options.limit,
+        [&](const std::string& page) {
+          std::string query = "?maxResults=1000";
+          if (!options.prefix.empty()) query += "&prefix=" + detail::encode(options.prefix);
+          if (!options.delimiter.empty())
+            query += "&delimiter=" + detail::encode(options.delimiter);
+          if (options.versions) query += "&versions=true";
+          if (!page.empty()) query += "&pageToken=" + detail::encode(page);
+          return core_->json(detail::HttpRequest{
+              .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o" + query),
+          });
+        },
+        detail::parse_object,
+        [&](const detail::Json& json) {
+          detail::for_each_json(json, "prefixes", [&](const detail::Json& prefix) {
+            result.prefixes.push_back(prefix.text());
+          });
+        });
     return result;
   }
 
   [[nodiscard]] Object put(std::string_view object, std::string_view bytes,
                            PutOptions options = {}) const {
     const std::string checksum = options.crc32c ? detail::crc32c(bytes) : std::string{};
-    auto response = core_->call(detail::HttpRequest{
+    Object result = detail::parse_object(core_->json(detail::HttpRequest{
         .method = "POST",
         .url = upload_url(object, options),
         .headers = upload_headers(options, checksum),
         .body = std::string(bytes),
-    });
-    Object result = detail::parse_object(detail::parse_json(response.body));
+    }));
     if (!checksum.empty() && checksum != result.crc32c)
       throw Error("Cloud Storage upload checksum mismatch");
     return result;
   }
 
-  [[nodiscard]] Object put_file(std::string_view object,
-                                const std::filesystem::path& source,
+  [[nodiscard]] Object put_file(std::string_view object, const std::filesystem::path& source,
                                 PutOptions options = {}) const {
     const auto upload = detail::prepare_upload(source, options.crc32c);
     const std::string& checksum = upload->crc32c;
-    auto response = core_->call(detail::HttpRequest{
+    Object result = detail::parse_object(core_->json(detail::HttpRequest{
         .method = "POST",
         .url = upload_url(object, options),
         .headers = upload_headers(options, checksum),
         .upload_file = upload,
         .timeout = core_->config.transfer_timeout,
-    });
-    Object result = detail::parse_object(detail::parse_json(response.body));
+    }));
     if (!checksum.empty() && checksum != result.crc32c)
       throw Error("Cloud Storage upload checksum mismatch");
     return result;
   }
 
+  // Verified downloads first pin a generation and require CRC32C metadata, so
+  // bytes cannot silently come from a different object version.
   [[nodiscard]] std::string get(std::string_view object, bool verify = true) const {
-    Object metadata;
-    if (verify) metadata = stat(object);
-    require_verification_metadata(metadata, verify);
-    std::string query = "?alt=media";
-    if (verify && !metadata.generation.empty())
-      query += "&generation=" + detail::encode(metadata.generation);
-    auto response = core_->call(detail::HttpRequest{
-        .url = storage("/download/storage/v1/b/" + detail::encode(name_) + "/o/" +
-                       detail::encode(object) + query),
-        .headers = {"Accept-Encoding: gzip"},
-        .calculate_crc32c = verify,
-        .accept_json = false,
-    });
-    if (verify && response.crc32c != metadata.crc32c)
-      throw Error("Cloud Storage download checksum mismatch");
-    return std::move(response.body);
+    return download(object, verify, [](auto&, const auto&) {}).body;
   }
 
   void get_file(std::string_view object, const std::filesystem::path& destination,
                 bool verify = true) const {
-    Object metadata;
-    if (verify) metadata = stat(object);
-    require_verification_metadata(metadata, verify);
-    std::string query = "?alt=media";
-    if (verify && !metadata.generation.empty())
-      query += "&generation=" + detail::encode(metadata.generation);
-    core_->call(detail::HttpRequest{
-        .url = storage("/download/storage/v1/b/" + detail::encode(name_) + "/o/" +
-                       detail::encode(object) + query),
-        .headers = {"Accept-Encoding: gzip"},
-        .download_file = destination,
-        .expected_crc32c = verify ? std::optional<std::string>(metadata.crc32c)
-                                 : std::nullopt,
-        .calculate_crc32c = verify,
-        .accept_json = false,
-        .timeout = core_->config.transfer_timeout,
+    (void)download(object, verify, [&](auto& request, const Object& metadata) {
+      request.download_file = destination;
+      request.expected_crc32c = verify ? std::optional<std::string>(metadata.crc32c) : std::nullopt;
+      request.timeout = core_->config.transfer_timeout;
     });
   }
 
-  void erase(std::string_view object,
-             std::optional<std::string> generation = std::nullopt) const {
+  void erase(std::string_view object, std::optional<std::string> generation = std::nullopt) const {
     std::string query;
     if (generation) {
       query = "?generation=" + detail::encode(*generation) +
@@ -1413,8 +1373,8 @@ class Bucket {
     }
     core_->call(detail::HttpRequest{
         .method = "DELETE",
-        .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o/" +
-                       detail::encode(object) + query),
+        .url = storage("/storage/v1/b/" + detail::encode(name_) + "/o/" + detail::encode(object) +
+                       query),
     });
   }
 
@@ -1429,8 +1389,7 @@ class Bucket {
     return core_->config.storage_endpoint + std::move(path);
   }
 
-  [[nodiscard]] std::string upload_url(std::string_view object,
-                                       const PutOptions& options) const {
+  [[nodiscard]] std::string upload_url(std::string_view object, const PutOptions& options) const {
     std::string url = storage("/upload/storage/v1/b/" + detail::encode(name_) +
                               "/o?uploadType=media&name=" + detail::encode(object));
     if (options.if_generation_match)
@@ -1438,20 +1397,41 @@ class Bucket {
     return url;
   }
 
-  [[nodiscard]] static std::vector<std::string> upload_headers(
-      const PutOptions& options, const std::string& checksum) {
-    std::vector<std::string> headers{
-        detail::header("Content-Type", options.content_type)};
-    if (!checksum.empty())
-      headers.push_back(detail::header("X-Goog-Hash", "crc32c=" + checksum));
+  [[nodiscard]] static std::vector<std::string> upload_headers(const PutOptions& options,
+                                                               const std::string& checksum) {
+    std::vector<std::string> headers{detail::header("Content-Type", options.content_type)};
+    if (!checksum.empty()) headers.push_back(detail::header("X-Goog-Hash", "crc32c=" + checksum));
     return headers;
+  }
+
+  template <typename Configure>
+  [[nodiscard]] detail::HttpResponse download(std::string_view object, bool verify,
+                                              Configure configure) const {
+    Object metadata;
+    if (verify) metadata = stat(object);
+    require_verification_metadata(metadata, verify);
+    std::string query = "?alt=media";
+    if (verify) query += "&generation=" + detail::encode(metadata.generation);
+    detail::HttpRequest request{
+        .url = storage("/download/storage/v1/b/" + detail::encode(name_) + "/o/" +
+                       detail::encode(object) + query),
+        .headers = {"Accept-Encoding: gzip"},
+        .calculate_crc32c = verify,
+        .accept_json = false,
+    };
+    configure(request, metadata);
+    auto response = core_->call(std::move(request));
+    if (verify && response.crc32c != metadata.crc32c)
+      throw Error("Cloud Storage download checksum mismatch");
+    return response;
   }
 
   static void require_verification_metadata(const Object& metadata, bool verify) {
     if (!verify) return;
     if (metadata.generation.empty() || metadata.crc32c.empty())
-      throw Error("Cloud Storage object lacks generation/CRC32C metadata; "
-                  "verified download is unavailable");
+      throw Error(
+          "Cloud Storage object lacks generation/CRC32C metadata; "
+          "verified download is unavailable");
   }
 
   std::shared_ptr<detail::Core> core_;
@@ -1473,18 +1453,13 @@ class Operation {
     const auto deadline = std::chrono::steady_clock::now() + timeout;
     while (true) {
       const auto now = std::chrono::steady_clock::now();
-      if (now >= deadline)
-        throw Error("Timed out waiting for Compute operation '" + name_ + "'");
-      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
-          deadline - now);
-      const auto response = core_->call(detail::HttpRequest{
-          .url = core_->config.compute_endpoint + "/compute/v1/projects/" +
-                 detail::encode(core_->project()) + "/zones/" + detail::encode(zone_) +
-                 "/operations/" + detail::encode(name_),
-          .timeout = std::max(std::chrono::milliseconds(1),
-                              std::min(core_->config.timeout, remaining)),
+      if (now >= deadline) throw Error("Timed out waiting for Compute operation '" + name_ + "'");
+      const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+      const detail::Json json = core_->json(detail::HttpRequest{
+          .url = core_->compute_url(zone_, "/operations/" + detail::encode(name_)),
+          .timeout =
+              std::max(std::chrono::milliseconds(1), std::min(core_->config.timeout, remaining)),
       });
-      const detail::Json json = detail::parse_json(response.body);
       if (detail::field(json, "status") == "DONE") {
         const std::string failure = detail::operation_error(json);
         if (!failure.empty()) throw Error("Compute operation failed: " + failure);
@@ -1492,9 +1467,9 @@ class Operation {
       }
       if (std::chrono::steady_clock::now() >= deadline)
         throw Error("Timed out waiting for Compute operation '" + name_ + "'");
-      std::this_thread::sleep_for(std::min(poll_interval,
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              deadline - std::chrono::steady_clock::now())));
+      std::this_thread::sleep_for(
+          std::min(poll_interval, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                      deadline - std::chrono::steady_clock::now())));
     }
   }
 
@@ -1516,17 +1491,16 @@ class Vm {
   [[nodiscard]] const std::string& name() const noexcept { return name_; }
 
   [[nodiscard]] Instance get() const {
-    auto response = core_->call(detail::HttpRequest{.url = instance_url()});
-    return detail::parse_instance(detail::parse_json(response.body));
+    return detail::parse_instance(core_->json(detail::HttpRequest{.url = instance_url()}));
   }
 
   [[nodiscard]] std::string status() const { return get().status; }
 
   [[nodiscard]] Operation start() const { return action("start"); }
   [[nodiscard]] Operation stop(bool discard_local_ssd = false) const {
-    return action(std::string("stop?discardLocalSsd=") +
-                  (discard_local_ssd ? "true" : "false") +
-                  "&requestId=" + detail::random_uuid(), false);
+    return action(std::string("stop?discardLocalSsd=") + (discard_local_ssd ? "true" : "false") +
+                      "&requestId=" + detail::random_uuid(),
+                  false);
   }
   [[nodiscard]] Operation erase() const { return action("", true); }
 
@@ -1538,9 +1512,7 @@ class Vm {
   }
 
   [[nodiscard]] std::string instance_url() const {
-    return core_->config.compute_endpoint + "/compute/v1/projects/" +
-           detail::encode(core_->project()) + "/zones/" + detail::encode(core_->zone()) +
-           "/instances/" + detail::encode(name_);
+    return core_->compute_url(core_->zone(), "/instances/" + detail::encode(name_));
   }
 
   [[nodiscard]] Operation action(std::string action, bool deleting = false) const {
@@ -1552,11 +1524,10 @@ class Vm {
     } else {
       url += "/" + action + "?requestId=" + detail::random_uuid();
     }
-    auto response = core_->call(detail::HttpRequest{
+    const detail::Json json = core_->json(detail::HttpRequest{
         .method = deleting ? "DELETE" : "POST",
         .url = std::move(url),
     });
-    const detail::Json json = detail::parse_json(response.body);
     return Operation(core_, detail::field(json, "name"), core_->zone());
   }
 
@@ -1566,59 +1537,41 @@ class Vm {
 
 class Cloud {
  public:
-  explicit Cloud(Config config = {})
-      : core_(std::make_shared<detail::Core>(std::move(config))) {}
+  explicit Cloud(Config config = {}) : core_(std::make_shared<detail::Core>(std::move(config))) {}
 
-  [[nodiscard]] Bucket bucket(std::string name) const {
-    return Bucket(core_, std::move(name));
-  }
+  [[nodiscard]] Bucket bucket(std::string name) const { return Bucket(core_, std::move(name)); }
 
   [[nodiscard]] Vm vm(std::string name) const { return Vm(core_, std::move(name)); }
 
-  [[nodiscard]] Operation create_from_template(
-      std::string name, std::string instance_template) const {
+  [[nodiscard]] Operation create_from_template(std::string name,
+                                               std::string instance_template) const {
     if (name.empty() || instance_template.empty())
       throw Error("VM name and instance template must not be empty");
-    if (!instance_template.starts_with("projects/") &&
-        !instance_template.starts_with("global/"))
+    if (!instance_template.starts_with("projects/") && !instance_template.starts_with("global/"))
       instance_template = "global/instanceTemplates/" + instance_template;
     const std::string request_id = detail::random_uuid();
-    auto response = core_->call(detail::HttpRequest{
+    const detail::Json json = core_->json(detail::HttpRequest{
         .method = "POST",
-        .url = core_->config.compute_endpoint + "/compute/v1/projects/" +
-               detail::encode(core_->project()) + "/zones/" +
-               detail::encode(core_->zone()) + "/instances?sourceInstanceTemplate=" +
-               detail::encode(instance_template) + "&requestId=" + request_id,
+        .url = core_->compute_url(core_->zone(), "/instances?sourceInstanceTemplate=" +
+                                                    detail::encode(instance_template) +
+                                                    "&requestId=" + request_id),
         .headers = {"Content-Type: application/json"},
         .body = "{\"name\":" + detail::json_quote(name) + "}",
     });
-    return Operation(core_, detail::field(detail::parse_json(response.body), "name"),
-                     core_->zone());
+    return Operation(core_, detail::field(json, "name"), core_->zone());
   }
 
   [[nodiscard]] std::vector<Instance> vms(std::size_t limit = 0) const {
-    std::vector<Instance> result;
-    std::string page_token;
-    do {
-      std::string query = "?maxResults=500";
-      if (!page_token.empty()) query += "&pageToken=" + detail::encode(page_token);
-      auto response = core_->call(detail::HttpRequest{
-          .url = core_->config.compute_endpoint + "/compute/v1/projects/" +
-                 detail::encode(core_->project()) + "/zones/" +
-                 detail::encode(core_->zone()) + "/instances" + query,
-      });
-      const detail::Json json = detail::parse_json(response.body);
-      if (const auto* items = json.get("items")) {
-        for (const auto& item : items->array()) {
-          result.push_back(detail::parse_instance(item));
-          if (limit && result.size() >= limit) break;
-        }
-      }
-      page_token = limit && result.size() >= limit
-                       ? std::string{}
-                       : detail::field(json, "nextPageToken");
-    } while (!page_token.empty());
-    return result;
+    return detail::paginate<Instance>(
+        limit,
+        [&](const std::string& page) {
+          std::string query = "?maxResults=500";
+          if (!page.empty()) query += "&pageToken=" + detail::encode(page);
+          return core_->json(detail::HttpRequest{
+              .url = core_->compute_url(core_->zone(), "/instances" + query),
+          });
+        },
+        detail::parse_instance, [](const detail::Json&) {});
   }
 
   [[nodiscard]] std::string project() const { return core_->project(); }
@@ -1630,6 +1583,10 @@ class Cloud {
 };
 
 }  // namespace cloud::gcp
+
+/*
+ * Provider-independent API
+ */
 
 namespace cloud {
 
@@ -1646,31 +1603,22 @@ using operation = gcp::Operation;
 using provider = std::string;
 enum class selection { ordered, lowest_cost };
 enum class feature {
-  object_storage,
-  containers,
-  spot_instances,
-  storage_mounts,
-  log_streaming,
-  raw_instances,
-  accelerators,
-  cost_estimates,
+  object_storage, containers, spot_instances, storage_mounts,
+  log_streaming, raw_instances, accelerators, cost_estimates,
 };
 
 class auth {
  public:
   auth() : credentials_(gcp::Credentials::automatic()) {}
   static auth default_chain() { return {}; }
-  static auth bearer(std::string token) {
-    return auth(gcp::Credentials::bearer(std::move(token)));
-  }
+  static auth bearer(std::string token) { return auth(gcp::Credentials::bearer(std::move(token))); }
   static auth from(token_provider callback) {
     return auth(gcp::Credentials::from(std::move(callback)));
   }
 
  private:
   friend struct detail::client_state;
-  explicit auth(gcp::Credentials credentials)
-      : credentials_(std::move(credentials)) {}
+  explicit auth(gcp::Credentials credentials) : credentials_(std::move(credentials)) {}
   gcp::Credentials credentials_;
 };
 
@@ -1689,6 +1637,8 @@ struct mount {
 };
 
 struct job_spec {
+  // command is direct argv and mount sources are buckets or slash-terminated
+  // prefixes. timeout is both the controller deadline and Batch's per-attempt cap.
   std::string name = "job";
   std::string image;
   std::vector<std::string> command;
@@ -1702,6 +1652,8 @@ struct job_spec {
 };
 
 struct plan {
+  // Estimates are advisory. A maximum price fails closed unless the caller
+  // supplied an estimate for the selected provider and machine.
   cloud::provider provider = "gcp";
   std::string region;
   std::string machine_type;
@@ -1710,17 +1662,20 @@ struct plan {
   std::vector<std::string> warnings;
 };
 
+#define CLOUD_HPP_JOB_STATES(X)             \
+  X(queued, "QUEUED")                       \
+  X(scheduled, "SCHEDULED")                 \
+  X(running, "RUNNING")                     \
+  X(succeeded, "SUCCEEDED")                 \
+  X(failed, "FAILED")                       \
+  X(cancelling, "CANCELLATION_IN_PROGRESS") \
+  X(cancelled, "CANCELLED")                 \
+  X(deleting, "DELETION_IN_PROGRESS")
+#define CLOUD_HPP_JOB_STATE_ENUM(name, unused) name,
 enum class job_state {
-  queued,
-  scheduled,
-  running,
-  succeeded,
-  failed,
-  cancelling,
-  cancelled,
-  deleting,
-  unknown,
+  CLOUD_HPP_JOB_STATES(CLOUD_HPP_JOB_STATE_ENUM) unknown,
 };
+#undef CLOUD_HPP_JOB_STATE_ENUM
 
 struct log_entry {
   std::string timestamp;
@@ -1735,14 +1690,12 @@ struct result {
   std::optional<int> exit_code;
   std::string message;
   std::vector<std::string> warnings;
-  [[nodiscard]] bool success() const noexcept {
-    return state == job_state::succeeded;
-  }
+  [[nodiscard]] bool success() const noexcept { return state == job_state::succeeded; }
   [[nodiscard]] const std::string& error() const noexcept { return message; }
 };
 
-using price_estimator = std::function<std::optional<double>(
-    std::string_view, std::string_view, std::string_view, bool)>;
+using price_estimator = std::function<std::optional<double>(std::string_view, std::string_view,
+                                                            std::string_view, bool)>;
 using log_sink = std::function<void(const log_entry&)>;
 
 struct config {
@@ -1767,6 +1720,10 @@ struct config {
   std::string logging_endpoint = "https://logging.googleapis.com";
 };
 
+/*
+ * Planning and Batch controller
+ */
+
 namespace detail {
 
 struct uri {
@@ -1774,17 +1731,16 @@ struct uri {
   std::string key;
 };
 
-inline uri parse_uri(std::string_view value) {
+inline uri parse_uri(std::string_view value, std::string_view operation = {}) {
   constexpr std::string_view prefix = "cloud://";
-  if (!value.starts_with(prefix))
-    throw error("Cloud URI must start with cloud://");
+  if (!value.starts_with(prefix)) throw error("Cloud URI must start with cloud://");
   value.remove_prefix(prefix.size());
   const auto slash = value.find('/');
   uri out{std::string(value.substr(0, slash)),
-          slash == std::string_view::npos
-              ? std::string{}
-              : std::string(value.substr(slash + 1))};
+          slash == std::string_view::npos ? std::string{} : std::string(value.substr(slash + 1))};
   if (out.bucket.empty()) throw error("Cloud URI must contain a bucket");
+  if (!operation.empty() && out.key.empty())
+    throw error(std::string(operation) + "() requires an object path");
   return out;
 }
 
@@ -1792,60 +1748,55 @@ inline std::string region(std::string value) {
   if (value == "europe") return "europe-west4";
   if (value == "us") return "us-central1";
   if (value == "asia") return "asia-east1";
-  if (value.empty() || !std::isalpha(static_cast<unsigned char>(value.front())) ||
-      !std::isalnum(static_cast<unsigned char>(value.back())))
+  if (value.empty() || !gcp::detail::is_ascii_alpha(value.front()) ||
+      !gcp::detail::is_ascii_alnum(value.back()))
     throw error("Invalid GCP region");
-  for (const char raw : value) {
-    const auto c = static_cast<unsigned char>(raw);
-    if (!std::islower(c) && !std::isdigit(c) && c != '-')
+  for (const char c : value)
+    if (!gcp::detail::is_ascii_lower(c) && !gcp::detail::is_ascii_digit(c) && c != '-')
       throw error("Invalid GCP region");
-  }
   return value;
 }
 
 inline void validate_project(std::string_view value) {
   if (value.empty()) throw error("GCP project must not be empty");
-  for (const char raw : value) {
-    const auto c = static_cast<unsigned char>(raw);
-    if (!std::isalnum(c) && c != '-' && c != '.' && c != ':')
+  for (const char c : value)
+    if (!gcp::detail::is_ascii_alnum(c) && c != '-' && c != '.' && c != ':')
       throw error("Invalid GCP project identifier");
-  }
 }
 
-inline provider selected_provider(const config& cfg,
-                                  std::vector<std::string>* warnings = nullptr) {
+inline provider selected_provider(const config& cfg, std::vector<std::string>* warnings = nullptr) {
   const std::vector<provider> choices =
       cfg.provider ? std::vector<provider>{*cfg.provider} : cfg.providers;
   if (choices.empty()) throw error("No cloud provider configured");
   if (cfg.selection == selection::lowest_cost)
-    throw error("lowest_cost requires at least two implemented providers; "
-                "only GCP is implemented");
+    throw error(
+        "lowest_cost requires at least two implemented providers; "
+        "only GCP is implemented");
   for (const auto& value : choices) {
     if (value == "gcp") return value;
-    if (warnings)
-      warnings->push_back(value + " backend is not implemented; skipped");
-    if (cfg.provider)
-      throw error(value + " backend is not implemented");
+    if (warnings) warnings->push_back(value + " backend is not implemented; skipped");
+    if (cfg.provider) throw error(value + " backend is not implemented");
   }
   throw error("None of the configured cloud providers is implemented");
 }
 
 inline std::string machine(const resources& requested) {
   if (!requested.gpu.empty())
-    throw error("gcp does not support requested accelerator \"" +
-                requested.gpu + "\" in cloud.hpp v0.1");
-  if (!requested.cpus || !(requested.memory_gb > 0) ||
-      !std::isfinite(requested.memory_gb))
+    throw error("gcp does not support requested accelerator \"" + requested.gpu +
+                "\" in cloud.hpp v0.1");
+  if (!requested.cpus || !(requested.memory_gb > 0) || !std::isfinite(requested.memory_gb))
     throw error("Resources require positive CPU and memory values");
-  struct shape { const char* name; unsigned cpus; double memory; };
+  struct shape {
+    const char* name;
+    unsigned cpus;
+    double memory;
+  };
   static constexpr shape shapes[] = {
-      {"e2-standard-2", 2, 8}, {"e2-standard-4", 4, 16},
-      {"e2-standard-8", 8, 32}, {"e2-standard-16", 16, 64},
-      {"e2-standard-32", 32, 128},
+      {"e2-standard-2", 2, 8},    {"e2-standard-4", 4, 16},    {"e2-standard-8", 8, 32},
+      {"e2-standard-16", 16, 64}, {"e2-standard-32", 32, 128},
   };
   for (const auto& shape : shapes)
-    if (requested.cpus <= shape.cpus && requested.memory_gb <= shape.memory)
-      return shape.name;
+    if (requested.cpus <= shape.cpus && requested.memory_gb <= shape.memory) return shape.name;
   throw error("No built-in GCP machine mapping satisfies the request");
 }
 
@@ -1858,11 +1809,10 @@ inline cloud::plan make_plan(const config& cfg, const job_spec& spec) {
   out.region = detail::region(cfg.region);
   out.machine_type = machine(spec.resources);
   if (cfg.estimate_hourly_cost)
-    out.estimated_hourly_cost = cfg.estimate_hourly_cost(
-        out.provider, out.region, out.machine_type, spec.resources.spot);
+    out.estimated_hourly_cost =
+        cfg.estimate_hourly_cost(out.provider, out.region, out.machine_type, spec.resources.spot);
   if (out.estimated_hourly_cost &&
-      (!std::isfinite(*out.estimated_hourly_cost) ||
-       *out.estimated_hourly_cost < 0))
+      (!std::isfinite(*out.estimated_hourly_cost) || *out.estimated_hourly_cost < 0))
     throw error("Price estimator returned an invalid hourly price");
   if (!out.estimated_hourly_cost)
     out.warnings.push_back("hourly cost unavailable; estimates are never guarantees");
@@ -1881,8 +1831,7 @@ inline cloud::plan make_plan(const config& cfg, const job_spec& spec) {
   return out;
 }
 
-inline std::string strings(const std::vector<std::string>& values,
-                           std::size_t begin = 0) {
+inline std::string strings(const std::vector<std::string>& values, std::size_t begin = 0) {
   std::string out = "[";
   for (std::size_t i = begin; i < values.size(); ++i) {
     if (i != begin) out += ',';
@@ -1892,11 +1841,9 @@ inline std::string strings(const std::vector<std::string>& values,
 }
 
 inline void validate_workdir(std::string_view path) {
-  for (const char raw : path) {
-    const auto c = static_cast<unsigned char>(raw);
-    if (!std::isalnum(c) && c != '/' && c != '.' && c != '_' && c != '-')
+  for (const char c : path)
+    if (!gcp::detail::is_ascii_alnum(c) && c != '/' && c != '.' && c != '_' && c != '-')
       throw error("Container workdir contains an unsafe character");
-  }
 }
 
 inline void validate_spec(const job_spec& spec) {
@@ -1921,13 +1868,11 @@ inline void validate_spec(const job_spec& spec) {
 }
 
 inline std::string batch_body(const job_spec& spec, const cloud::plan& chosen) {
-  std::string container = "{\"imageUri\":" +
-      gcp::detail::json_quote(spec.image) + ",\"entrypoint\":" +
-      gcp::detail::json_quote(spec.command.front()) + ",\"commands\":" +
-      strings(spec.command, 1);
+  std::string container = "{\"imageUri\":" + gcp::detail::json_quote(spec.image) +
+                          ",\"entrypoint\":" + gcp::detail::json_quote(spec.command.front()) +
+                          ",\"commands\":" + strings(spec.command, 1);
   if (!spec.workdir.empty())
-    container += ",\"options\":" +
-                 gcp::detail::json_quote("--workdir=" + spec.workdir);
+    container += ",\"options\":" + gcp::detail::json_quote("--workdir=" + spec.workdir);
 
   std::string task_volumes;
   std::string container_volumes;
@@ -1935,63 +1880,57 @@ inline std::string batch_body(const job_spec& spec, const cloud::plan& chosen) {
     const auto& item = spec.mounts[i];
     const uri source = parse_uri(item.source);
     const std::string host = "/mnt/disks/cloud-" + std::to_string(i);
-    const std::string remote =
-        source.bucket + (source.key.empty() ? "" : "/" + source.key);
+    const std::string remote = source.bucket + (source.key.empty() ? "" : "/" + source.key);
     if (!task_volumes.empty()) {
       task_volumes += ',';
       container_volumes += ',';
     }
-    task_volumes += "{\"gcs\":{\"remotePath\":" +
-        gcp::detail::json_quote(remote) + "},\"mountPath\":" +
-        gcp::detail::json_quote(host) + '}';
-    container_volumes += gcp::detail::json_quote(
-        host + ":" + item.target + (item.read_only ? ":ro" : ""));
+    task_volumes += "{\"gcs\":{\"remotePath\":" + gcp::detail::json_quote(remote) +
+                    "},\"mountPath\":" + gcp::detail::json_quote(host) + '}';
+    container_volumes +=
+        gcp::detail::json_quote(host + ":" + item.target + (item.read_only ? ":ro" : ""));
   }
-  if (!container_volumes.empty())
-    container += ",\"volumes\":[" + container_volumes + ']';
+  if (!container_volumes.empty()) container += ",\"volumes\":[" + container_volumes + ']';
   container += '}';
 
   const auto milliseconds = spec.timeout.count();
   const auto seconds = milliseconds / 1000 + (milliseconds % 1000 != 0);
-  const auto memory = static_cast<std::uint64_t>(
-      std::ceil(spec.resources.memory_gb * 1024.0));
-  std::string task = "{\"runnables\":[{\"container\":" + container +
-      "}],\"computeResource\":{\"cpuMilli\":" +
+  const auto memory = static_cast<std::uint64_t>(std::ceil(spec.resources.memory_gb * 1024.0));
+  std::string task =
+      "{\"runnables\":[{\"container\":" + container + "}],\"computeResource\":{\"cpuMilli\":" +
       gcp::detail::json_quote(std::to_string(spec.resources.cpus * 1000ULL)) +
       ",\"memoryMib\":" + gcp::detail::json_quote(std::to_string(memory)) +
-      "},\"maxRunDuration\":" +
-      gcp::detail::json_quote(std::to_string(seconds) + "s") +
+      "},\"maxRunDuration\":" + gcp::detail::json_quote(std::to_string(seconds) + "s") +
       ",\"maxRetryCount\":" + std::to_string(spec.retries);
   if (!task_volumes.empty()) task += ",\"volumes\":[" + task_volumes + ']';
   task += '}';
 
-  const std::string service_account = spec.service_account.empty()
-      ? std::string{}
-      : ",\"serviceAccount\":{\"email\":" +
-            gcp::detail::json_quote(spec.service_account) + '}';
+  const std::string service_account =
+      spec.service_account.empty()
+          ? std::string{}
+          : ",\"serviceAccount\":{\"email\":" + gcp::detail::json_quote(spec.service_account) + '}';
 
   return "{\"taskGroups\":[{\"taskSpec\":" + task +
-      ",\"taskCount\":\"1\",\"parallelism\":\"1\"}],"
-      "\"allocationPolicy\":{\"location\":{\"allowedLocations\":[" +
-      gcp::detail::json_quote("regions/" + chosen.region) +
-      "]},\"instances\":[{\"policy\":{\"machineType\":" +
-      gcp::detail::json_quote(chosen.machine_type) +
-      ",\"provisioningModel\":\"" +
-      std::string(spec.resources.spot ? "SPOT" : "STANDARD") +
-      "\"},\"blockProjectSshKeys\":true}]" + service_account + "},"
-      "\"logsPolicy\":{\"destination\":\"CLOUD_LOGGING\"},"
-      "\"labels\":{\"cloud-hpp\":\"temporary\",\"cloud-hpp-ttl-seconds\":" +
-      gcp::detail::json_quote(std::to_string(seconds)) + "}}";
+         ",\"taskCount\":\"1\",\"parallelism\":\"1\"}],"
+         "\"allocationPolicy\":{\"location\":{\"allowedLocations\":[" +
+         gcp::detail::json_quote("regions/" + chosen.region) +
+         "]},\"instances\":[{\"policy\":{\"machineType\":" +
+         gcp::detail::json_quote(chosen.machine_type) + ",\"provisioningModel\":\"" +
+         std::string(spec.resources.spot ? "SPOT" : "STANDARD") +
+         "\"},\"blockProjectSshKeys\":true}]" + service_account +
+         "},"
+         "\"logsPolicy\":{\"destination\":\"CLOUD_LOGGING\"},"
+         "\"labels\":{\"cloud-hpp\":\"temporary\",\"cloud-hpp-ttl-seconds\":" +
+         gcp::detail::json_quote(std::to_string(seconds)) + "}}";
 }
 
 inline std::string job_id(std::string value) {
   for (char& c : value) {
-    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    if (!std::isalnum(static_cast<unsigned char>(c))) c = '-';
+    c = gcp::detail::ascii_lower(c);
+    if (!gcp::detail::is_ascii_alnum(c)) c = '-';
   }
   while (!value.empty() && value.back() == '-') value.pop_back();
-  if (value.empty() || !std::isalpha(static_cast<unsigned char>(value.front())))
-    value = "job-" + value;
+  if (value.empty() || !gcp::detail::is_ascii_alpha(value.front())) value = "job-" + value;
   if (value.size() > 46) value.resize(46);
   std::string suffix = gcp::detail::random_uuid();
   suffix.erase(std::remove(suffix.begin(), suffix.end(), '-'), suffix.end());
@@ -2017,8 +1956,7 @@ struct client_state {
     return out;
   }
 
-  explicit client_state(cloud::config value)
-      : config(std::move(value)), raw(low_level(config)) {
+  explicit client_state(cloud::config value) : config(std::move(value)), raw(low_level(config)) {
     if (config.poll_interval <= std::chrono::milliseconds::zero() ||
         config.final_log_delay < std::chrono::milliseconds::zero() ||
         config.final_log_timeout < config.final_log_delay ||
@@ -2026,31 +1964,28 @@ struct client_state {
       throw error("Polling and cleanup durations must be valid");
   }
 
-  [[nodiscard]] std::shared_ptr<gcp::detail::Core> core() const {
-    return raw.core_;
-  }
+  [[nodiscard]] std::shared_ptr<gcp::detail::Core> core() const { return raw.core_; }
 };
 
 inline bool retryable(long status) {
-  return status == 0 || status == 408 || status == 429 ||
-         (status >= 500 && status < 600);
+  return status == 0 || status == 408 || status == 429 || (status >= 500 && status < 600);
 }
 
 inline gcp::detail::HttpResponse call(
     const client_state& client, const gcp::detail::HttpRequest& request,
-    std::chrono::steady_clock::time_point deadline =
-        std::chrono::steady_clock::time_point::max()) {
-  const auto base_timeout =
-      request.timeout.value_or(client.config.request_timeout);
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+  // Status-less failures plus HTTP 408, 429, and 5xx are retried. Mutation
+  // callers also use provider idempotency keys for ambiguous responses.
+  const auto base_timeout = request.timeout.value_or(client.config.request_timeout);
   for (int attempt = 0;; ++attempt) {
     auto current = request;
     if (deadline != std::chrono::steady_clock::time_point::max()) {
       const auto now = std::chrono::steady_clock::now();
       if (now >= deadline) throw error("Cloud operation deadline exceeded");
-      current.timeout = std::max(std::chrono::milliseconds(1),
-          std::min(base_timeout,
-              std::chrono::duration_cast<std::chrono::milliseconds>(
-                  deadline - now)));
+      current.timeout =
+          std::max(std::chrono::milliseconds(1),
+                   std::min(base_timeout,
+                            std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now)));
     }
     try {
       return client.core()->call(std::move(current));
@@ -2060,16 +1995,15 @@ inline gcp::detail::HttpResponse call(
     auto backoff = std::chrono::milliseconds(100 * (1 << attempt));
     if (deadline != std::chrono::steady_clock::time_point::max())
       backoff = std::min(backoff, std::max(std::chrono::milliseconds::zero(),
-          std::chrono::duration_cast<std::chrono::milliseconds>(
-              deadline - std::chrono::steady_clock::now())));
+                                           std::chrono::duration_cast<std::chrono::milliseconds>(
+                                               deadline - std::chrono::steady_clock::now())));
     if (backoff <= std::chrono::milliseconds::zero())
       throw error("Cloud operation deadline exceeded");
     std::this_thread::sleep_for(backoff);
   }
 }
 
-inline void pause(const client_state& client,
-                  std::chrono::steady_clock::time_point deadline) {
+inline void pause(const client_state& client, std::chrono::steady_clock::time_point deadline) {
   const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
       deadline - std::chrono::steady_clock::now());
   if (remaining > std::chrono::milliseconds::zero())
@@ -2088,21 +2022,18 @@ struct job_data {
   mutable std::unordered_set<std::string> log_ids;
   mutable std::string log_cursor;
   mutable std::string log_high_water;
-  std::chrono::steady_clock::time_point submitted =
-      std::chrono::steady_clock::now();
+  std::chrono::steady_clock::time_point submitted = std::chrono::steady_clock::now();
 };
 
 inline job_state parse_state(std::string_view state) {
-  if (state == "QUEUED") return job_state::queued;
-  if (state == "SCHEDULED") return job_state::scheduled;
-  if (state == "RUNNING") return job_state::running;
-  if (state == "SUCCEEDED") return job_state::succeeded;
-  if (state == "FAILED") return job_state::failed;
-  if (state == "CANCELLATION_IN_PROGRESS") return job_state::cancelling;
-  if (state == "CANCELLED") return job_state::cancelled;
-  if (state == "DELETION_IN_PROGRESS") return job_state::deleting;
+#define CLOUD_HPP_PARSE_JOB_STATE(name, value) \
+  if (state == value) return job_state::name;
+  CLOUD_HPP_JOB_STATES(CLOUD_HPP_PARSE_JOB_STATE)
+#undef CLOUD_HPP_PARSE_JOB_STATE
   return job_state::unknown;
 }
+
+#undef CLOUD_HPP_JOB_STATES
 
 inline bool terminal(job_state state) {
   return state == job_state::succeeded || state == job_state::failed ||
@@ -2111,41 +2042,41 @@ inline bool terminal(job_state state) {
 
 inline gcp::detail::Json get_job(
     const job_data& job,
-    std::chrono::steady_clock::time_point deadline =
-        std::chrono::steady_clock::time_point::max()) {
-  auto response = call(*job.client, gcp::detail::HttpRequest{
-      .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name,
-  }, deadline);
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
+  auto response = call(*job.client,
+                       gcp::detail::HttpRequest{
+                           .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name,
+                       },
+                       deadline);
   return gcp::detail::parse_json(response.body);
 }
 
 inline job_state update(const job_data& job, const gcp::detail::Json& json) {
   if (job.uid.empty()) job.uid = gcp::detail::field(json, "uid");
   const auto* status = json.get("status");
-  return status ? parse_state(gcp::detail::field(*status, "state"))
-                : job_state::unknown;
+  return status ? parse_state(gcp::detail::field(*status, "state")) : job_state::unknown;
 }
 
 inline std::string status_error(const gcp::detail::Json& json) {
   const auto* status = json.get("status");
-  const auto* events = status ? status->get("statusEvents") : nullptr;
   std::string message;
-  if (events)
-    for (const auto& event : events->array()) {
+  if (status)
+    gcp::detail::for_each_json(*status, "statusEvents", [&](const gcp::detail::Json& event) {
       const std::string value = gcp::detail::field(event, "description");
       if (!value.empty()) message = value;
-    }
+    });
   return message.empty() ? "Batch job failed" : message;
 }
 
 inline std::optional<int> task_exit_code(const job_data& job) {
   try {
-    const auto deadline = std::chrono::steady_clock::now() +
-                          job.client->config.request_timeout;
-    auto response = call(*job.client, gcp::detail::HttpRequest{
-        .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name +
-               "/taskGroups/group0/tasks/0",
-    }, deadline);
+    const auto deadline = std::chrono::steady_clock::now() + job.client->config.request_timeout;
+    auto response = call(*job.client,
+                         gcp::detail::HttpRequest{
+                             .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name +
+                                    "/taskGroups/group0/tasks/0",
+                         },
+                         deadline);
     const auto json = gcp::detail::parse_json(response.body);
     const auto* status = json.get("status");
     const auto* events = status ? status->get("statusEvents") : nullptr;
@@ -2170,50 +2101,51 @@ inline std::optional<int> task_exit_code(const job_data& job) {
 
 inline std::vector<log_entry> logs(
     const job_data& job,
-    std::chrono::steady_clock::time_point deadline =
-        std::chrono::steady_clock::time_point::max()) {
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
   if (job.uid.empty()) update(job, get_job(job, deadline));
   std::vector<log_entry> out;
   std::string page;
+  // Query from the previous high-water receive time, then deduplicate by
+  // stable log identity. The overlap avoids gaps when Logging exposes entries
+  // with equal or delayed timestamps on different polls.
   do {
     const std::string project = job.client->core()->project();
     validate_project(project);
     const std::string filter =
         "logName = \"projects/" + project +
         "/logs/batch_task_logs\" AND labels.job_uid=" + job.uid +
-        (job.log_cursor.empty()
-             ? std::string{}
-             : " AND receiveTimestamp >= \"" + job.log_cursor + "\"");
-    std::string body = "{\"resourceNames\":[" +
-        gcp::detail::json_quote("projects/" + project) +
-        "],\"filter\":" + gcp::detail::json_quote(filter) +
-        ",\"orderBy\":\"timestamp desc\"";
-    if (!page.empty())
-      body += ",\"pageToken\":" + gcp::detail::json_quote(page);
+        (job.log_cursor.empty() ? std::string{}
+                                : " AND receiveTimestamp >= \"" + job.log_cursor + "\"");
+    std::string body = "{\"resourceNames\":[" + gcp::detail::json_quote("projects/" + project) +
+                       "],\"filter\":" + gcp::detail::json_quote(filter) +
+                       ",\"orderBy\":\"timestamp desc\"";
+    if (!page.empty()) body += ",\"pageToken\":" + gcp::detail::json_quote(page);
     body += '}';
-    auto response = call(*job.client, gcp::detail::HttpRequest{
-        .method = "POST",
-        .url = job.client->core()->config.logging_endpoint + "/v2/entries:list",
-        .headers = {"Content-Type: application/json"},
-        .body = std::move(body),
-    }, deadline);
+    auto response =
+        call(*job.client,
+             gcp::detail::HttpRequest{
+                 .method = "POST",
+                 .url = job.client->core()->config.logging_endpoint + "/v2/entries:list",
+                 .headers = {"Content-Type: application/json"},
+                 .body = std::move(body),
+             },
+             deadline);
     const auto json = gcp::detail::parse_json(response.body);
-    if (const auto* entries = json.get("entries"))
-      for (const auto& entry : entries->array()) {
-        log_entry line{
-            .timestamp = gcp::detail::field(entry, "timestamp"),
-            .receive_timestamp = gcp::detail::field(entry, "receiveTimestamp"),
-            .id = gcp::detail::field(entry, "insertId"),
-            .text = gcp::detail::field(entry, "textPayload"),
-            .severity = gcp::detail::field(entry, "severity"),
-        };
-        if (line.text.empty())
-          if (const auto* payload = entry.get("jsonPayload"))
-            line.text = gcp::detail::field(*payload, "message");
-        if (line.text.empty()) line.text = "[structured log entry]";
-        if (line.id.empty()) line.id = line.timestamp + '\n' + line.text;
-        out.push_back(std::move(line));
-      }
+    gcp::detail::for_each_json(json, "entries", [&](const gcp::detail::Json& entry) {
+      log_entry line{
+          .timestamp = gcp::detail::field(entry, "timestamp"),
+          .receive_timestamp = gcp::detail::field(entry, "receiveTimestamp"),
+          .id = gcp::detail::field(entry, "insertId"),
+          .text = gcp::detail::field(entry, "textPayload"),
+          .severity = gcp::detail::field(entry, "severity"),
+      };
+      if (line.text.empty())
+        if (const auto* payload = entry.get("jsonPayload"))
+          line.text = gcp::detail::field(*payload, "message");
+      if (line.text.empty()) line.text = "[structured log entry]";
+      if (line.id.empty()) line.id = line.timestamp + '\n' + line.text;
+      out.push_back(std::move(line));
+    });
     page = gcp::detail::field(json, "nextPageToken");
   } while (!page.empty());
   std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) {
@@ -2223,8 +2155,8 @@ inline std::vector<log_entry> logs(
     std::string received = line.receive_timestamp;
     if (received.size() == 20 && received.back() == 'Z')
       received.insert(19, ".000000000");
-    else if (received.size() > 21 && received[19] == '.' &&
-             received.back() == 'Z' && received.size() <= 29 &&
+    else if (received.size() > 21 && received[19] == '.' && received.back() == 'Z' &&
+             received.size() <= 29 &&
              std::all_of(received.begin() + 20, received.end() - 1,
                          [](char c) { return c >= '0' && c <= '9'; }))
       received.insert(received.size() - 1, 9 - (received.size() - 21), '0');
@@ -2242,8 +2174,7 @@ inline std::vector<log_entry> logs(
 
 inline std::vector<log_entry> merge_logs(
     const job_data& job,
-    std::chrono::steady_clock::time_point deadline =
-        std::chrono::steady_clock::time_point::max()) {
+    std::chrono::steady_clock::time_point deadline = std::chrono::steady_clock::time_point::max()) {
   std::vector<log_entry> added;
   for (auto& line : logs(job, deadline)) {
     const std::string identity = line.timestamp + '\n' + line.id;
@@ -2252,27 +2183,37 @@ inline std::vector<log_entry> merge_logs(
       job.log_cache.push_back(std::move(line));
     }
   }
-  std::sort(job.log_cache.begin(), job.log_cache.end(),
-            [](const auto& a, const auto& b) {
-              return std::tie(a.timestamp, a.id) < std::tie(b.timestamp, b.id);
-            });
+  std::sort(job.log_cache.begin(), job.log_cache.end(), [](const auto& a, const auto& b) {
+    return std::tie(a.timestamp, a.id) < std::tie(b.timestamp, b.id);
+  });
   return added;
 }
 
-inline void wait_operation(
-    const client_state& client, const std::string& name,
-    std::chrono::steady_clock::time_point deadline) {
+template <typename Poll>
+inline void drain_logs(const job_data& job, Poll poll) {
+  const auto stop = std::chrono::steady_clock::now() + job.client->config.final_log_timeout;
+  auto quiet_since = std::chrono::steady_clock::now();
+  while (std::chrono::steady_clock::now() < stop) {
+    if (poll(stop)) quiet_since = std::chrono::steady_clock::now();
+    if (std::chrono::steady_clock::now() - quiet_since >= job.client->config.final_log_delay) break;
+    pause(*job.client, stop);
+  }
+}
+
+inline void wait_operation(const client_state& client, const std::string& name,
+                           std::chrono::steady_clock::time_point deadline) {
   if (name.empty()) throw error("Malformed Batch operation: missing name");
   while (std::chrono::steady_clock::now() < deadline) {
-    auto response = call(client, gcp::detail::HttpRequest{
-        .url = client.core()->config.batch_endpoint + "/v1/" + name,
-    }, deadline);
+    auto response = call(client,
+                         gcp::detail::HttpRequest{
+                             .url = client.core()->config.batch_endpoint + "/v1/" + name,
+                         },
+                         deadline);
     const auto json = gcp::detail::parse_json(response.body);
     if (const auto* done = json.get("done"); done && done->boolean()) {
       if (const auto* failure = json.get("error")) {
         std::string message = gcp::detail::field(*failure, "message");
-        throw error("Batch cleanup failed" +
-                    (message.empty() ? std::string{} : ": " + message));
+        throw error("Batch cleanup failed" + (message.empty() ? std::string{} : ": " + message));
       }
       return;
     }
@@ -2282,27 +2223,27 @@ inline void wait_operation(
 }
 
 inline void delete_job(const job_data& job, std::string_view reason) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + job.client->config.cleanup_timeout;
+  const auto deadline = std::chrono::steady_clock::now() + job.client->config.cleanup_timeout;
   gcp::detail::HttpResponse response;
   try {
-    response = call(*job.client, gcp::detail::HttpRequest{
-        .method = "DELETE",
-        .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name +
-               "?reason=" + gcp::detail::encode(reason) +
-               "&requestId=" + gcp::detail::random_uuid(),
-    }, deadline);
+    response = call(*job.client,
+                    gcp::detail::HttpRequest{
+                        .method = "DELETE",
+                        .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name +
+                               "?reason=" + gcp::detail::encode(reason) +
+                               "&requestId=" + gcp::detail::random_uuid(),
+                    },
+                    deadline);
   } catch (const error& failure) {
     if (failure.http_status() == 404) return;
     throw;
   }
-  wait_operation(*job.client,
-      gcp::detail::field(gcp::detail::parse_json(response.body), "name"),
-      deadline);
+  wait_operation(*job.client, gcp::detail::field(gcp::detail::parse_json(response.body), "name"),
+                 deadline);
 }
 
-inline gcp::detail::Json wait_terminal(
-    const job_data& job, std::chrono::steady_clock::time_point deadline) {
+inline gcp::detail::Json wait_terminal(const job_data& job,
+                                       std::chrono::steady_clock::time_point deadline) {
   while (std::chrono::steady_clock::now() < deadline) {
     auto json = get_job(job, deadline);
     if (terminal(update(job, json))) return json;
@@ -2312,20 +2253,21 @@ inline gcp::detail::Json wait_terminal(
 }
 
 inline gcp::detail::Json cancel_job(const job_data& job) {
-  const auto deadline =
-      std::chrono::steady_clock::now() + job.client->config.cleanup_timeout;
+  const auto deadline = std::chrono::steady_clock::now() + job.client->config.cleanup_timeout;
   auto current = get_job(job, deadline);
   if (terminal(update(job, current))) return current;
   const std::string request_id = gcp::detail::random_uuid();
   gcp::detail::HttpResponse response;
   try {
-    response = call(*job.client, gcp::detail::HttpRequest{
-        .method = "POST",
-        .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name +
-               ":cancel",
-        .headers = {"Content-Type: application/json"},
-        .body = "{\"requestId\":" + gcp::detail::json_quote(request_id) + "}",
-    }, deadline);
+    response =
+        call(*job.client,
+             gcp::detail::HttpRequest{
+                 .method = "POST",
+                 .url = job.client->core()->config.batch_endpoint + "/v1/" + job.name + ":cancel",
+                 .headers = {"Content-Type: application/json"},
+                 .body = "{\"requestId\":" + gcp::detail::json_quote(request_id) + "}",
+             },
+             deadline);
   } catch (const error& failure) {
     current = get_job(job, deadline);
     const job_state state = update(job, current);
@@ -2334,14 +2276,12 @@ inline gcp::detail::Json cancel_job(const job_data& job) {
       return wait_terminal(job, deadline);
     throw;
   }
-  wait_operation(*job.client,
-      gcp::detail::field(gcp::detail::parse_json(response.body), "name"),
-      deadline);
+  wait_operation(*job.client, gcp::detail::field(gcp::detail::parse_json(response.body), "name"),
+                 deadline);
   return wait_terminal(job, deadline);
 }
 
-inline result make_result(const job_data& job,
-                          const gcp::detail::Json& json) {
+inline result make_result(const job_data& job, const gcp::detail::Json& json) {
   const job_state state = update(job, json);
   result out{.state = state};
   out.warnings = job.chosen.warnings;
@@ -2358,60 +2298,52 @@ inline result make_result(const job_data& job,
 
 }  // namespace detail
 
+/*
+ * Storage, Compute, and job handles
+ */
+
 class storage {
  public:
-  object put(std::string_view destination, std::string_view bytes,
-             put_options options = {}) const {
-    const auto uri = detail::parse_uri(destination);
-    if (uri.key.empty()) throw error("put() requires an object path");
+  object put(std::string_view destination, std::string_view bytes, put_options options = {}) const {
+    const auto uri = detail::parse_uri(destination, "put");
     return raw().bucket(uri.bucket).put(uri.key, bytes, std::move(options));
   }
 
-  object put_file(std::string_view destination,
-                  const std::filesystem::path& source,
+  object put_file(std::string_view destination, const std::filesystem::path& source,
                   put_options options = {}) const {
-    const auto uri = detail::parse_uri(destination);
-    if (uri.key.empty()) throw error("put_file() requires an object path");
-    return raw().bucket(uri.bucket).put_file(
-        uri.key, source, std::move(options));
+    const auto uri = detail::parse_uri(destination, "put_file");
+    return raw().bucket(uri.bucket).put_file(uri.key, source, std::move(options));
   }
 
   [[nodiscard]] std::string get(std::string_view source) const {
-    const auto uri = detail::parse_uri(source);
-    if (uri.key.empty()) throw error("get() requires an object path");
+    const auto uri = detail::parse_uri(source, "get");
     return raw().bucket(uri.bucket).get(uri.key);
   }
 
-  void get_file(std::string_view source,
-                const std::filesystem::path& destination) const {
-    const auto uri = detail::parse_uri(source);
-    if (uri.key.empty()) throw error("get_file() requires an object path");
+  void get_file(std::string_view source, const std::filesystem::path& destination) const {
+    const auto uri = detail::parse_uri(source, "get_file");
     raw().bucket(uri.bucket).get_file(uri.key, destination);
   }
 
-  [[nodiscard]] object_list list(std::string_view source,
-                                 list_options options = {}) const {
+  [[nodiscard]] object_list list(std::string_view source, list_options options = {}) const {
     const auto uri = detail::parse_uri(source);
     options.prefix = uri.key + options.prefix;
     return raw().bucket(uri.bucket).list(std::move(options));
   }
 
   [[nodiscard]] object stat(std::string_view source) const {
-    const auto uri = detail::parse_uri(source);
-    if (uri.key.empty()) throw error("stat() requires an object path");
+    const auto uri = detail::parse_uri(source, "stat");
     return raw().bucket(uri.bucket).stat(uri.key);
   }
 
   void remove(std::string_view source) const {
-    const auto uri = detail::parse_uri(source);
-    if (uri.key.empty()) throw error("remove() requires an object path");
+    const auto uri = detail::parse_uri(source, "remove");
     raw().bucket(uri.bucket).erase(uri.key);
   }
 
  private:
   friend class client;
-  explicit storage(std::shared_ptr<detail::client_state> state)
-      : state_(std::move(state)) {}
+  explicit storage(std::shared_ptr<detail::client_state> state) : state_(std::move(state)) {}
   [[nodiscard]] gcp::Cloud& raw() const {
     (void)detail::selected_provider(state_->config);
     return state_->raw;
@@ -2424,25 +2356,20 @@ class compute {
   [[nodiscard]] std::vector<instance> instances(std::size_t limit = 0) const {
     return raw().vms(limit);
   }
-  [[nodiscard]] operation create(std::string name,
-                                 std::string instance_template) const {
-    return raw().create_from_template(
-        std::move(name), std::move(instance_template));
+  [[nodiscard]] operation create(std::string name, std::string instance_template) const {
+    return raw().create_from_template(std::move(name), std::move(instance_template));
   }
   [[nodiscard]] operation start(std::string name) const {
     return raw().vm(std::move(name)).start();
   }
-  [[nodiscard]] operation stop(std::string name) const {
-    return raw().vm(std::move(name)).stop();
-  }
+  [[nodiscard]] operation stop(std::string name) const { return raw().vm(std::move(name)).stop(); }
   [[nodiscard]] operation destroy(std::string name) const {
     return raw().vm(std::move(name)).erase();
   }
 
  private:
   friend class client;
-  explicit compute(std::shared_ptr<detail::client_state> state)
-      : state_(std::move(state)) {}
+  explicit compute(std::shared_ptr<detail::client_state> state) : state_(std::move(state)) {}
   [[nodiscard]] gcp::Cloud& raw() const {
     (void)detail::selected_provider(state_->config);
     return state_->raw;
@@ -2452,6 +2379,9 @@ class compute {
 
 class job {
  public:
+  // Copies share this controller state. status(), logs(), wait(), and cancel()
+  // must therefore be serialized by the caller; final log draining remains
+  // best effort because Cloud Logging is eventually visible.
   [[nodiscard]] const std::string& id() const noexcept { return data_->id; }
 
   [[nodiscard]] job_state status() const {
@@ -2473,8 +2403,7 @@ class job {
       try {
         detail::delete_job(*data_, reason);
       } catch (const std::exception& failure) {
-        out.warnings.push_back(std::string("automatic cleanup failed: ") +
-                               failure.what());
+        out.warnings.push_back(std::string("automatic cleanup failed: ") + failure.what());
         data_->cached = out;
       }
     };
@@ -2492,7 +2421,7 @@ class job {
             sink(line);
           } catch (...) {
             const auto original = std::current_exception();
-            if (data_->spec.auto_delete)
+            if (data_->spec.auto_delete) {
               try {
                 const auto json = detail::cancel_job(*data_);
                 result out = detail::make_result(*data_, json);
@@ -2500,23 +2429,13 @@ class job {
                 detail::delete_job(*data_, "cloud.hpp log callback failure");
               } catch (...) {
               }
+            }
             std::rethrow_exception(original);
           }
         }
       return added.size();
     };
-    const auto drain = [&] {
-      const auto stop = std::chrono::steady_clock::now() +
-                        data_->client->config.final_log_timeout;
-      auto quiet_since = std::chrono::steady_clock::now();
-      while (std::chrono::steady_clock::now() < stop) {
-        if (emit(stop)) quiet_since = std::chrono::steady_clock::now();
-        if (std::chrono::steady_clock::now() - quiet_since >=
-            data_->client->config.final_log_delay)
-          return;
-        detail::pause(*data_->client, stop);
-      }
-    };
+    const auto drain = [&] { detail::drain_logs(*data_, emit); };
     const auto deadline = data_->submitted + data_->spec.timeout;
     try {
       while (true) {
@@ -2551,13 +2470,14 @@ class job {
       }
     } catch (...) {
       const auto original = std::current_exception();
-      if (data_->spec.auto_delete && !data_->cached)
+      if (data_->spec.auto_delete && !data_->cached) {
         try {
           const auto json = detail::cancel_job(*data_);
           result out = detail::make_result(*data_, json);
           cleanup(out, "cloud.hpp control failure");
         } catch (...) {
         }
+      }
       std::rethrow_exception(original);
     }
   }
@@ -2566,37 +2486,27 @@ class job {
     if (data_->cached) return;
     const auto json = detail::cancel_job(*data_);
     std::string warning;
-    const auto stop = std::chrono::steady_clock::now() +
-                      data_->client->config.final_log_timeout;
-    auto quiet_since = std::chrono::steady_clock::now();
-    while (std::chrono::steady_clock::now() < stop) {
-      try {
-        if (!detail::merge_logs(*data_, stop).empty())
-          quiet_since = std::chrono::steady_clock::now();
-      } catch (const std::exception& failure) {
-        warning = std::string("final log polling failed: ") + failure.what();
-        break;
-      }
-      if (std::chrono::steady_clock::now() - quiet_since >=
-          data_->client->config.final_log_delay)
-        break;
-      detail::pause(*data_->client, stop);
+    try {
+      detail::drain_logs(
+          *data_, [&](auto deadline) { return !detail::merge_logs(*data_, deadline).empty(); });
+    } catch (const std::exception& failure) {
+      warning = std::string("final log polling failed: ") + failure.what();
     }
     data_->cached = detail::make_result(*data_, json);
     if (!warning.empty()) data_->cached->warnings.push_back(std::move(warning));
-    if (data_->spec.auto_delete)
+    if (data_->spec.auto_delete) {
       try {
         detail::delete_job(*data_, "cloud.hpp cancellation");
       } catch (const std::exception& failure) {
-        data_->cached->warnings.push_back(
-            std::string("automatic cleanup failed: ") + failure.what());
+        data_->cached->warnings.push_back(std::string("automatic cleanup failed: ") +
+                                          failure.what());
       }
+    }
   }
 
  private:
   friend class client;
-  explicit job(std::shared_ptr<detail::job_data> data)
-      : data_(std::move(data)) {}
+  explicit job(std::shared_ptr<detail::job_data> data) : data_(std::move(data)) {}
   std::shared_ptr<detail::job_data> data_;
 };
 
@@ -2604,7 +2514,8 @@ class client {
  public:
   explicit client(cloud::config value = {})
       : state_(std::make_shared<detail::client_state>(std::move(value))),
-        storage_(state_), compute_(state_) {}
+        storage_(state_),
+        compute_(state_) {}
 
   [[nodiscard]] cloud::plan plan(const job_spec& spec) const {
     return detail::make_plan(state_->config, spec);
@@ -2615,40 +2526,39 @@ class client {
     const std::string id = detail::job_id(spec.name);
     const std::string project = state_->core()->project();
     detail::validate_project(project);
-    const std::string parent = "projects/" + project + "/locations/" +
-                               chosen.region + "/jobs";
+    const std::string parent = "projects/" + project + "/locations/" + chosen.region + "/jobs";
     const std::string name = parent + '/' + id;
     const std::string request_id = gcp::detail::random_uuid();
-    const std::string create_url =
-        state_->core()->config.batch_endpoint + "/v1/projects/" +
-        gcp::detail::encode(project) + "/locations/" +
-        gcp::detail::encode(chosen.region) + "/jobs" +
-        "?jobId=" + gcp::detail::encode(id) +
-        "&requestId=" + request_id;
+    const std::string create_url = state_->core()->config.batch_endpoint + "/v1/projects/" +
+                                   gcp::detail::encode(project) + "/locations/" +
+                                   gcp::detail::encode(chosen.region) + "/jobs" +
+                                   "?jobId=" + gcp::detail::encode(id) + "&requestId=" + request_id;
     const std::string body = detail::batch_body(spec, chosen);
     gcp::detail::HttpResponse created_response;
     try {
       created_response = detail::call(*state_, gcp::detail::HttpRequest{
-          .method = "POST",
-          .url = create_url,
-          .headers = {"Content-Type: application/json"},
-          .body = body,
-      });
+                                                   .method = "POST",
+                                                   .url = create_url,
+                                                   .headers = {"Content-Type: application/json"},
+                                                   .body = body,
+                                               });
     } catch (const error& failure) {
       if (!detail::retryable(failure.http_status())) throw;
       const auto submission = std::current_exception();
-      const auto recovery = std::min(state_->config.cleanup_timeout,
-                                     std::chrono::milliseconds(30'000));
+      const auto recovery =
+          std::min(state_->config.cleanup_timeout, std::chrono::milliseconds(30'000));
       const auto deadline = std::chrono::steady_clock::now() + recovery;
       while (true) {
         try {
-          created_response = detail::call(*state_, gcp::detail::HttpRequest{
-              .url = state_->core()->config.batch_endpoint + "/v1/" + name,
-          }, deadline);
+          created_response =
+              detail::call(*state_,
+                           gcp::detail::HttpRequest{
+                               .url = state_->core()->config.batch_endpoint + "/v1/" + name,
+                           },
+                           deadline);
           break;
         } catch (const error& lookup) {
-          if (lookup.http_status() != 404 ||
-              std::chrono::steady_clock::now() >= deadline)
+          if (lookup.http_status() != 404 || std::chrono::steady_clock::now() >= deadline)
             std::rethrow_exception(submission);
           detail::pause(*state_, deadline);
         }
@@ -2666,8 +2576,7 @@ class client {
     return cloud::job(std::move(data));
   }
 
-  [[nodiscard]] bool supports(std::string_view value,
-                              feature requested) const {
+  [[nodiscard]] bool supports(std::string_view value, feature requested) const {
     if (value != "gcp") return false;
     if (requested == feature::accelerators) return false;
     if (requested == feature::cost_estimates)
