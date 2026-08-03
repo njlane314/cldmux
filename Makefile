@@ -27,17 +27,27 @@ EMPIRICAL_MODULAR := /tmp/cloud-empirical-modular
 EMPIRICAL_AMALGAMATED := /tmp/cloud-empirical-amalgamated
 EMPIRICAL_SAN_MODULAR := /tmp/cloud-empirical-san-modular
 EMPIRICAL_SAN_AMALGAMATED := /tmp/cloud-empirical-san-amalgamated
+BURST_MODULAR := /tmp/cloud-burst-modular
+BURST_AMALGAMATED := /tmp/cloud-burst-amalgamated
+BURST_TEST_MODULAR := /tmp/cloud-burst-test-modular
+BURST_TEST_AMALGAMATED := /tmp/cloud-burst-test-amalgamated
+BURST_SAN_MODULAR := /tmp/cloud-burst-san-modular
+BURST_SAN_AMALGAMATED := /tmp/cloud-burst-san-amalgamated
+BURST_TEST_SAN_MODULAR := /tmp/cloud-burst-test-san-modular
+BURST_TEST_SAN_AMALGAMATED := /tmp/cloud-burst-test-san-amalgamated
 ODR_MODULAR := /tmp/cloud-odr-modular
 ODR_AMALGAMATED := /tmp/cloud-odr-amalgamated
 
 .PHONY: check check-readme check-headers check-tool check-modular \
 	check-amalgamation check-amalgamated check-odr check-odr-modular \
-	check-odr-amalgamated check-cli check-empirical check-standards check-c++17 \
-	check-c++20 check-c++23 amalgamate example example-amalgamated empirical \
-	empirical-amalgamated sanitise
+	check-odr-amalgamated check-cli check-empirical check-burst \
+	check-burst-header check-burst-modular check-burst-amalgamated check-standards \
+	check-c++17 check-c++20 check-c++23 amalgamate example example-amalgamated \
+	empirical empirical-amalgamated burst burst-amalgamated sanitise
 
 check: check-readme check-headers check-tool check-modular check-amalgamated \
-	check-odr check-cli check-empirical example-amalgamated empirical-amalgamated
+	check-odr check-cli check-empirical check-burst example-amalgamated \
+	empirical-amalgamated
 	@! grep -n "$$(printf '\t')" cloud.h single_include/cloud.h \
 		$$(find apps include tests tools -type f) example.cpp test.cpp README.md
 
@@ -137,6 +147,36 @@ empirical-amalgamated: check-amalgamation
 
 check-empirical: empirical
 	sh tests/empirical.sh $(EMPIRICAL_MODULAR)
+
+burst:
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -Iinclude -I. \
+		apps/burst.cpp apps/burst_main.cpp $(CURL_LIBS) -pthread -o $(BURST_MODULAR)
+
+burst-amalgamated: check-amalgamation
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
+		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. apps/burst.cpp \
+		apps/burst_main.cpp $(CURL_LIBS) -pthread -o $(BURST_AMALGAMATED)
+
+check-burst-header:
+	@! grep -nE '^[[:space:]]*#include[[:space:]].*cloud|cloud::' apps/burst.hpp
+	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. \
+		-fsyntax-only tests/compile/burst.cpp
+
+check-burst-modular: check-burst-header burst
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DBURST_TESTING \
+		-Iinclude -I. apps/burst.cpp tests/burst.cpp $(CURL_LIBS) -pthread \
+		-o $(BURST_TEST_MODULAR)
+	$(BURST_TEST_MODULAR)
+	sh tests/burst.sh $(BURST_MODULAR)
+
+check-burst-amalgamated: check-burst-header burst-amalgamated
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DBURST_TESTING \
+		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. apps/burst.cpp \
+		tests/burst.cpp $(CURL_LIBS) -pthread -o $(BURST_TEST_AMALGAMATED)
+	$(BURST_TEST_AMALGAMATED)
+	sh tests/burst.sh $(BURST_AMALGAMATED)
+
+check-burst: check-burst-modular check-burst-amalgamated
 
 check-cli: example
 	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
@@ -238,3 +278,23 @@ sanitise: check-amalgamation
 		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. apps/empirical.cpp \
 		$(CURL_LIBS) -pthread -o $(EMPIRICAL_SAN_AMALGAMATED)
 	sh tests/empirical.sh $(EMPIRICAL_SAN_AMALGAMATED)
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
+		-fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude -I. \
+		apps/burst.cpp apps/burst_main.cpp $(CURL_LIBS) -pthread \
+		-o $(BURST_SAN_MODULAR)
+	sh tests/burst.sh $(BURST_SAN_MODULAR)
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DBURST_TESTING \
+		-fsanitize=address,undefined -fno-omit-frame-pointer -Iinclude -I. \
+		apps/burst.cpp tests/burst.cpp $(CURL_LIBS) -pthread \
+		-o $(BURST_TEST_SAN_MODULAR)
+	$(BURST_TEST_SAN_MODULAR)
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
+		-fsanitize=address,undefined -fno-omit-frame-pointer \
+		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. apps/burst.cpp \
+		apps/burst_main.cpp $(CURL_LIBS) -pthread -o $(BURST_SAN_AMALGAMATED)
+	sh tests/burst.sh $(BURST_SAN_AMALGAMATED)
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DBURST_TESTING \
+		-fsanitize=address,undefined -fno-omit-frame-pointer \
+		-DCLOUD_TEST_AMALGAMATED -Isingle_include -I. apps/burst.cpp tests/burst.cpp \
+		$(CURL_LIBS) -pthread -o $(BURST_TEST_SAN_AMALGAMATED)
+	$(BURST_TEST_SAN_AMALGAMATED)

@@ -221,11 +221,13 @@ inline void environment_locations(config& out) {
 }
 
 inline bool environment_aws_configured() {
-    // Cheapest routing currently needs an EC2-backed queue whose native shape
-    // can be priced. Fargate-only/storage-only/raw-only AWS configuration is
-    // still accepted by from_environment("aws"), but is not inferred here.
+    // Storage-only and raw-instance-only settings do not make Batch runnable.
+    // Fargate queues are included because mounted CPU jobs have a composable
+    // public-catalogue vCPU and memory price.
     return !gcp::detail::env("CLOUD_AWS_JOB_QUEUE").empty() ||
            !gcp::detail::env("CLOUD_AWS_SPOT_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLOUD_AWS_FARGATE_JOB_QUEUE").empty() ||
+           !gcp::detail::env("CLOUD_AWS_FARGATE_SPOT_JOB_QUEUE").empty() ||
            !gcp::detail::env("CLOUD_AWS_GPU_MODEL").empty() ||
            !gcp::detail::env("CLOUD_AWS_GPU_JOB_QUEUE").empty() ||
            !gcp::detail::env("CLOUD_AWS_GPU_SPOT_JOB_QUEUE").empty() ||
@@ -285,6 +287,24 @@ inline void environment_gcp(config& out) {
     }
 }
 
+inline void environment_aws_s3_files(config& out, std::string_view role) {
+    std::string prefix = "CLOUD_AWS_S3_FILES";
+    if (!role.empty())
+        prefix += '_' + std::string(role);
+    const std::string bucket = gcp::detail::env(prefix + "_BUCKET");
+    const std::string file_system = gcp::detail::env(prefix + "_FILE_SYSTEM_ARN");
+    const std::string access_point = gcp::detail::env(prefix + "_ACCESS_POINT_ARN");
+    if (bucket.empty() && file_system.empty() && access_point.empty())
+        return;
+    if (bucket.empty() || file_system.empty())
+        throw error(prefix + " environment configuration requires a bucket and file system ARN");
+    const aws_s3_files_mount value{file_system, access_point};
+    const auto [found, inserted] = out.aws.s3_files.emplace(bucket, value);
+    if (!inserted && (found->second.file_system_arn != value.file_system_arn ||
+                      found->second.access_point_arn != value.access_point_arn))
+        throw error("Conflicting AWS S3 Files environment mappings for bucket " + bucket);
+}
+
 inline void environment_aws(config& out, bool comparing_prices) {
     out.aws.job_queue = gcp::detail::env("CLOUD_AWS_JOB_QUEUE");
     out.aws.spot_job_queue = gcp::detail::env("CLOUD_AWS_SPOT_JOB_QUEUE");
@@ -299,17 +319,9 @@ inline void environment_aws(config& out, bool comparing_prices) {
         out.aws.log_group = value;
     environment_aws_gpu_target(out);
 
-    const std::string bucket = gcp::detail::env("CLOUD_AWS_S3_FILES_BUCKET");
-    const std::string file_system =
-        gcp::detail::env("CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN");
-    const std::string access_point =
-        gcp::detail::env("CLOUD_AWS_S3_FILES_ACCESS_POINT_ARN");
-    if (!bucket.empty() || !file_system.empty() || !access_point.empty()) {
-        if (bucket.empty() || file_system.empty())
-            throw error("AWS S3 Files environment configuration requires a bucket and file "
-                        "system ARN");
-        out.aws.s3_files[bucket] = {file_system, access_point};
-    }
+    environment_aws_s3_files(out, {});
+    environment_aws_s3_files(out, "INPUT");
+    environment_aws_s3_files(out, "OUTPUT");
 
     const std::string launch_id = gcp::detail::env("CLOUD_AWS_LAUNCH_TEMPLATE_ID");
     const std::string launch_name = gcp::detail::env("CLOUD_AWS_LAUNCH_TEMPLATE_NAME");
@@ -335,9 +347,11 @@ inline void environment_aws(config& out, bool comparing_prices) {
             return !item.second.job_queue.empty() ||
                    (!item.second.spot_job_queue.empty() && !zone.empty());
         });
-    if (comparing_prices && !priced_cpu && !priced_spot && !priced_gpu)
-        throw error("AWS price comparison requires a queue with an exact machine type; Spot "
-                    "pricing also requires CLOUD_AWS_ZONE");
+    const bool fargate =
+        !out.aws.fargate_job_queue.empty() || !out.aws.fargate_spot_job_queue.empty();
+    if (comparing_prices && !priced_cpu && !priced_spot && !priced_gpu && !fargate)
+        throw error("AWS price comparison requires an exact EC2 machine queue or a Fargate "
+                    "queue; EC2 Spot pricing also requires CLOUD_AWS_ZONE");
     if (comparing_prices && (gcp::detail::env("AWS_ACCESS_KEY_ID").empty() ||
                              gcp::detail::env("AWS_SECRET_ACCESS_KEY").empty()))
         throw error("AWS price comparison requires AWS_ACCESS_KEY_ID and "
@@ -706,6 +720,7 @@ inline cloud::plan make_provider_plan(const config& cfg, const job_spec& spec,
             out.warnings.push_back("AWS Fargate memory was rounded up to " +
                                    std::to_string(rounded) + " MiB");
         out.warnings.push_back("AWS S3 Files mounts use Fargate and cannot attach GPUs");
+        out.warnings.push_back("AWS Fargate bills from image download with a one-minute minimum");
     }
     if (out.provider == "azure")
         out.warnings.push_back(

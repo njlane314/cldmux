@@ -264,6 +264,7 @@ public:
     std::atomic<int> azure_task_reads{0};
     std::atomic<int> gcp_price_reads{0};
     std::atomic<int> aws_price_reads{0};
+    std::atomic<int> aws_fargate_price_reads{0};
     std::atomic<int> azure_price_reads{0};
     std::atomic<int> aws_spot_reads{0};
     std::atomic<int> aws_storage_puts{0};
@@ -297,6 +298,7 @@ public:
     std::atomic<int> azure_compute_deletes{0};
     std::atomic<int> azure_compute_operation_polls{0};
     std::atomic<bool> aws_body_valid{true};
+    std::atomic<bool> aws_fargate_price_valid{true};
     std::atomic<bool> aws_storage_valid{true};
     std::atomic<bool> aws_mount_body_valid{true};
     std::atomic<bool> aws_compute_valid{true};
@@ -390,6 +392,24 @@ private:
                "},\"pricingInfo\":[{\"pricingExpression\":{\"tieredRates\":[{\"unitPrice\":{"
                "\"currencyCode\":\"USD\",\"units\":\"0\",\"nanos\":" +
                std::to_string(nanos) + "}}]}}]}";
+    }
+
+    static std::string aws_fargate_product(std::string_view usage_type,
+                                           std::string_view resource_name,
+                                           std::string_view resource_value, std::string_view price,
+                                           std::string_view extra_attributes = {}) {
+        const std::string offer =
+            "{\"product\":{\"productFamily\":\"Compute\",\"attributes\":{"
+            "\"servicecode\":\"AmazonECS\",\"regionCode\":\"eu-west-1\","
+            "\"tenancy\":\"Shared\",\"operation\":\"\",\"usagetype\":" +
+            cloud::gcp::detail::json_quote(usage_type) + "," +
+            cloud::gcp::detail::json_quote(resource_name) + ':' +
+            cloud::gcp::detail::json_quote(resource_value) + std::string(extra_attributes) +
+            "}},\"serviceCode\":\"AmazonECS\",\"terms\":{\"OnDemand\":{\"term\":{"
+            "\"priceDimensions\":{\"dimension\":{\"unit\":\"hours\","
+            "\"beginRange\":\"0\",\"endRange\":\"Inf\",\"pricePerUnit\":{\"USD\":" +
+            cloud::gcp::detail::json_quote(price) + "}}}}}}}";
+        return cloud::gcp::detail::json_quote(offer);
     }
 
     static std::string aws_instance_xml(std::string_view id, std::string_view name,
@@ -787,6 +807,31 @@ private:
                 return {200, "{\"events\":[],\"nextForwardToken\":\"done\"}"};
             return {200, "{\"events\":[{\"timestamp\":\"1000\",\"ingestionTime\":\"1001\","
                          "\"message\":\"aws-out\"}],\"nextForwardToken\":\"done\"}"};
+        }
+        if (method == "POST" && target == "/" &&
+            body.find("\"ServiceCode\":\"AmazonECS\"") != std::string_view::npos) {
+            ++aws_fargate_price_reads;
+            if (body.find("\"Field\":\"regionCode\",\"Value\":\"eu-west-1\"") ==
+                    std::string_view::npos ||
+                body.find("\"Field\":\"tenancy\",\"Value\":\"Shared\"") == std::string_view::npos ||
+                body.find("operatingSystem") != std::string_view::npos)
+                aws_fargate_price_valid = false;
+            if (body.find("\"NextToken\":\"fargate-page-2\"") != std::string_view::npos)
+                return {200, "{\"PriceList\":[" +
+                                 aws_fargate_product("EU-Fargate-GB-Hours", "memorytype", "perGB",
+                                                     "0.0050000000") +
+                                 "]}"};
+            return {200,
+                    "{\"PriceList\":[" +
+                        aws_fargate_product("EU-Fargate-vCPU-Hours:perCPU", "cputype", "perCPU",
+                                            "0.0400000000") +
+                        ',' +
+                        aws_fargate_product("EU-Fargate-ARM-vCPU-Hours:perCPU", "cputype", "perCPU",
+                                            "9.0000000000", ",\"cpuArchitecture\":\"ARM\"") +
+                        ',' +
+                        aws_fargate_product("EU-Fargate-Windows-GB-Hours", "memorytype", "perGB",
+                                            "8.0000000000") +
+                        "],\"NextToken\":\"fargate-page-2\"}"};
         }
         if (method == "POST" && target == "/" &&
             body.find("\"ServiceCode\":\"AmazonEC2\"") != std::string_view::npos) {
@@ -2082,6 +2127,35 @@ void aws_mount_tests() {
                    priced_request->memory_gb == 5,
                "AWS Fargate callback receives billed vCPU and rounded memory quantities");
 
+    auto catalogue_config = aws_mount_config(server);
+    catalogue_config.aws.pricing_endpoint = server.url();
+    catalogue_config.prices = cloud::price_source::public_catalogue;
+    cloud::client catalogue(std::move(catalogue_config));
+    const auto rounded_catalogue = catalogue.plan(rounded);
+    const auto exact_catalogue = catalogue.plan(spec);
+    (void)catalogue.plan(rounded);
+    tst::check(rounded_catalogue.estimated_hourly_cost &&
+                   std::fabs(*rounded_catalogue.estimated_hourly_cost - 0.105) < 1e-12 &&
+                   exact_catalogue.estimated_hourly_cost &&
+                   std::fabs(*exact_catalogue.estimated_hourly_cost - 0.100) < 1e-12,
+               "AWS Fargate catalogue composes vCPU and rounded-memory prices");
+    tst::check(server.aws_fargate_price_reads == 4 && server.aws_fargate_price_valid,
+               "AWS Fargate catalogue paginates and caches by billed shape");
+
+    auto spot_config = aws_mount_config(server);
+    spot_config.aws.fargate_spot_job_queue = "fargate-spot-queue";
+    spot_config.aws.pricing_endpoint = server.url();
+    spot_config.prices = cloud::price_source::public_catalogue;
+    cloud::client spot_catalogue(std::move(spot_config));
+    auto spot = spec;
+    spot.resources.spot = true;
+    tst::check(!spot_catalogue.plan(spot).estimated_hourly_cost &&
+                   server.aws_fargate_price_reads == 4 && server.aws_spot_reads == 0,
+               "AWS Fargate Spot remains unavailable without an unstable web-price lookup");
+    spot.resources.max_price_per_hour = 1;
+    tst::throws<cloud::error>([&] { (void)spot_catalogue.plan(spot); },
+                              "AWS Fargate Spot price ceiling fails closed");
+
     const auto job = client.run(spec);
     tst::check(job.wait().success() && server.aws_fargate_registers == 1 &&
                    server.aws_fargate_submits == 1 && server.aws_mount_body_valid,
@@ -2504,6 +2578,12 @@ void environment_factory_tests() {
         "CLOUD_AWS_S3_FILES_BUCKET",
         "CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN",
         "CLOUD_AWS_S3_FILES_ACCESS_POINT_ARN",
+        "CLOUD_AWS_S3_FILES_INPUT_BUCKET",
+        "CLOUD_AWS_S3_FILES_INPUT_FILE_SYSTEM_ARN",
+        "CLOUD_AWS_S3_FILES_INPUT_ACCESS_POINT_ARN",
+        "CLOUD_AWS_S3_FILES_OUTPUT_BUCKET",
+        "CLOUD_AWS_S3_FILES_OUTPUT_FILE_SYSTEM_ARN",
+        "CLOUD_AWS_S3_FILES_OUTPUT_ACCESS_POINT_ARN",
         "CLOUD_AWS_LAUNCH_TEMPLATE_ID",
         "CLOUD_AWS_LAUNCH_TEMPLATE_NAME",
         "CLOUD_AWS_LAUNCH_TEMPLATE_VERSION",
@@ -2602,6 +2682,12 @@ void environment_factory_tests() {
     environment.set("CLOUD_AWS_S3_FILES_BUCKET", "inputs");
     environment.set("CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN",
                     "arn:aws:s3files:eu-west-1:123:file-system/fs-1");
+    environment.set("CLOUD_AWS_S3_FILES_INPUT_BUCKET", "burst-input");
+    environment.set("CLOUD_AWS_S3_FILES_INPUT_FILE_SYSTEM_ARN",
+                    "arn:aws:s3files:eu-west-1:123:file-system/fs-input");
+    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "burst-output");
+    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_FILE_SYSTEM_ARN",
+                    "arn:aws:s3files:eu-west-1:123:file-system/fs-output");
     environment.set("CLOUD_AWS_LAUNCH_TEMPLATE_ID", "lt-123");
 
     const cloud::config aws_config = cloud::detail::config_from_environment("aws");
@@ -2614,10 +2700,18 @@ void environment_factory_tests() {
                    aws_config.aws.fargate_job_queue == "fargate-queue" &&
                    aws_config.aws.s3_files.at("inputs").file_system_arn.find("fs-1") !=
                        std::string::npos &&
+                   aws_config.aws.s3_files.at("burst-input").file_system_arn.find("fs-input") !=
+                       std::string::npos &&
+                   aws_config.aws.s3_files.at("burst-output").file_system_arn.find("fs-output") !=
+                       std::string::npos &&
                    aws_config.instance_templates.at("worker").aws.id == "lt-123" &&
                    cloud::detail::configured_region(aws_config, "aws") == "eu-west-1" &&
                    cloud::detail::configured_zone(aws_config, "aws") == "eu-west-1a",
                "AWS environment mapping");
+    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "inputs");
+    tst::throws<cloud::error>([] { (void)cloud::detail::config_from_environment("aws"); },
+                              "AWS environment rejects conflicting named mount mappings");
+    environment.set("CLOUD_AWS_S3_FILES_OUTPUT_BUCKET", "burst-output");
     const auto aws_plan = cloud::client::from_environment("aws").plan(spec);
     tst::check(aws_plan.provider == "aws" && aws_plan.region == "eu-west-1" &&
                    aws_plan.machine_type == "m6i.xlarge" && !aws_plan.estimated_hourly_cost,

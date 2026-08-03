@@ -236,12 +236,126 @@ inline std::optional<double> gcp_catalogue_price(const client_state& client,
     return total;
 }
 
+inline std::optional<double> aws_fargate_catalogue_price(const client_state& client,
+                                                         const cloud::plan& chosen, unsigned cpus,
+                                                         std::uint64_t memory_mib) {
+    // Fargate has no instance SKU: its Linux/x86 price is the sum of separate
+    // vCPU-hour and GiB-hour products. A region/shared query also returns ARM
+    // and Windows products, so classify the two portable components by their
+    // exact usage-type suffixes rather than relying on regional billing prefixes.
+    const std::string endpoint = gcp::detail::base_url(client.config.aws.pricing_endpoint);
+    validate_endpoint(client, endpoint, "AWS pricing_endpoint");
+    const auto filter = [](std::string_view field, std::string_view value) {
+        return "{\"Type\":\"TERM_MATCH\",\"Field\":" + gcp::detail::json_quote(field) +
+               ",\"Value\":" + gcp::detail::json_quote(value) + '}';
+    };
+    std::optional<double> cpu_unit;
+    std::optional<double> memory_unit;
+    const auto record = [](std::optional<double>& component, double price, std::string_view label) {
+        if (component && std::fabs(*component - price) > 1e-12)
+            throw error("AWS catalogue returned ambiguous " + std::string(label) + " prices");
+        component = price;
+    };
+    std::string token;
+    std::unordered_set<std::string> seen_tokens;
+    std::size_t pages = 0;
+    do {
+        if (pages == 64)
+            throw error("AWS Fargate catalogue pagination exceeded 64 pages");
+        ++pages;
+        std::string body = "{\"ServiceCode\":\"AmazonECS\",\"FormatVersion\":\"aws_v1\","
+                           "\"MaxResults\":100,\"Filters\":[" +
+                           filter("regionCode", chosen.region) + ',' + filter("tenancy", "Shared") +
+                           ']';
+        if (!token.empty())
+            body += ",\"NextToken\":" + gcp::detail::json_quote(token);
+        body += '}';
+        const auto outer = gcp::detail::parse_json(
+            aws_call(client,
+                     gcp::detail::HttpRequest{}
+                         .with_method("POST")
+                         .with_url(endpoint + '/')
+                         .with_headers({"Content-Type: application/x-amz-json-1.1",
+                                        "X-Amz-Target: AWSPriceListService.GetProducts"})
+                         .with_body(body),
+                     client.config.aws.pricing_region, "pricing")
+                .body);
+        const auto* products = outer.get("PriceList");
+        if (products)
+            for (const auto& encoded_product : products->array()) {
+                const auto offer = gcp::detail::parse_json(encoded_product.text());
+                const auto* product = offer.get("product");
+                const auto* attributes = product ? product->get("attributes") : nullptr;
+                if (!product || !attributes ||
+                    gcp::detail::field(offer, "serviceCode") != "AmazonECS" ||
+                    gcp::detail::field(*product, "productFamily") != "Compute" ||
+                    gcp::detail::field(*attributes, "servicecode") != "AmazonECS" ||
+                    gcp::detail::field(*attributes, "regionCode") != chosen.region ||
+                    gcp::detail::field(*attributes, "tenancy") != "Shared")
+                    continue;
+
+                const std::string usage = gcp::detail::field(*attributes, "usagetype");
+                const bool cpu = gcp::detail::ends_with(usage, "Fargate-vCPU-Hours:perCPU") &&
+                                 gcp::detail::field(*attributes, "cputype") == "perCPU";
+                const bool memory = gcp::detail::ends_with(usage, "Fargate-GB-Hours") &&
+                                    gcp::detail::field(*attributes, "memorytype") == "perGB";
+                if (!cpu && !memory)
+                    continue;
+
+                const auto* terms = offer.get("terms");
+                const auto* on_demand = terms ? terms->get("OnDemand") : nullptr;
+                if (!on_demand)
+                    continue;
+                for (const auto& [unused_term, term] : on_demand->object()) {
+                    (void)unused_term;
+                    const auto* dimensions = term.get("priceDimensions");
+                    if (!dimensions)
+                        continue;
+                    for (const auto& [unused_dimension, dimension] : dimensions->object()) {
+                        (void)unused_dimension;
+                        if (gcp::detail::field(dimension, "unit") != "hours" ||
+                            gcp::detail::field(dimension, "beginRange") != "0" ||
+                            gcp::detail::field(dimension, "endRange") != "Inf")
+                            continue;
+                        const auto* per_unit = dimension.get("pricePerUnit");
+                        const std::string usd =
+                            per_unit ? gcp::detail::field(*per_unit, "USD") : std::string{};
+                        if (usd.empty())
+                            continue;
+                        const double price = decimal(usd, "AWS Fargate price");
+                        if (cpu)
+                            record(cpu_unit, price, "Fargate vCPU-hour");
+                        if (memory)
+                            record(memory_unit, price, "Fargate GiB-hour");
+                    }
+                }
+            }
+        const std::string next = gcp::detail::field(outer, "NextToken");
+        if (!next.empty() && !seen_tokens.insert(next).second)
+            throw error("AWS Fargate catalogue pagination repeated a token");
+        token = next;
+    } while (!token.empty());
+
+    if (!cpu_unit || !memory_unit)
+        return std::nullopt;
+    return *cpu_unit * static_cast<double>(cpus) +
+           *memory_unit * (static_cast<double>(memory_mib) / 1024.0);
+}
+
 inline std::optional<double> aws_catalogue_price(const client_state& client,
-                                                const cloud::plan& chosen, bool spot) {
+                                                 const cloud::plan& chosen, bool spot,
+                                                 unsigned fargate_cpus,
+                                                 std::uint64_t fargate_memory_mib) {
     // Spot is the newest Linux/UNIX observation for one exact Availability Zone.
     // On-demand requires one unique Linux/shared/no-software hourly price term.
-    if (chosen.machine_type == "batch-managed" || chosen.machine_type == "FARGATE")
+    if (chosen.machine_type == "batch-managed")
         return std::nullopt;
+    // AWS publishes Fargate Spot rates on its pricing web page but not through
+    // the stable Price List API. Leave that market unavailable so ceilings and
+    // lowest-cost routing fail closed unless the caller supplies a price lookup.
+    if (chosen.machine_type == "FARGATE")
+        return spot ? std::nullopt
+                    : aws_fargate_catalogue_price(client, chosen, fargate_cpus, fargate_memory_mib);
     if (spot) {
         const std::string zone = configured_zone(client.config, "aws");
         if (zone.empty())
@@ -397,15 +511,19 @@ inline std::optional<double> azure_catalogue_price(const client_state& client,
     return found;
 }
 
-inline std::optional<double> catalogue_price(const client_state& client,
-                                             const cloud::plan& chosen, bool spot) {
+inline std::optional<double> catalogue_price(const client_state& client, const cloud::plan& chosen,
+                                             bool spot, unsigned fargate_cpus = 0,
+                                             std::uint64_t fargate_memory_mib = 0) {
     // Cache keys include provider, region, zone, native shape, accelerator, and
     // market. Only successful quotes are cached; unavailable prices are retried.
-    const std::string key = chosen.provider + '\n' + chosen.region + '\n' +
-                            configured_zone(client.config, chosen.provider) + '\n' +
-                            chosen.machine_type + '\n' + chosen.accelerator + '\n' +
-                            std::to_string(chosen.accelerator_count) +
-                            (spot ? "\nspot" : "\nondemand");
+    std::string key = chosen.provider + '\n' + chosen.region + '\n' +
+                      configured_zone(client.config, chosen.provider) + '\n' + chosen.machine_type +
+                      '\n' + chosen.accelerator + '\n' + std::to_string(chosen.accelerator_count) +
+                      (spot ? "\nspot" : "\nondemand");
+    // Every Fargate plan has the same native machine label, so its billed
+    // resource quantities are part of the identity of a cached total quote.
+    if (chosen.provider == "aws" && chosen.machine_type == "FARGATE")
+        key += '\n' + std::to_string(fargate_cpus) + '\n' + std::to_string(fargate_memory_mib);
     const auto now = std::chrono::steady_clock::now();
     const auto ttl = spot ? client.config.spot_price_cache_ttl : client.config.price_cache_ttl;
     {
@@ -418,7 +536,7 @@ inline std::optional<double> catalogue_price(const client_state& client,
     if (chosen.provider == "gcp")
         price = gcp_catalogue_price(client, chosen, spot);
     if (chosen.provider == "aws")
-        price = aws_catalogue_price(client, chosen, spot);
+        price = aws_catalogue_price(client, chosen, spot, fargate_cpus, fargate_memory_mib);
     if (chosen.provider == "azure")
         price = azure_catalogue_price(client, chosen, spot);
     if (price) {
@@ -459,7 +577,10 @@ inline cloud::plan priced_plan(const client_state& client, const job_spec& spec,
         out.estimated_hourly_cost = client.config.estimate_hourly_cost(
             out.provider, out.region, out.machine_type, spec.resources.spot);
     } else if (client.config.prices == price_source::public_catalogue) {
-        out.estimated_hourly_cost = catalogue_price(client, out, spec.resources.spot);
+        const bool fargate = out.provider == "aws" && out.machine_type == "FARGATE";
+        out.estimated_hourly_cost =
+            catalogue_price(client, out, spec.resources.spot, fargate ? spec.resources.cpus : 0,
+                            fargate ? fargate_memory_mib(spec.resources) : 0);
     }
     if (out.estimated_hourly_cost &&
         (!std::isfinite(*out.estimated_hourly_cost) || *out.estimated_hourly_cost < 0))

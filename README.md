@@ -105,8 +105,11 @@ cloud.
 - AWS on-demand jobs require `CLOUD_AWS_JOB_QUEUE` and
   `CLOUD_AWS_MACHINE_TYPE`; Spot adds `CLOUD_AWS_SPOT_JOB_QUEUE`,
   `CLOUD_AWS_SPOT_MACHINE_TYPE`, and `CLOUD_AWS_ZONE`. Mounted jobs instead
-  require `CLOUD_AWS_FARGATE_JOB_QUEUE`, role variables, and a
-  `CLOUD_AWS_S3_FILES_*` mapping. GPU queues are configured separately.
+  require `CLOUD_AWS_FARGATE_JOB_QUEUE` (or `CLOUD_AWS_FARGATE_SPOT_JOB_QUEUE`), role variables,
+  and a
+  `CLOUD_AWS_S3_FILES_*` mapping. Two mounts use the corresponding
+  `CLOUD_AWS_S3_FILES_INPUT_*` and `CLOUD_AWS_S3_FILES_OUTPUT_*` mappings.
+  GPU queues are configured separately.
 
 - Azure requires `CLOUD_AZURE_BATCH_ENDPOINT`. Its submission token is read
   from `CLOUD_AZURE_BATCH_TOKEN` only if Azure is selected and `run()` is
@@ -224,10 +227,11 @@ Spot APIs, and Azure Retail Prices. USD compute list prices are cached for one
 hour, or five minutes for Spot. Disks, storage, network, licences, taxes,
 discounts, and free tiers are excluded.
 
-AWS needs an exact machine type for on-demand pricing and an Availability Zone
-for Spot history. Mounted AWS jobs use Fargate, so their price requires a
-trusted callback. GCP A2 Ultra and A3 High built-in estimates are unavailable
-because inseparable Local SSD charges prevent an honest compute-only value.
+AWS needs an exact machine type for EC2 on-demand pricing and an Availability
+Zone for Spot history. Mounted on-demand jobs compose Fargate vCPU and rounded
+memory prices; Fargate Spot requires a trusted callback. GCP A2 Ultra and A3
+High built-in estimates are unavailable because inseparable Local SSD charges
+prevent an honest compute-only value.
 
 Applications may override lookup with a current internal price source:
 
@@ -241,6 +245,36 @@ config.lookup_hourly_cost = [](const cloud::price_request& request)
 Callbacks return a finite, non-negative USD hourly rate or `std::nullopt`.
 `resources::max_price_per_hour` fails closed when the estimate is absent or too
 high. An earlier plan is never a reservation; `run()` prices again.
+
+## BURST APPLICATION
+
+[`apps/burst.hpp`](apps/burst.hpp) is a provider-neutral, two-phase adapter.
+`prepare()` validates, quotes, and pins without allocating compute. Passing its
+move-only result to `execute()` is the caller's approval.
+
+```sh
+make burst
+export BURST_INPUT_ROOT=cloud://burst-input
+export BURST_OUTPUT_ROOT=cloud://burst-output
+/tmp/cloud-burst-modular --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
+    --input=case.tar.zst --output=result.tar.zst -- /app/solve
+# Review the KEY=value quote, then repeat with --submit to approve it.
+```
+
+The dry run reports the route, hourly price, expected runtime, and advisory cost.
+`--policy=gcp`, `aws`, or `azure` overrides cheapest routing; an unpriced
+submission also needs `--allow-unpriced`.
+
+The container reads `/burst/input/runs/ID/input.tar.zst`, writes
+`/burst/output/runs/ID/output.tar.zst`, emits line-oriented progress, and exits
+zero on success. The two roots must name different buckets/containers so input
+stays read-only. AWS needs both named S3 Files mappings and is CPU-only here.
+
+`execute()` uses a create-only input upload and no-clobber local publication. Its
+grep-friendly receipt records the image digest, SHA-256 hashes, quote, route,
+elapsed time, result, and recovery state. An interruption leaves `.pending` and
+`.pending.EXECUTION_ID`; do not resubmit blindly. Burst is not a scheduler,
+credential store, provisioner, archiver, or workflow engine.
 
 ## EMPIRICAL ROUTING
 
@@ -369,6 +403,9 @@ Use the generated single header when vendoring one file:
 ```
 
 ```text
+apps/burst.hpp               provider-neutral burst API
+apps/burst.cpp               sole cloud-backed burst adapter
+apps/burst_main.cpp          quote-and-approve UNIX command
 apps/empirical.cpp           observed-runtime routing application
 include/cloud/               canonical modular headers
 include/cloud/detail/        transport, pricing, storage, and submission
@@ -403,9 +440,9 @@ make sanitise
 
 `make check` compiles every modular header, tests the generator, checks both
 generated headers byte-for-byte, runs modular and single-header suites, probes
-multi-translation-unit use, and builds the example and empirical application in
-both forms. Tests use a loopback fake server and injected empirical quotes; they
-make no cloud API calls, need no credentials, and cannot incur charges.
+multi-translation-unit use, and builds the example, burst, and empirical
+applications in both forms. Tests use loopback fakes and offline quotes; they
+need no cloud credentials and cannot incur charges.
 
 ## LICENCE
 
