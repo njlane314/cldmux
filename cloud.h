@@ -24,8 +24,8 @@
 #ifndef NJLANE314_CLOUD_H_INCLUDED
 #define NJLANE314_CLOUD_H_INCLUDED
 
-#define CLOUD_H_VERSION "0.3.1"
-#define CLOUD_H_VERSION_NUM 0x000301
+#define CLOUD_H_VERSION "0.3.2"
+#define CLOUD_H_VERSION_NUM 0x000302
 
 // Dependencies and compile-time contract --------------------------------------
 
@@ -2189,8 +2189,9 @@ struct job_spec {
     std::vector<mount> mounts;
     cloud::resources resources;
 
-    // retries counts retries after the first attempt. Provider APIs express the
-    // same policy as total attempts or maximum retry count as appropriate.
+    // retries requests this many policy retries after the first attempt.
+    // Qualifying failures differ by provider, and provider-managed recovery or
+    // requeueing may occur outside this budget.
     unsigned retries = 0;
 
     // GCP deletes the Batch job; AWS keeps the terminal record but deregisters
@@ -2198,9 +2199,11 @@ struct job_spec {
     // job-lifetime pool and deletes the record only when auto_delete is true.
     bool auto_delete = true;
 
-    // Total controller deadline. It is also mapped to GCP/AWS per-attempt caps
-    // and Azure task wall-clock time; retries can outlive those provider caps if
-    // the controller that enforces this total deadline disappears.
+    // Waiting-controller deadline, measured from creation of the submitted job
+    // handle. It is also mapped to GCP/AWS per-attempt caps and Azure task
+    // wall-clock time. It is not a provider-wide wall-clock upper bound: retries,
+    // queueing, cancellation, cleanup, or a vanished controller can extend the
+    // provider resource lifetime.
     std::chrono::milliseconds timeout{std::chrono::hours(1)};
 };
 
@@ -2215,6 +2218,35 @@ struct plan {
     std::optional<double> estimated_hourly_cost;
     // Reserved for a future comparable egress model; currently always empty.
     std::optional<double> estimated_egress_cost;
+    std::vector<std::string> warnings;
+};
+
+// Read-only, pre-submission facts for one planned run. Durations expose the
+// controller contract separately from the provider payload so callers do not
+// need provider-specific timeout or retry arithmetic. Costs use the selected
+// plan's advisory USD hourly estimate; public-catalogue estimates are
+// compute-only, while callback contents remain caller-defined. Unavailable
+// prices remain unavailable rather than being reported as zero.
+struct run_diagnostics {
+    cloud::plan selected_plan;
+    // Caller-modelled active duration for one attempt. Queueing, provisioning,
+    // retries, recovery, cancellation, and cleanup are outside this value.
+    std::chrono::milliseconds expected_attempt_runtime{};
+    std::chrono::milliseconds controller_timeout{};
+    std::chrono::seconds provider_attempt_timeout{};
+    // Azure also receives a job-level watchdog measured from Azure job creation
+    // and covering the controller timeout plus cleanup, final-log, and request
+    // allowances. Other providers leave it empty because their submitted job
+    // has no equivalent total watchdog.
+    std::optional<std::chrono::seconds> provider_job_timeout;
+    unsigned configured_retries = 0;
+    // This is the caller-configured retry-policy budget, not a bound on internal
+    // provider recovery, requeueing, or Spot-preemption behaviour.
+    unsigned configured_attempt_limit = 1;
+    // Selected hourly estimate multiplied only by expected_attempt_runtime.
+    // This is a sensitivity calculation, not an expected bill or
+    // billable-lifetime model.
+    std::optional<double> estimated_cost_for_expected_attempt_runtime;
     std::vector<std::string> warnings;
 };
 
@@ -2260,7 +2292,8 @@ struct result {
 
 struct price_request {
     // Exact native plan sent to a trusted caller callback. Returning nullopt
-    // means no quote is available; max_price_per_hour then fails closed.
+    // means no quote is available; otherwise the result must be finite,
+    // nonnegative USD per hour. max_price_per_hour then fails closed.
     cloud::provider provider;
     std::string region;
     std::string zone;
@@ -2275,8 +2308,9 @@ struct price_request {
     double memory_gb = 0;
 };
 using price_lookup = std::function<std::optional<double>(const price_request&)>;
-// Compatibility callback. New code should use lookup_hourly_cost so attached
-// accelerators and an Availability Zone cannot be accidentally omitted.
+// Compatibility callback with the same USD-per-hour result contract. New code
+// should use lookup_hourly_cost so attached accelerators and an Availability
+// Zone cannot be accidentally omitted.
 using price_estimator = std::function<std::optional<double>(std::string_view, std::string_view,
                                                             std::string_view, bool)>;
 using log_sink = std::function<void(const log_entry&)>;
@@ -3350,6 +3384,20 @@ inline void validate_provider_spec(std::string_view provider, const config& cfg,
     }
 }
 
+inline std::uint64_t duration_seconds(std::chrono::milliseconds value) {
+    const auto milliseconds = value.count();
+    return static_cast<std::uint64_t>(milliseconds / 1000 + (milliseconds % 1000 != 0));
+}
+
+inline std::uint64_t provider_attempt_timeout_seconds(const job_spec& spec) {
+    return duration_seconds(spec.timeout);
+}
+
+inline std::uint64_t azure_job_timeout_seconds(const job_spec& spec, const config& cfg) {
+    return provider_attempt_timeout_seconds(spec) + duration_seconds(cfg.cleanup_timeout) +
+           duration_seconds(cfg.final_log_timeout) + duration_seconds(cfg.request_timeout);
+}
+
 inline std::string batch_body(const job_spec& spec, const cloud::plan& chosen) {
     // GCP Batch owns queueing and temporary VM lifecycle. The request creates one
     // task, blocks inherited project SSH keys, mounts GCS prefixes through GCS
@@ -3380,14 +3428,14 @@ inline std::string batch_body(const job_spec& spec, const cloud::plan& chosen) {
         container += ",\"volumes\":[" + container_volumes + ']';
     container += '}';
 
-    const auto milliseconds = spec.timeout.count();
-    const auto seconds = milliseconds / 1000 + (milliseconds % 1000 != 0);
+    const auto seconds = provider_attempt_timeout_seconds(spec);
     const auto memory = memory_mib(spec.resources.memory_gb);
     std::string task =
         "{\"runnables\":[{\"container\":" + container + "}],\"computeResource\":{\"cpuMilli\":" +
         gcp::detail::json_quote(std::to_string(spec.resources.cpus * 1000ULL)) +
         ",\"memoryMib\":" + gcp::detail::json_quote(std::to_string(memory)) +
-        "},\"maxRunDuration\":" + gcp::detail::json_quote(std::to_string(seconds) + "s") +
+        "},\"maxRunDuration\":" +
+        gcp::detail::json_quote(std::to_string(seconds) + "s") +
         ",\"maxRetryCount\":" + std::to_string(spec.retries);
     if (!task_volumes.empty())
         task += ",\"volumes\":[" + task_volumes + ']';
@@ -6171,11 +6219,6 @@ inline result make_result(const job_data& job, const gcp::detail::Json& json) {
 
 // AWS and Azure submission -----------------------------------------------------
 
-inline std::uint64_t duration_seconds(std::chrono::milliseconds value) {
-    const auto milliseconds = value.count();
-    return static_cast<std::uint64_t>(milliseconds / 1000 + (milliseconds % 1000 != 0));
-}
-
 inline std::string aws_queue(const config& cfg, const job_spec& spec) {
     if (!spec.mounts.empty())
         return spec.resources.spot ? cfg.aws.fargate_spot_job_queue : cfg.aws.fargate_job_queue;
@@ -6405,7 +6448,7 @@ inline std::shared_ptr<job_data> submit_aws(std::shared_ptr<client_state> client
         ",\"jobDefinition\":" + gcp::detail::json_quote(definition) +
         ",\"retryStrategy\":{\"attempts\":" + std::to_string(spec.retries + 1) +
         "},\"timeout\":{\"attemptDurationSeconds\":" +
-        std::to_string(duration_seconds(spec.timeout)) +
+        std::to_string(provider_attempt_timeout_seconds(spec)) +
         "},\"tags\":{\"cloud-hpp\":\"temporary\"}}";
     const std::string queue = aws_queue(client->config, spec);
     std::string id;
@@ -6494,10 +6537,7 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
     if (endpoint.empty())
         throw error("Azure jobs require config::azure.batch_endpoint");
     const bool spot = spec.resources.spot;
-    const std::uint64_t watchdog_seconds = duration_seconds(spec.timeout) +
-                                           duration_seconds(client->config.cleanup_timeout) +
-                                           duration_seconds(client->config.final_log_timeout) +
-                                           duration_seconds(client->config.request_timeout);
+    const std::uint64_t watchdog_seconds = azure_job_timeout_seconds(spec, client->config);
     std::string pool =
         "{\"vmSize\":" + gcp::detail::json_quote(chosen.machine_type) +
         ",\"targetDedicatedNodes\":" + (spot ? "0" : "1") +
@@ -6593,7 +6633,8 @@ inline std::shared_ptr<job_data> submit_azure(std::shared_ptr<client_state> clie
     const std::string task_body =
         "{\"id\":\"task\",\"commandLine\":" + gcp::detail::json_quote(azure_command(spec.command)) +
         ",\"constraints\":{\"maxWallClockTime\":" +
-        gcp::detail::json_quote("PT" + std::to_string(duration_seconds(spec.timeout)) + "S") +
+        gcp::detail::json_quote(
+            "PT" + std::to_string(provider_attempt_timeout_seconds(spec)) + "S") +
         ",\"maxTaskRetryCount\":" + std::to_string(spec.retries) +
         ",\"retentionTime\":\"PT1H\"},\"containerSettings\":{\"imageName\":" +
         gcp::detail::json_quote(spec.image) +
@@ -6926,7 +6967,7 @@ public:
                     drain();
                     result out = detail::make_result(*data_, json);
                     if (out.state == job_state::cancelled)
-                        out.message = "Cloud job exceeded its total timeout";
+                        out.message = "Cloud job exceeded its controller timeout";
                     if (!log_warning.empty())
                         out.warnings.push_back(log_warning);
                     cleanup(out, "cloud.h timeout");
@@ -7017,12 +7058,118 @@ public:
         return client(detail::config_from_environment(provider_name));
     }
 
+    // Explicitly opt an environment-built client into or out of public catalogue
+    // pricing. This is useful for a single-provider diagnostic plan, whose default
+    // remains local and unpriced in the one-argument overload. "cheapest" cannot
+    // opt out because its selection contract requires comparable prices.
+    [[nodiscard]] static client from_environment(std::string_view provider_name,
+                                                 cloud::price_source prices) {
+        if (provider_name == "cheapest" && prices == cloud::price_source::none)
+            throw error("cheapest environment routing requires public catalogue pricing");
+        auto value = detail::config_from_environment(provider_name);
+        value.prices = prices;
+        return client(std::move(value));
+    }
+
     [[nodiscard]] cloud::plan plan(const job_spec& spec) const {
         // Does not mutate provider resources; it may invoke a caller pricing
         // callback or query a read-only public catalogue API.
         if (bound_provider_)
             return detail::priced_plan(*state_, spec, *bound_provider_);
         return detail::make_plan(*state_, spec);
+    }
+
+    [[nodiscard]] cloud::run_diagnostics
+    diagnose(const job_spec& spec, std::chrono::milliseconds expected_attempt_runtime) const {
+        if (expected_attempt_runtime <= std::chrono::milliseconds::zero())
+            throw error("Expected attempt runtime must be positive");
+        if (spec.timeout > std::chrono::milliseconds::zero() &&
+            expected_attempt_runtime > spec.timeout)
+            throw error("Expected attempt runtime must not exceed the controller timeout");
+
+        cloud::run_diagnostics out;
+        out.selected_plan = plan(spec);
+        out.expected_attempt_runtime = expected_attempt_runtime;
+        out.controller_timeout = spec.timeout;
+        out.configured_retries = spec.retries;
+        out.configured_attempt_limit = spec.retries + 1;
+
+        const auto seconds_from = [](std::uint64_t count) {
+            using rep = std::chrono::seconds::rep;
+            if (count > static_cast<std::uintmax_t>((std::numeric_limits<rep>::max)()))
+                throw error("Provider timeout cannot be represented by std::chrono::seconds");
+            return std::chrono::seconds(static_cast<rep>(count));
+        };
+        out.provider_attempt_timeout =
+            seconds_from(detail::provider_attempt_timeout_seconds(spec));
+        if (out.selected_plan.provider == "azure")
+            out.provider_job_timeout =
+                seconds_from(detail::azure_job_timeout_seconds(spec, state_->config));
+
+        out.warnings = out.selected_plan.warnings;
+        out.warnings.push_back(
+            "diagnostics are advisory planning snapshots; run() replans before submission");
+        out.warnings.push_back(
+            "expected attempt runtime is caller-supplied; queueing and provisioning are not "
+            "predicted");
+        out.warnings.push_back(
+            "cancellation, final log draining, and cleanup can finish after the controller "
+            "timeout");
+        out.warnings.push_back(
+            "controller timeout is enforced only while a live caller is inside wait()");
+        if (out.configured_attempt_limit > 1)
+            out.warnings.push_back(
+                "configured retries can add cost beyond the single-runtime estimate");
+        out.warnings.push_back(
+            "provider-managed lifecycle can add cost outside the expected-attempt-runtime "
+            "estimate");
+        if (spec.resources.spot)
+            out.warnings.push_back(
+                "Spot capacity and future prices are not reserved by planning");
+        if (out.selected_plan.provider == "gcp")
+            out.warnings.push_back("GCP applies its provider timeout separately to each attempt");
+        else if (out.selected_plan.provider == "aws") {
+            out.warnings.push_back(
+                "AWS Batch does not retry attempts terminated by its provider timeout");
+            out.warnings.push_back(
+                "AWS provider timeout excludes queueing and STARTING and termination is best "
+                "effort");
+        } else if (out.selected_plan.provider == "azure") {
+            out.warnings.push_back(
+                "Azure's job watchdog includes cleanup, final-log, and request allowances");
+            out.warnings.push_back(
+                "Azure applies its task timeout separately to each attempt");
+            out.warnings.push_back(
+                "Azure system recovery can occur outside the configured attempt limit");
+            if (spec.resources.spot)
+                out.warnings.push_back(
+                    "Azure Spot preemption can requeue a task outside the configured attempt "
+                    "limit");
+        }
+
+        if (out.selected_plan.estimated_hourly_cost) {
+            const double hourly = *out.selected_plan.estimated_hourly_cost;
+            if (state_->config.lookup_hourly_cost || state_->config.estimate_hourly_cost)
+                out.warnings.push_back(
+                    "included charges follow the caller's hourly callback; the library adds "
+                    "none");
+            else
+                out.warnings.push_back(
+                    "public-catalogue compute cost excludes storage, disks, network, licences, "
+                    "taxes, discounts, and provider overhead");
+            const auto cost_for_hours = [hourly](double hours) {
+                const double cost = hourly * hours;
+                if (!std::isfinite(cost))
+                    throw error("Diagnostic cost is not finite");
+                return cost;
+            };
+            const double expected_hours =
+                std::chrono::duration<double, std::chrono::hours::period>(
+                    expected_attempt_runtime)
+                    .count();
+            out.estimated_cost_for_expected_attempt_runtime = cost_for_hours(expected_hours);
+        }
+        return out;
     }
 
     // Plan once to choose a provider, then pin every subsequent operation to

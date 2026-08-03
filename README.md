@@ -14,6 +14,8 @@ key; map an earlier direct GCE template value through
 British `price_source::public_catalogue` spelling.
 Version 0.3.1 makes example output line-oriented `KEY=value`, limits in-memory
 responses to 16 MiB, and bounds the private provider-response parser.
+Version 0.3.2 adds structured pre-submission runtime and compute-cost
+diagnostics without turning an estimate into a quote or wall-clock guarantee.
 
 ```text
 local data → plan → upload → run → poll logs → collect output → delete
@@ -48,10 +50,17 @@ int main() {
     job.retries = 1;
     job.timeout = std::chrono::minutes(15);
 
-    const auto selected = client.plan(job);
-    std::cout << "provider=" << selected.provider << '\n'
-              << "region=" << selected.region << '\n'
-              << "machine=" << selected.machine_type << '\n';
+    const auto report = client.diagnose(job, std::chrono::minutes(5));
+    std::cout << "provider=" << report.selected_plan.provider << '\n'
+              << "region=" << report.selected_plan.region << '\n'
+              << "machine=" << report.selected_plan.machine_type << '\n'
+              << "expected_attempt_runtime_seconds="
+              << std::chrono::duration_cast<std::chrono::seconds>(
+                     report.expected_attempt_runtime).count()
+              << '\n';
+    if (report.estimated_cost_for_expected_attempt_runtime)
+        std::cout << "estimated_cost_for_expected_attempt_runtime_usd="
+                  << *report.estimated_cost_for_expected_attempt_runtime << '\n';
 }
 ```
 
@@ -75,31 +84,66 @@ The first argument chooses the policy without changing or recompiling the job:
 cloud-run                  # compare configured providers and choose the cheapest
 cloud-run cheapest         # the same explicit policy
 cloud-run gcp              # override the router
-cloud-run aws
-cloud-run azure --submit   # submit only after the explicit flag
+cloud-run aws --estimate   # price one explicit provider through its public catalogue
+cloud-run azure --expected-attempt-runtime=20m --estimate --submit
 ```
 
-Planning output is one stable record per line:
+The dry run is also the pre-submission diagnostic. Output is one stable record
+per line:
 
 ```text
+output_version=1
+requested_provider=cheapest
 provider=aws
 region=eu-west-1
 machine=m6i.xlarge
-hourly_usd=0.192
-warning=estimates are advisory
+requested_cpus=4
+requested_memory_gb=16
+expected_attempt_runtime_seconds=300
+controller_timeout_seconds=900
+provider_attempt_timeout_seconds=900
+configured_retries=1
+configured_attempt_limit=2
+hourly_rate_estimate_usd=0.192
+estimated_cost_for_expected_attempt_runtime_usd=0.016
+estimate_basis=expected-attempt-runtime-times-hourly-rate
+preflight=planned
 status=dry-run
 ```
+
+`preflight=planned` means the job passed local/provider-shape planning at that
+snapshot. It does not probe submission credentials, queues or pools, referenced
+images, objects or mount resources, quota, capacity, provider API reachability,
+or a successful submission.
+
+`--expected-attempt-runtime=` accepts a positive whole number of seconds,
+minutes, or hours, such as `30s`, `20m`, or `2h`. It changes only the cost
+sensitivity input; `job_spec::timeout` remains the controller/provider limit.
+The provider and flags may appear in any order, but each may be supplied once.
 
 `client::from_environment("cheapest")` checks configured providers in stable
 GCP, AWS, Azure order, enables public-catalogue prices, and selects the lowest
 USD compute estimate. At least two providers must be configured. Every included
 provider must validate the same job and return a comparable price; one failed
 plan or missing quote aborts the decision instead of biasing it towards a
-partial set. `run()` repeats the comparison immediately before submission.
+partial set. The example binds the provider reported by `diagnose()` and
+`run()` then revalidates and reprices that provider immediately before
+submission; it cannot silently switch clouds after the visible preflight.
 
 Passing `gcp`, `aws`, or `azure` is the override. It loads only that provider
-and leaves catalogue lookup disabled, so `plan()` remains local. For job
-submission, provider infrastructure stays outside the program:
+and leaves catalogue lookup disabled, so `plan()` remains local. The example's
+`--estimate` flag uses the two-argument factory to opt that explicit provider
+into public-catalogue lookup:
+
+```cpp
+auto client = cloud::client::from_environment(
+    "aws", cloud::price_source::public_catalogue);
+```
+
+Without pricing, the diagnostic prints `unavailable` rather than zero. The
+two-argument `price_source::none` form is valid only for an explicit provider;
+`cheapest` requires public-catalogue pricing. For job submission, provider
+infrastructure stays outside the program:
 
 | Provider | Required environment | Optional environment |
 |---|---|---|
@@ -139,6 +183,61 @@ auto submitted = routed.run(job);
 not mutate the router. Its storage, raw compute, planning, and submission stay
 on the bound provider. `run()` revalidates and reprices the job, but cannot
 switch that routed client to a different cloud.
+
+## PRE-SUBMISSION DIAGNOSTICS
+
+`diagnose()` is read-only. It plans once, accepts the caller's expected active
+runtime for one attempt, and returns ordinary typed C++:
+
+```cpp
+const auto report = router.diagnose(job, std::chrono::minutes(20));
+auto routed = router.route(report.selected_plan.provider);
+
+if (report.estimated_cost_for_expected_attempt_runtime)
+    std::cout << *report.estimated_cost_for_expected_attempt_runtime << '\n';
+
+// Print or otherwise inspect report before this explicit mutation.
+auto submitted = routed.run(job);
+```
+
+`run_diagnostics` contains the selected `plan`, the caller-supplied expected
+attempt runtime, the waiting-controller timeout, the provider's whole-second
+per-attempt timeout, configured retries, and the configured attempt limit.
+Provider-managed recovery and requeueing can execute outside that policy
+budget. Azure also exposes its separate job watchdog; the other providers
+report no equivalent value.
+
+`run_diagnostics::warnings` is the complete ordered list: it copies the
+selected plan's warnings first and then appends runtime and cost qualifications.
+For `cheapest`, the report describes the selected route; it does not expose an
+ordered audit of every candidate quote. Selection still applies the strict
+all-configured-provider comparison described above.
+
+When an hourly price exists,
+`estimated_cost_for_expected_attempt_runtime` multiplies it only by the
+expected active runtime for one attempt. It is a sensitivity calculation, not
+an expected bill, maximum, reservation, total, or quote. Allocation, startup,
+teardown, retries, provider recovery, and shared-capacity attribution can make
+actual billable lifetimes differ. With the public catalogue, storage, disks,
+network, licences, taxes, discounts, and provider overhead remain outside the
+estimate. A callback defines its own included charges. Missing prices remain
+`std::nullopt`.
+
+The expected attempt runtime is not inferred from an image or command.
+Queueing and provisioning cannot be predicted portably. GCP applies its
+provider timeout to each attempt. AWS excludes queueing and `STARTING`, treats
+termination as best effort, and does not retry an attempt terminated for
+timeout. Azure applies a task timeout per attempt and adds a job watchdog
+measured from job creation. A live caller inside `job::wait()` starts
+cancellation at the local controller deadline; there is no autonomous timer,
+and final logs and cleanup can finish later.
+
+The examples turn this object into escaped `KEY=value` records through
+[`examples/support.h`](examples/support.h). That formatter is example code,
+not a required output or configuration dependency.
+After `--submit`, it also emits `status=submitting`, `job_id`, terminal
+`job_state`, optional `exit_code`, result warnings, and a final
+`status=succeeded` or `status=failed` record.
 
 One exact AWS GPU target can be supplied without adding provider logic to the
 program: set `CLOUD_AWS_GPU_MODEL`, `CLOUD_AWS_GPU_MACHINE_TYPE`,
@@ -280,10 +379,19 @@ config.lookup_hourly_cost = [](const cloud::price_request& request) -> std::opti
 };
 ```
 
+Both pricing callbacks return a finite, nonnegative USD-per-hour rate or
+`std::nullopt`; custom code defines which billable components that rate covers.
+
 `resources::max_price_per_hour` is enforced before submission. A maximum
 without an available estimate fails closed. Estimates are advisory, never
 guarantees; `run()` plans again, so an earlier returned plan is not a
 reservation or binding quote. Egress is reported as unknown.
+
+`diagnose(job, expected_attempt_runtime)` performs the same read-only planning
+and derives one rate-times-expected-attempt-runtime sensitivity from that
+hourly estimate. It rejects a non-positive expected attempt runtime or one
+beyond the configured controller timeout. The arithmetic never turns an
+unavailable hourly estimate into zero.
 
 `selection::lowest_cost` validates and prices every configured provider,
 requires at least two of them, compares the same USD compute-only basis, and

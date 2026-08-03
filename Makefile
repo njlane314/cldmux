@@ -19,15 +19,30 @@ check: example examples
 	@output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
 		CLOUD_GCP_REGION=europe-west4 $(RUN_EXAMPLE) gcp)"; \
 		printf '%s\n' "$$output"; \
+		printf '%s\n' "$$output" | grep -q '^output_version=1$$'; \
+		printf '%s\n' "$$output" | grep -q '^requested_provider=gcp$$'; \
 		printf '%s\n' "$$output" | grep -q '^provider=gcp$$'; \
 		printf '%s\n' "$$output" | grep -q '^region=europe-west4$$'; \
 		printf '%s\n' "$$output" | grep -q '^machine=e2-standard-4$$'; \
+		printf '%s\n' "$$output" | grep -q '^expected_attempt_runtime_seconds=300$$'; \
+		printf '%s\n' "$$output" | grep -q '^controller_timeout_seconds=900$$'; \
+		printf '%s\n' "$$output" | grep -q '^provider_attempt_timeout_seconds=900$$'; \
+		printf '%s\n' "$$output" | grep -q '^configured_attempt_limit=2$$'; \
+		printf '%s\n' "$$output" | grep -q '^hourly_rate_estimate_usd=unavailable$$'; \
+		printf '%s\n' "$$output" | \
+			grep -q '^estimated_cost_for_expected_attempt_runtime_usd=unavailable$$'; \
+		printf '%s\n' "$$output" | grep -q '^preflight=planned$$'; \
+		printf '%s\n' "$$output" | grep -q '^status=dry-run$$'; \
 		! printf '%s\n' "$$output" | grep -Ev '^[a-z_]+=.*$$'
-	@env -i PATH="$(PATH)" CLOUD_AWS_JOB_QUEUE=test-queue CLOUD_AWS_REGION=eu-west-1 \
-		$(RUN_EXAMPLE) aws >/dev/null
-	@env -i PATH="$(PATH)" CLOUD_AZURE_BATCH_ENDPOINT=https://test.westeurope.batch.azure.com \
-		CLOUD_AZURE_REGION=westeurope \
-		$(RUN_EXAMPLE) azure >/dev/null
+	@output="$$(env -i PATH="$(PATH)" CLOUD_AWS_JOB_QUEUE=test-queue \
+		CLOUD_AWS_REGION=eu-west-1 $(RUN_EXAMPLE) aws)"; \
+		printf '%s\n' "$$output" | grep -q '^provider=aws$$'; \
+		printf '%s\n' "$$output" | grep -q '^provider_job_timeout_seconds=not-applicable$$'
+	@output="$$(env -i PATH="$(PATH)" \
+		CLOUD_AZURE_BATCH_ENDPOINT=https://test.westeurope.batch.azure.com \
+		CLOUD_AZURE_REGION=westeurope $(RUN_EXAMPLE) azure)"; \
+		printf '%s\n' "$$output" | grep -q '^provider=azure$$'; \
+		printf '%s\n' "$$output" | grep -q '^provider_job_timeout_seconds=1290$$'
 	@status=0; env -i PATH="$(PATH)" $(RUN_EXAMPLE) >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
 	@status=0; $(RUN_EXAMPLE) gcp extra >/dev/null 2>&1 || status=$$?; test $$status -eq 2
@@ -38,6 +53,21 @@ check: example examples
 		printf '%s\n' "$$output" | grep -Fq '\n'
 	@status=0; $(RUN_EXAMPLE) gcp --submit --submit >/dev/null 2>&1 || status=$$?; \
 		test $$status -eq 2
+	@status=0; $(RUN_EXAMPLE) gcp --estimate --estimate >/dev/null 2>&1 || status=$$?; \
+		test $$status -eq 2
+	@status=0; $(RUN_EXAMPLE) gcp --expected-attempt-runtime=0s >/dev/null 2>&1 || status=$$?; \
+		test $$status -eq 2
+	@status=0; $(RUN_EXAMPLE) gcp --expected-attempt-runtime=15 >/dev/null 2>&1 || status=$$?; \
+		test $$status -eq 2
+	@status=0; output="$$(env -i PATH="$(PATH)" CLOUD_GCP_PROJECT=test-project \
+		CLOUD_GCP_REGION=europe-west4 $(RUN_EXAMPLE) gcp \
+		--expected-attempt-runtime=16m 2>&1)" || status=$$?; \
+		test $$status -eq 2; \
+		test "$$output" = 'error=Expected attempt runtime must not exceed the controller timeout'
+	@status=0; $(RUN_EXAMPLE) gcp --unknown >/dev/null 2>&1 || status=$$?; \
+		test $$status -eq 2
+	@! grep -n "$$(printf '\t')" cloud.h example.cpp examples/run.cpp examples/support.h test.cpp \
+		README.md
 
 check-standards:
 	$(MAKE) check-c++17

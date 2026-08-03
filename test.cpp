@@ -1,4 +1,5 @@
 #include "cloud.h"
+#include "examples/support.h"
 
 #if __cplusplus >= 202002L
 #include <tst.hpp>
@@ -2249,6 +2250,22 @@ void pricing_tests() {
     cloud::client gcp_priced(std::move(gcp_prices));
     tst::check(std::fabs(*gcp_priced.plan(price_spec).estimated_hourly_cost - 0.072) < 1e-12,
                "GCP built-in component price");
+    auto fractional_timeout = price_spec;
+    fractional_timeout.timeout = std::chrono::milliseconds(1'501);
+    const auto fractional_diagnostics =
+        gcp_priced.diagnose(fractional_timeout, std::chrono::seconds(1));
+    tst::check(fractional_diagnostics.provider_attempt_timeout == std::chrono::seconds(2) &&
+                   cloud::detail::batch_body(fractional_timeout,
+                                             fractional_diagnostics.selected_plan)
+                           .find("\"maxRunDuration\":\"2s\"") != std::string::npos,
+               "diagnostic and GCP payload share ceil-second timeout rounding");
+    const auto boundary_diagnostics =
+        gcp_priced.diagnose(fractional_timeout, fractional_timeout.timeout);
+    tst::check(boundary_diagnostics.expected_attempt_runtime == fractional_timeout.timeout,
+               "expected attempt runtime may equal the controller timeout");
+    tst::check(server.create_retries == 0 && server.deletes == 0 &&
+                   server.gcp_compute_creates == 0,
+               "GCP diagnostics perform no mutations");
     auto exact_catalogue_ceiling = price_spec;
     exact_catalogue_ceiling.resources.max_price_per_hour = 0.072;
     (void)gcp_priced.plan(exact_catalogue_ceiling);
@@ -2304,6 +2321,19 @@ void pricing_tests() {
     tst::throws<cloud::error>([&] { (void)legacy_priced.plan(two_t4); },
                               "legacy price estimator fails closed for accelerator plans");
 
+    cloud::config overflowing_price;
+    overflowing_price.provider = "gcp";
+    overflowing_price.project = "test";
+    overflowing_price.lookup_hourly_cost = [](const cloud::price_request&) {
+        return std::optional<double>((std::numeric_limits<double>::max)());
+    };
+    cloud::client overflowing_priced(std::move(overflowing_price));
+    auto overflowing_spec = price_spec;
+    overflowing_spec.timeout = std::chrono::hours(2);
+    tst::throws<cloud::error>(
+        [&] { (void)overflowing_priced.diagnose(overflowing_spec, std::chrono::hours(2)); },
+        "overflowing diagnostic cost fails closed");
+
     cloud::config aws_prices;
     aws_prices.provider = "aws";
     aws_prices.region = "eu-west-1";
@@ -2318,6 +2348,19 @@ void pricing_tests() {
     price_spec.timeout = std::chrono::seconds(60);
     tst::check(aws_priced.plan(price_spec).estimated_hourly_cost == 0.42,
                "AWS built-in on-demand price");
+    price_spec.retries = 2;
+    const auto aws_diagnostics = aws_priced.diagnose(price_spec, std::chrono::seconds(30));
+    tst::check(aws_diagnostics.provider_attempt_timeout == std::chrono::seconds(60) &&
+                   !aws_diagnostics.provider_job_timeout &&
+                   aws_diagnostics.configured_attempt_limit == 3 &&
+                   std::any_of(aws_diagnostics.warnings.begin(), aws_diagnostics.warnings.end(),
+                               [](const std::string& warning) {
+                                   return warning.find("does not retry attempts terminated") !=
+                                          std::string::npos;
+                               }),
+               "AWS diagnostic timeout and retry qualifications");
+    tst::check(server.aws_registers == 0 && server.aws_submits == 0,
+               "AWS diagnostics perform no mutations");
 
     cloud::config aws_spot_prices;
     aws_spot_prices.provider = "aws";
@@ -2347,6 +2390,18 @@ void pricing_tests() {
     cloud::client azure_priced(std::move(azure_prices));
     tst::check(azure_priced.plan(price_spec).estimated_hourly_cost == 0.20,
                "Azure built-in retail price");
+    const auto azure_diagnostics =
+        azure_priced.diagnose(price_spec, std::chrono::seconds(30));
+    tst::check(azure_diagnostics.provider_attempt_timeout == std::chrono::seconds(60) &&
+                   azure_diagnostics.provider_job_timeout == std::chrono::seconds(450) &&
+                   azure_diagnostics.configured_attempt_limit == 3 &&
+                   std::any_of(azure_diagnostics.warnings.begin(), azure_diagnostics.warnings.end(),
+                               [](const std::string& warning) {
+                                   return warning.find("system recovery") != std::string::npos;
+                               }),
+               "Azure diagnostic watchdog and recovery qualification");
+    tst::check(server.azure_jobs == 0 && server.azure_tasks == 0,
+               "Azure diagnostics perform no mutations");
     price_spec.resources.spot = true;
     tst::check(azure_priced.plan(price_spec).estimated_hourly_cost == 0.04,
                "Azure built-in Spot price");
@@ -2375,7 +2430,13 @@ void pricing_tests() {
         return std::optional<double>(provider == "azure" ? 0.1 : provider == "aws" ? 0.2 : 0.3);
     };
     cloud::client cheapest(std::move(cheapest_config));
-    tst::check(cheapest.plan(price_spec).provider == "azure", "lowest-cost provider selection");
+    const auto cheapest_diagnostics =
+        cheapest.diagnose(price_spec, std::chrono::seconds(30));
+    tst::check(cheapest_diagnostics.selected_plan.provider == "azure" &&
+                   cheapest_diagnostics.estimated_cost_for_expected_attempt_runtime &&
+                   std::fabs(*cheapest_diagnostics.estimated_cost_for_expected_attempt_runtime -
+                             (0.1 / 120.0)) < 1e-12,
+               "lowest-cost provider selection and diagnostic cost");
     tst::throws<cloud::error>([&] { (void)cheapest.selected_provider(); },
                               "unrouted multi-provider client has no selected provider");
     tst::throws<cloud::error>([&] { (void)cheapest.storage().list("cloud://bucket"); },
@@ -2448,6 +2509,11 @@ void environment_factory_tests() {
 
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("unknown"); },
                               "environment factory rejects an unknown provider");
+    tst::throws<cloud::error>(
+        [] {
+            (void)cloud::client::from_environment("cheapest", cloud::price_source::none);
+        },
+        "cheapest environment factory rejects disabled pricing");
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("gcp"); },
                               "environment factory requires a GCP project");
     const auto storage_only_aws = cloud::client::from_environment("aws");
@@ -2659,9 +2725,10 @@ void environment_factory_tests() {
 
 void planning_tests() {
     static_assert(cloud::gcp::version == CLOUD_H_VERSION);
-    static_assert(CLOUD_H_VERSION_NUM == 0x000301);
+    static_assert(CLOUD_H_VERSION_NUM == 0x000302);
     static_assert(std::is_aggregate_v<cloud::resources>);
     static_assert(std::is_aggregate_v<cloud::job_spec>);
+    static_assert(std::is_aggregate_v<cloud::run_diagnostics>);
 
     cloud::config config;
     config.project = "test-project";
@@ -2701,6 +2768,52 @@ void planning_tests() {
     tst::check(plan.estimated_hourly_cost == 0.24, "price estimate");
     tst::check(client.supports(cloud::feature::spot_instances), "spot support");
     tst::check(client.supports(cloud::feature::accelerators), "gpu support");
+
+    const cloud::run_diagnostics diagnostics =
+        client.diagnose(spec, std::chrono::minutes(30));
+    tst::check(diagnostics.selected_plan.provider == "gcp" &&
+                   diagnostics.expected_attempt_runtime == std::chrono::minutes(30) &&
+                   diagnostics.controller_timeout == std::chrono::hours(2),
+               "diagnostic plan and caller runtime");
+    tst::check(diagnostics.provider_attempt_timeout == std::chrono::seconds(7'200) &&
+                   !diagnostics.provider_job_timeout && diagnostics.configured_retries == 2 &&
+                   diagnostics.configured_attempt_limit == 3,
+               "diagnostic timeout and retry facts");
+    tst::check(diagnostics.estimated_cost_for_expected_attempt_runtime &&
+                   std::fabs(*diagnostics.estimated_cost_for_expected_attempt_runtime - 0.12) <
+                       1e-12,
+               "diagnostic compute-cost sensitivity");
+    tst::check(std::any_of(diagnostics.warnings.begin(), diagnostics.warnings.end(),
+                           [](const std::string& warning) {
+                               return warning.find("caller-supplied") != std::string::npos;
+                           }) &&
+                   std::any_of(diagnostics.warnings.begin(), diagnostics.warnings.end(),
+                               [](const std::string& warning) {
+                                   return warning.find("egress cost") != std::string::npos;
+                               }),
+               "diagnostic warnings include plan and runtime qualifications");
+
+    tst::throws<cloud::error>(
+        [&] { (void)client.diagnose(spec, std::chrono::milliseconds::zero()); },
+        "zero expected attempt runtime is rejected");
+    tst::throws<cloud::error>(
+        [&] { (void)client.diagnose(spec, std::chrono::hours(3)); },
+        "expected attempt runtime beyond controller timeout is rejected");
+
+    cloud::config unpriced_config;
+    unpriced_config.project = "test-project";
+    unpriced_config.region = "europe";
+    unpriced_config.auth = cloud::auth::bearer("test-token");
+    unpriced_config.lookup_hourly_cost =
+        [](const cloud::price_request&) { return std::optional<double>{}; };
+    cloud::client unpriced(std::move(unpriced_config));
+    cloud::job_spec unpriced_spec = spec;
+    unpriced_spec.resources.max_price_per_hour.reset();
+    const cloud::run_diagnostics unavailable =
+        unpriced.diagnose(unpriced_spec, std::chrono::minutes(30));
+    tst::check(!unavailable.selected_plan.estimated_hourly_cost &&
+                   !unavailable.estimated_cost_for_expected_attempt_runtime,
+               "unavailable prices remain unavailable in diagnostics");
 
     const std::string body = cloud::detail::batch_body(spec, plan);
     const auto batch = cloud::gcp::detail::parse_json(body);
@@ -2845,6 +2958,32 @@ void planning_tests() {
     tst::throws<cloud::error>([&] { (void)unsafe_region.plan(spec); }, "region validation");
 }
 
+void example_support_tests() {
+    tst::check(cloud_example::parse_runtime("30s") == std::chrono::seconds(30) &&
+                   cloud_example::parse_runtime("20m") == std::chrono::minutes(20) &&
+                   cloud_example::parse_runtime("2h") == std::chrono::hours(2),
+               "example runtime parser units");
+    for (const std::string_view invalid :
+         {"", "0s", "-1s", "1", "1d", "18446744073709551615h"})
+        tst::throws<std::invalid_argument>(
+            [=] { (void)cloud_example::parse_runtime(invalid); },
+            "example runtime parser rejects malformed or overflowing input");
+
+    std::ostringstream output;
+    cloud_example::print_number(output, "hourly_rate_estimate_usd", 0.24);
+    cloud_example::print_duration_seconds(output, "runtime_seconds",
+                                          std::chrono::milliseconds(1'500));
+    cloud_example::print_record(output, "warning", "line\nwith\\control\t");
+    tst::check(output.str() ==
+                   "hourly_rate_estimate_usd=0.24\n"
+                   "runtime_seconds=1.5\n"
+                   "warning=line\\nwith\\\\control\\t\n",
+               "example output is concise, locale-stable, and escaped");
+    tst::check(cloud_example::job_state_name(cloud::job_state::succeeded) == "succeeded" &&
+                   cloud_example::job_state_name(cloud::job_state::unknown) == "unknown",
+               "example job-state output");
+}
+
 } // namespace
 
 int main() {
@@ -2862,5 +3001,6 @@ int main() {
         TST_CASE("submits Azure whole-container Blob mounts", azure_mount_tests()),
         TST_CASE("runs AWS Batch and recovery", aws_lifecycle_tests()),
         TST_CASE("runs Azure Batch and log recovery", azure_lifecycle_tests()),
-        TST_CASE("looks up prices and selects providers", pricing_tests()));
+        TST_CASE("looks up prices and selects providers", pricing_tests()),
+        TST_CASE("formats example diagnostics", example_support_tests()));
 }
