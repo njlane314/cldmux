@@ -9,7 +9,7 @@ EXAMPLE := /tmp/cloud-h-example
 check: example $(TST_DIR)/tst.hpp
 	awk '/^```cpp$$/ {code=1; next} code && /^```/ {exit} code {print}' README.md | \
 		$(CXX) $(CXXFLAGS) -I. -x c++ -fsyntax-only -
-	$(CXX) $(CXXFLAGS) -I. -I"$(TST_DIR)" test.cpp $(CURL_FLAGS) -pthread -o $(TEST)
+	$(CXX) $(CXXFLAGS) -I. -isystem "$(TST_DIR)" test.cpp $(CURL_FLAGS) -pthread -o $(TEST)
 	$(TEST)
 
 example:
@@ -17,5 +17,5 @@ example:
 
 sanitize: $(TST_DIR)/tst.hpp
 	$(CXX) $(CXXFLAGS) -fsanitize=address,undefined -fno-omit-frame-pointer \
-		-I. -I"$(TST_DIR)" test.cpp $(CURL_FLAGS) -pthread -o $(TEST)-san
+		-I. -isystem "$(TST_DIR)" test.cpp $(CURL_FLAGS) -pthread -o $(TEST)-san
 	$(TEST)-san
