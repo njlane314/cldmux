@@ -1152,10 +1152,20 @@ inline HttpResponse http(HttpRequest request) {
             throw Error("Cannot rewind upload file: " + request.upload_file->path.string());
         upload_source.stream = &upload;
         upload_source.remaining = request.upload_file->size;
-        curl_set(curl.get(), CURLOPT_POST, 1L);
         curl_set(curl.get(), CURLOPT_READFUNCTION, &read_callback);
         curl_set(curl.get(), CURLOPT_READDATA, &upload_source);
-        curl_set(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, request.upload_file->size);
+        if (request.method == "POST") {
+            curl_set(curl.get(), CURLOPT_POST, 1L);
+            curl_set(curl.get(), CURLOPT_POSTFIELDSIZE_LARGE, request.upload_file->size);
+        } else {
+            // CURLOPT_UPLOAD selects HTTP PUT by default. Keeping the method
+            // explicit for any future streamed verb avoids silently turning a
+            // provider upload into the POST historically used by GCS.
+            curl_set(curl.get(), CURLOPT_UPLOAD, 1L);
+            curl_set(curl.get(), CURLOPT_INFILESIZE_LARGE, request.upload_file->size);
+            if (request.method != "PUT")
+                curl_set(curl.get(), CURLOPT_CUSTOMREQUEST, request.method.c_str());
+        }
     } else if (request.method == "POST") {
         curl_set(curl.get(), CURLOPT_POST, 1L);
         curl_set(curl.get(), CURLOPT_POSTFIELDS, request.body.data());
@@ -1179,7 +1189,7 @@ inline HttpResponse http(HttpRequest request) {
         if (!parent.empty())
             std::filesystem::create_directories(parent);
         temporary = *request.download_file;
-        temporary += ".gcp-part-" + random_uuid();
+        temporary += ".cloud-part-" + random_uuid();
         temporary_guard.emplace(temporary);
         output.open(temporary, std::ios::binary | std::ios::trunc);
         if (!output)
@@ -1932,8 +1942,8 @@ private:
 
 namespace cloud {
 
-// Storage, object, instance, and operation aliases intentionally expose the
-// low-level GCP representations. Portable Batch jobs use the types below.
+// Storage and instance values deliberately use one compact representation for
+// every provider. Native identifiers remain provider-shaped strings.
 using error = gcp::Error;
 using access_token = gcp::AccessToken;
 using token_provider = std::function<access_token()>;
@@ -1943,9 +1953,40 @@ using object_list = gcp::ObjectList;
 using list_options = gcp::ListOptions;
 using put_options = gcp::PutOptions;
 using instance = gcp::Instance;
-using operation = gcp::Operation;
 
 using provider = std::string;
+
+// Provider-neutral asynchronous raw-compute operation. GCE long-running
+// operations and AWS/Azure state transitions expose the same bounded wait()
+// surface without pretending their native operation resources are identical.
+class operation {
+public:
+    [[nodiscard]] const std::string& name() const noexcept { return name_; }
+    [[nodiscard]] const std::string& zone() const noexcept { return location_; }
+
+    void wait(std::chrono::milliseconds timeout = std::chrono::minutes(10),
+              std::chrono::milliseconds poll_interval = std::chrono::seconds(1)) const {
+        if (timeout <= std::chrono::milliseconds::zero())
+            throw error("Compute operation wait timeout must be positive");
+        if (poll_interval <= std::chrono::milliseconds::zero())
+            throw error("Compute operation poll interval must be positive");
+        waiter_(timeout, poll_interval);
+    }
+
+private:
+    friend class compute;
+    using waiter = std::function<void(std::chrono::milliseconds, std::chrono::milliseconds)>;
+
+    operation(std::string name, std::string location, waiter wait)
+        : name_(std::move(name)), location_(std::move(location)), waiter_(std::move(wait)) {
+        if (name_.empty() || !waiter_)
+            throw error("Malformed compute operation");
+    }
+
+    std::string name_;
+    std::string location_;
+    waiter waiter_;
+};
 
 // ordered selects the first configured provider that can plan the request.
 // lowest_cost requires comparable hourly prices and at least two candidates.
@@ -2149,6 +2190,37 @@ struct aws_gpu_target {
     unsigned gpus = 0;
 };
 
+// One S3 Files file system already associated with a bucket. AWS Batch mounts
+// the file system, while cloud:// continues to name the corresponding bucket.
+struct aws_s3_files_mount {
+    std::string file_system_arn;
+    std::string access_point_arn;
+};
+
+// A logical raw-instance template can contain one native definition per cloud.
+// Callers pass only the logical map key to compute().create().
+struct aws_launch_template {
+    std::string id;
+    std::string name;
+    std::string version = "$Default";
+};
+
+struct azure_instance_template {
+    // A specialised managed image or Compute Gallery image resource ID avoids
+    // embedding provider-specific login/password policy in the common API.
+    std::string image_id;
+    std::string subnet_id;
+    std::string machine_type;
+    std::string location;
+    std::string os_disk_type = "Standard_LRS";
+};
+
+struct instance_template {
+    std::string gcp_instance_template;
+    cloud::aws_launch_template aws;
+    cloud::azure_instance_template azure;
+};
+
 struct aws_config {
     // The refresh callback wins, followed by explicit values, then
     // AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, and optional AWS_SESSION_TOKEN.
@@ -2160,6 +2232,13 @@ struct aws_config {
     // required when resources::spot is true.
     std::string job_queue;
     std::string spot_job_queue;
+    // S3 Files is supported by AWS Batch only on Fargate. Mounted jobs use
+    // these queues and roles instead of the EC2 queues above.
+    std::string fargate_job_queue;
+    std::string fargate_spot_job_queue;
+    std::string execution_role_arn;
+    std::string job_role_arn;
+    std::map<std::string, aws_s3_files_mount, std::less<>> s3_files;
     // Batch cannot select an EC2 GPU model per job. Map a canonical GPU name to
     // queues backed only by one exact instance type and declare that type's
     // capacity; planning fails rather than overcommitting it.
@@ -2173,6 +2252,7 @@ struct aws_config {
     std::string batch_endpoint;
     std::string logs_endpoint;
     std::string ec2_endpoint;
+    std::string s3_endpoint;
     std::string pricing_endpoint = "https://api.pricing.us-east-1.amazonaws.com";
     std::string pricing_region = "us-east-1";
 };
@@ -2183,6 +2263,19 @@ struct azure_config {
     // When absent, config::auth supplies the Batch bearer token. This override
     // lets a multi-provider client use an Azure-scoped token independently.
     std::optional<cloud::auth> auth;
+    // Blob and Resource Manager use different OAuth audiences from Batch.
+    // Separate overrides preserve correct token caching in multi-cloud clients.
+    std::string storage_account;
+    std::optional<cloud::auth> storage_auth;
+    // A SAS is used only by Batch nodes for BlobFuse mounts. Controller object
+    // operations continue to prefer the storage-scoped bearer token above.
+    std::string storage_sas;
+    std::string storage_endpoint;
+    std::string subscription_id;
+    std::string resource_group;
+    std::optional<cloud::auth> management_auth;
+    std::string management_endpoint = "https://management.azure.com";
+    std::string compute_api_version = "2025-04-01";
     // Image fields describe the auto-pool node image, not the submitted
     // container. Each job receives a one-node job-lifetime pool.
     std::string image_publisher = "microsoft-dsvm";
@@ -2213,6 +2306,9 @@ struct config {
     cloud::auth auth = cloud::auth::default_chain();
     cloud::aws_config aws;
     cloud::azure_config azure;
+    // Many logical templates may be supplied in C++. from_environment() keeps
+    // its contract concise by loading at most one named CLOUD_COMPUTE_TEMPLATE.
+    std::map<std::string, cloud::instance_template, std::less<>> instance_templates;
 
     // Price precedence is lookup_hourly_cost, compatibility estimator, then the
     // opt-in public catalogue. Supplying either callback suppresses catalogue lookup.
@@ -2341,6 +2437,20 @@ inline provider selected_provider(const config& cfg, std::vector<std::string>* w
     throw error("None of the configured cloud providers is implemented");
 }
 
+inline std::optional<provider> implicit_route(const config& cfg) {
+    if (cfg.provider)
+        return selected_provider(cfg);
+    if (cfg.providers.size() == 1 && implemented(cfg.providers.front()))
+        return cfg.providers.front();
+    return std::nullopt;
+}
+
+inline bool configured_provider(const config& cfg, std::string_view wanted) {
+    if (cfg.provider)
+        return *cfg.provider == wanted;
+    return std::find(cfg.providers.begin(), cfg.providers.end(), wanted) != cfg.providers.end();
+}
+
 inline std::string canonical_gpu(std::string value) {
     std::transform(value.begin(), value.end(), value.begin(), gcp::detail::ascii_lower);
     for (const std::string_view prefix : {std::string_view("nvidia-"), std::string_view("tesla-")})
@@ -2440,6 +2550,9 @@ inline void environment_locations(config& out) {
 }
 
 inline bool environment_aws_configured() {
+    // Cheapest routing currently needs an EC2-backed queue whose native shape
+    // can be priced. Fargate-only/storage-only/raw-only AWS configuration is
+    // still accepted by from_environment("aws"), but is not inferred here.
     return !gcp::detail::env("CLOUD_AWS_JOB_QUEUE").empty() ||
            !gcp::detail::env("CLOUD_AWS_SPOT_JOB_QUEUE").empty() ||
            !gcp::detail::env("CLOUD_AWS_GPU_MODEL").empty() ||
@@ -2449,6 +2562,16 @@ inline bool environment_aws_configured() {
            !gcp::detail::env("CLOUD_AWS_GPU_CPUS").empty() ||
            !gcp::detail::env("CLOUD_AWS_GPU_MEMORY_GB").empty() ||
            !gcp::detail::env("CLOUD_AWS_GPU_COUNT").empty();
+}
+
+inline std::string environment_compute_template() {
+    return gcp::detail::env("CLOUD_COMPUTE_TEMPLATE");
+}
+
+inline void require_environment_template(std::string_view native_name,
+                                         const std::string& logical) {
+    if (logical.empty())
+        throw error(std::string(native_name) + " requires CLOUD_COMPUTE_TEMPLATE");
 }
 
 inline void environment_aws_gpu_target(config& out) {
@@ -2483,19 +2606,55 @@ inline void environment_gcp(config& out) {
     if (out.project.empty())
         throw error("GCP environment configuration requires CLOUD_GCP_PROJECT");
     validate_project(out.project);
+    const std::string native = gcp::detail::env("CLOUD_GCP_INSTANCE_TEMPLATE");
+    if (!native.empty()) {
+        const std::string logical = environment_compute_template();
+        require_environment_template("CLOUD_GCP_INSTANCE_TEMPLATE", logical);
+        out.instance_templates[logical].gcp_instance_template = native;
+    }
 }
 
 inline void environment_aws(config& out, bool comparing_prices) {
     out.aws.job_queue = gcp::detail::env("CLOUD_AWS_JOB_QUEUE");
     out.aws.spot_job_queue = gcp::detail::env("CLOUD_AWS_SPOT_JOB_QUEUE");
+    out.aws.fargate_job_queue = gcp::detail::env("CLOUD_AWS_FARGATE_JOB_QUEUE");
+    out.aws.fargate_spot_job_queue =
+        gcp::detail::env("CLOUD_AWS_FARGATE_SPOT_JOB_QUEUE");
+    out.aws.execution_role_arn = gcp::detail::env("CLOUD_AWS_EXECUTION_ROLE_ARN");
+    out.aws.job_role_arn = gcp::detail::env("CLOUD_AWS_JOB_ROLE_ARN");
     out.aws.machine_type = gcp::detail::env("CLOUD_AWS_MACHINE_TYPE");
     out.aws.spot_machine_type = gcp::detail::env("CLOUD_AWS_SPOT_MACHINE_TYPE");
     if (const std::string value = gcp::detail::env("CLOUD_AWS_LOG_GROUP"); !value.empty())
         out.aws.log_group = value;
     environment_aws_gpu_target(out);
-    if (out.aws.job_queue.empty() && out.aws.spot_job_queue.empty() && out.aws.gpu_targets.empty())
-        throw error("AWS environment configuration requires at least one CPU, Spot, or GPU "
-                    "Batch queue");
+
+    const std::string bucket = gcp::detail::env("CLOUD_AWS_S3_FILES_BUCKET");
+    const std::string file_system =
+        gcp::detail::env("CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN");
+    const std::string access_point =
+        gcp::detail::env("CLOUD_AWS_S3_FILES_ACCESS_POINT_ARN");
+    if (!bucket.empty() || !file_system.empty() || !access_point.empty()) {
+        if (bucket.empty() || file_system.empty())
+            throw error("AWS S3 Files environment configuration requires a bucket and file "
+                        "system ARN");
+        out.aws.s3_files[bucket] = {file_system, access_point};
+    }
+
+    const std::string launch_id = gcp::detail::env("CLOUD_AWS_LAUNCH_TEMPLATE_ID");
+    const std::string launch_name = gcp::detail::env("CLOUD_AWS_LAUNCH_TEMPLATE_NAME");
+    const std::string launch_version = gcp::detail::env("CLOUD_AWS_LAUNCH_TEMPLATE_VERSION");
+    if (!launch_id.empty() || !launch_name.empty() || !launch_version.empty()) {
+        const std::string logical = environment_compute_template();
+        require_environment_template("AWS launch-template configuration", logical);
+        if (launch_id.empty() == launch_name.empty())
+            throw error("AWS raw compute requires exactly one of "
+                        "CLOUD_AWS_LAUNCH_TEMPLATE_ID and CLOUD_AWS_LAUNCH_TEMPLATE_NAME");
+        auto& target = out.instance_templates[logical].aws;
+        target.id = launch_id;
+        target.name = launch_name;
+        if (!launch_version.empty())
+            target.version = launch_version;
+    }
     const std::string zone = configured_zone(out, "aws");
     const bool priced_cpu = !out.aws.job_queue.empty() && !out.aws.machine_type.empty();
     const bool priced_spot =
@@ -2536,21 +2695,79 @@ inline void validate_environment_azure_endpoint(const config& out, std::string e
 inline void environment_azure(config& out) {
     out.azure.batch_endpoint =
         gcp::detail::base_url(gcp::detail::env("CLOUD_AZURE_BATCH_ENDPOINT"));
-    if (out.azure.batch_endpoint.empty())
-        throw error("Azure environment configuration requires CLOUD_AZURE_BATCH_ENDPOINT");
     // Restrict bearer-token destinations in the minimal environment contract.
     // Explicit cloud::config remains the escape hatch for a trusted proxy or a
     // sovereign-cloud endpoint with a different DNS suffix.
-    validate_environment_azure_endpoint(out, out.azure.batch_endpoint);
-    // Azure catalogue pricing is public, so the Batch token is read only if an
-    // Azure job is actually submitted. A zero expiry receives the conservative
-    // refresh lifetime used by the shared credential cache.
-    out.azure.auth = auth::from([](std::string_view) {
-        std::string token = gcp::detail::env("CLOUD_AZURE_BATCH_TOKEN");
+    if (!out.azure.batch_endpoint.empty())
+        validate_environment_azure_endpoint(out, out.azure.batch_endpoint);
+
+    out.azure.storage_account = gcp::detail::env("CLOUD_AZURE_STORAGE_ACCOUNT");
+    if (!out.azure.storage_account.empty()) {
+        if (out.azure.storage_account.size() < 3 || out.azure.storage_account.size() > 24 ||
+            !std::all_of(out.azure.storage_account.begin(), out.azure.storage_account.end(),
+                         [](char c) {
+                             return gcp::detail::is_ascii_lower(c) ||
+                                    gcp::detail::is_ascii_digit(c);
+                         }))
+            throw error("CLOUD_AZURE_STORAGE_ACCOUNT must contain 3-24 lowercase letters or "
+                        "digits");
+        out.azure.storage_endpoint =
+            "https://" + out.azure.storage_account + ".blob.core.windows.net";
+    }
+    out.azure.storage_sas = gcp::detail::env("CLOUD_AZURE_STORAGE_SAS");
+    if (!out.azure.storage_sas.empty() && out.azure.storage_sas.front() == '?')
+        out.azure.storage_sas.erase(out.azure.storage_sas.begin());
+
+    out.azure.subscription_id = gcp::detail::env("CLOUD_AZURE_SUBSCRIPTION_ID");
+    out.azure.resource_group = gcp::detail::env("CLOUD_AZURE_RESOURCE_GROUP");
+    const std::string image = gcp::detail::env("CLOUD_AZURE_VM_IMAGE_ID");
+    const std::string subnet = gcp::detail::env("CLOUD_AZURE_VM_SUBNET_ID");
+    const std::string size = gcp::detail::env("CLOUD_AZURE_VM_SIZE");
+    const std::string location = gcp::detail::env("CLOUD_AZURE_VM_LOCATION");
+    const std::string disk = gcp::detail::env("CLOUD_AZURE_VM_OS_DISK_TYPE");
+    if (!image.empty() || !subnet.empty() || !size.empty() || !location.empty() ||
+        !disk.empty()) {
+        const std::string logical = environment_compute_template();
+        require_environment_template("Azure VM template configuration", logical);
+        if (image.empty() || subnet.empty() || size.empty())
+            throw error("Azure raw compute requires CLOUD_AZURE_VM_IMAGE_ID, "
+                        "CLOUD_AZURE_VM_SUBNET_ID, and CLOUD_AZURE_VM_SIZE");
+        auto& target = out.instance_templates[logical].azure;
+        target.image_id = image;
+        target.subnet_id = subnet;
+        target.machine_type = size;
+        target.location = location;
+        if (!disk.empty())
+            target.os_disk_type = disk;
+    }
+    const bool raw_configured = !image.empty() || !out.azure.subscription_id.empty() ||
+                                !out.azure.resource_group.empty();
+    if (raw_configured && (out.azure.subscription_id.empty() || out.azure.resource_group.empty()))
+        throw error("Azure raw compute requires CLOUD_AZURE_SUBSCRIPTION_ID and "
+                    "CLOUD_AZURE_RESOURCE_GROUP");
+    if (out.azure.batch_endpoint.empty() && out.azure.storage_account.empty() && !raw_configured)
+        throw error("Azure environment configuration requires Batch, Blob Storage, or raw VM "
+                    "settings");
+
+    // Tokens are fetched lazily and selected by the exact Azure audience. A
+    // zero expiry receives the conservative refresh lifetime used by the
+    // shared credential cache.
+    const auto environment_auth = auth::from([](std::string_view scope) {
+        std::string variable;
+        if (scope == "https://storage.azure.com/.default")
+            variable = "CLOUD_AZURE_STORAGE_TOKEN";
+        else if (scope == "https://management.azure.com/.default")
+            variable = "CLOUD_AZURE_MANAGEMENT_TOKEN";
+        else
+            variable = "CLOUD_AZURE_BATCH_TOKEN";
+        std::string token = gcp::detail::env(variable);
         if (token.empty())
-            throw error("Azure submission requires CLOUD_AZURE_BATCH_TOKEN");
+            throw error(variable + " is required for this Azure operation");
         return access_token{std::move(token), {}, {}};
     });
+    out.azure.auth = environment_auth;
+    out.azure.storage_auth = environment_auth;
+    out.azure.management_auth = environment_auth;
 }
 
 inline config config_from_environment(std::string_view requested) {
@@ -3015,7 +3232,9 @@ inline std::string job_id(std::string value) {
 struct client_state {
     cloud::config config;
     gcp::Cloud raw;
-    gcp::Credentials azure_auth;
+    gcp::Credentials azure_batch_auth;
+    gcp::Credentials azure_storage_auth;
+    gcp::Credentials azure_management_auth;
     mutable std::mutex price_mutex;
     mutable std::map<std::string, std::pair<std::chrono::steady_clock::time_point, double>,
                      std::less<>>
@@ -3038,8 +3257,18 @@ struct client_state {
 
     explicit client_state(cloud::config value)
         : config(std::move(value)), raw(low_level(config)),
-          azure_auth((config.azure.auth ? *config.azure.auth : config.auth)
-                         .for_scope("https://batch.core.windows.net/.default")) {
+          azure_batch_auth((config.azure.auth ? *config.azure.auth : config.auth)
+                               .for_scope("https://batch.core.windows.net/.default")),
+          azure_storage_auth(
+              (config.azure.storage_auth
+                   ? *config.azure.storage_auth
+                   : config.azure.auth ? *config.azure.auth : config.auth)
+                  .for_scope("https://storage.azure.com/.default")),
+          azure_management_auth(
+              (config.azure.management_auth
+                   ? *config.azure.management_auth
+                   : config.azure.auth ? *config.azure.auth : config.auth)
+                  .for_scope("https://management.azure.com/.default")) {
         if (config.poll_interval <= std::chrono::milliseconds::zero() ||
             config.final_log_delay < std::chrono::milliseconds::zero() ||
             config.final_log_timeout < config.final_log_delay ||
@@ -3051,7 +3280,13 @@ struct client_state {
 
     [[nodiscard]] std::shared_ptr<gcp::detail::Core> core() const { return raw.core_; }
 
-    [[nodiscard]] const gcp::Credentials& azure_credentials() const { return azure_auth; }
+    [[nodiscard]] const gcp::Credentials& azure_credentials() const { return azure_batch_auth; }
+    [[nodiscard]] const gcp::Credentials& azure_storage_credentials() const {
+        return azure_storage_auth;
+    }
+    [[nodiscard]] const gcp::Credentials& azure_management_credentials() const {
+        return azure_management_auth;
+    }
 };
 
 inline bool retryable(long status) {
@@ -5001,13 +5236,22 @@ public:
 
 private:
     friend class client;
-    explicit storage(std::shared_ptr<detail::client_state> state) : state_(std::move(state)) {}
+    explicit storage(std::shared_ptr<detail::client_state> state,
+                     std::optional<cloud::provider> provider)
+        : state_(std::move(state)), provider_(std::move(provider)) {}
+    [[nodiscard]] const cloud::provider& provider() const {
+        if (!provider_)
+            throw error("Object storage on a multi-provider client requires route(job) or "
+                        "route(provider) first");
+        return *provider_;
+    }
     [[nodiscard]] gcp::Cloud& raw() const {
-        if (detail::selected_provider(state_->config) != "gcp")
+        if (provider() != "gcp")
             throw error("Generic object storage is currently available only for GCP");
         return state_->raw;
     }
     std::shared_ptr<detail::client_state> state_;
+    std::optional<cloud::provider> provider_;
 };
 
 // Provider-shaped facade for raw GCE instances. Batch jobs do not use this path;
@@ -5018,27 +5262,43 @@ public:
         return raw().vms(limit);
     }
     [[nodiscard]] operation create(std::string name, std::string instance_template) const {
-        return raw().create_from_template(std::move(name), std::move(instance_template));
+        return wrap(raw().create_from_template(std::move(name), std::move(instance_template)));
     }
     [[nodiscard]] operation start(std::string name) const {
-        return raw().vm(std::move(name)).start();
+        return wrap(raw().vm(std::move(name)).start());
     }
     [[nodiscard]] operation stop(std::string name) const {
-        return raw().vm(std::move(name)).stop();
+        return wrap(raw().vm(std::move(name)).stop());
     }
     [[nodiscard]] operation destroy(std::string name) const {
-        return raw().vm(std::move(name)).erase();
+        return wrap(raw().vm(std::move(name)).erase());
     }
 
 private:
     friend class client;
-    explicit compute(std::shared_ptr<detail::client_state> state) : state_(std::move(state)) {}
+    explicit compute(std::shared_ptr<detail::client_state> state,
+                     std::optional<cloud::provider> provider)
+        : state_(std::move(state)), provider_(std::move(provider)) {}
+    [[nodiscard]] const cloud::provider& provider() const {
+        if (!provider_)
+            throw error("Raw compute on a multi-provider client requires route(job) or "
+                        "route(provider) first");
+        return *provider_;
+    }
     [[nodiscard]] gcp::Cloud& raw() const {
-        if (detail::selected_provider(state_->config) != "gcp")
+        if (provider() != "gcp")
             throw error("Generic raw instance control is currently available only for GCP");
         return state_->raw;
     }
+    [[nodiscard]] static operation wrap(gcp::Operation native) {
+        const std::string name = native.name();
+        const std::string zone = native.zone();
+        return operation(name, zone, [native = std::move(native)](auto timeout, auto poll) {
+            native.wait(timeout, poll);
+        });
+    }
     std::shared_ptr<detail::client_state> state_;
+    std::optional<cloud::provider> provider_;
 };
 
 class job {
@@ -5198,8 +5458,9 @@ private:
 class client {
 public:
     explicit client(cloud::config value = {})
-        : state_(std::make_shared<detail::client_state>(std::move(value))), storage_(state_),
-          compute_(state_) {}
+        : state_(std::make_shared<detail::client_state>(std::move(value))),
+          bound_provider_(detail::implicit_route(state_->config)),
+          storage_(state_, bound_provider_), compute_(state_, bound_provider_) {}
 
     // Construct one provider-neutral client from the documented CLOUD_*
     // environment contract. "cheapest" compares every configured provider;
@@ -5211,7 +5472,30 @@ public:
     [[nodiscard]] cloud::plan plan(const job_spec& spec) const {
         // Does not mutate provider resources; it may invoke a caller pricing
         // callback or query a read-only public catalogue API.
+        if (bound_provider_)
+            return detail::priced_plan(*state_, spec, *bound_provider_);
         return detail::make_plan(*state_, spec);
+    }
+
+    // Plan once to choose a provider, then pin every subsequent operation to
+    // that backend. run() still revalidates/reprices, but cannot switch clouds.
+    [[nodiscard]] client route(const job_spec& spec) const {
+        return client(state_, plan(spec).provider);
+    }
+
+    // Explicit routing is the local override for an already configured router.
+    [[nodiscard]] client route(cloud::provider value) const {
+        if (!detail::implemented(value))
+            throw error(value + " backend is not implemented");
+        if (!detail::configured_provider(state_->config, value))
+            throw error(value + " is not configured on this client");
+        return client(state_, std::move(value));
+    }
+
+    [[nodiscard]] const cloud::provider& selected_provider() const {
+        if (!bound_provider_)
+            throw error("Multi-provider client is not routed");
+        return *bound_provider_;
     }
 
     [[nodiscard]] cloud::job run(const job_spec& spec) const {
@@ -5283,11 +5567,12 @@ public:
     }
 
     [[nodiscard]] bool supports(feature requested) const {
-        try {
-            return supports(detail::selected_provider(state_->config), requested);
-        } catch (const error&) {
+        if (bound_provider_)
+            return supports(*bound_provider_, requested);
+        if (state_->config.providers.empty())
             return false;
-        }
+        return std::all_of(state_->config.providers.begin(), state_->config.providers.end(),
+                           [&](const auto& value) { return supports(value, requested); });
     }
 
     [[nodiscard]] cloud::storage& storage() noexcept { return storage_; }
@@ -5298,7 +5583,12 @@ public:
     [[nodiscard]] const gcp::Cloud& gcp() const noexcept { return state_->raw; }
 
 private:
+    client(std::shared_ptr<detail::client_state> state, cloud::provider provider)
+        : state_(std::move(state)), bound_provider_(std::move(provider)),
+          storage_(state_, bound_provider_), compute_(state_, bound_provider_) {}
+
     std::shared_ptr<detail::client_state> state_;
+    std::optional<cloud::provider> bound_provider_;
     cloud::storage storage_;
     cloud::compute compute_;
 };

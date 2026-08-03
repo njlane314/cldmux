@@ -1137,6 +1137,22 @@ void pricing_tests() {
     };
     cloud::client cheapest(std::move(cheapest_config));
     tst::check(cheapest.plan(price_spec).provider == "azure", "lowest-cost provider selection");
+    tst::throws<cloud::error>([&] { (void)cheapest.selected_provider(); },
+                              "unrouted multi-provider client has no selected provider");
+    tst::throws<cloud::error>([&] { (void)cheapest.storage().list("cloud://bucket"); },
+                              "unrouted multi-provider storage fails closed");
+    tst::throws<cloud::error>([&] { (void)cheapest.compute().instances(); },
+                              "unrouted multi-provider compute fails closed");
+    const auto azure_route = cheapest.route(price_spec);
+    tst::check(azure_route.selected_provider() == "azure" &&
+                   azure_route.plan(price_spec).provider == "azure",
+               "route(job) fixes the planned provider");
+    const auto aws_override = cheapest.route("aws");
+    tst::check(aws_override.selected_provider() == "aws" &&
+                   aws_override.plan(price_spec).provider == "aws",
+               "route(provider) overrides cheapest routing locally");
+    tst::throws<cloud::error>([&] { (void)cheapest.route("unknown"); },
+                              "explicit route rejects an unknown provider");
 }
 
 void environment_factory_tests() {
@@ -1146,8 +1162,20 @@ void environment_factory_tests() {
         "CLOUD_GCP_PROJECT",
         "CLOUD_GCP_REGION",
         "CLOUD_GCP_ZONE",
+        "CLOUD_COMPUTE_TEMPLATE",
+        "CLOUD_GCP_INSTANCE_TEMPLATE",
         "CLOUD_AWS_JOB_QUEUE",
         "CLOUD_AWS_SPOT_JOB_QUEUE",
+        "CLOUD_AWS_FARGATE_JOB_QUEUE",
+        "CLOUD_AWS_FARGATE_SPOT_JOB_QUEUE",
+        "CLOUD_AWS_EXECUTION_ROLE_ARN",
+        "CLOUD_AWS_JOB_ROLE_ARN",
+        "CLOUD_AWS_S3_FILES_BUCKET",
+        "CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN",
+        "CLOUD_AWS_S3_FILES_ACCESS_POINT_ARN",
+        "CLOUD_AWS_LAUNCH_TEMPLATE_ID",
+        "CLOUD_AWS_LAUNCH_TEMPLATE_NAME",
+        "CLOUD_AWS_LAUNCH_TEMPLATE_VERSION",
         "CLOUD_AWS_MACHINE_TYPE",
         "CLOUD_AWS_SPOT_MACHINE_TYPE",
         "CLOUD_AWS_LOG_GROUP",
@@ -1166,14 +1194,24 @@ void environment_factory_tests() {
         "CLOUD_AZURE_BATCH_ENDPOINT",
         "CLOUD_AZURE_REGION",
         "CLOUD_AZURE_BATCH_TOKEN",
+        "CLOUD_AZURE_STORAGE_ACCOUNT",
+        "CLOUD_AZURE_STORAGE_TOKEN",
+        "CLOUD_AZURE_STORAGE_SAS",
+        "CLOUD_AZURE_SUBSCRIPTION_ID",
+        "CLOUD_AZURE_RESOURCE_GROUP",
+        "CLOUD_AZURE_MANAGEMENT_TOKEN",
+        "CLOUD_AZURE_VM_IMAGE_ID",
+        "CLOUD_AZURE_VM_SUBNET_ID",
+        "CLOUD_AZURE_VM_SIZE",
+        "CLOUD_AZURE_VM_LOCATION",
+        "CLOUD_AZURE_VM_OS_DISK_TYPE",
     };
 
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("unknown"); },
                               "environment factory rejects an unknown provider");
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("gcp"); },
                               "environment factory requires a GCP project");
-    tst::throws<cloud::error>([] { (void)cloud::client::from_environment("aws"); },
-                              "environment factory requires an AWS queue");
+    const auto storage_only_aws = cloud::client::from_environment("aws");
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("azure"); },
                               "environment factory requires an Azure endpoint");
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("cheapest"); },
@@ -1188,10 +1226,14 @@ void environment_factory_tests() {
     spec.command = {"run"};
     spec.resources.cpus = 4;
     spec.resources.memory_gb = 16;
+    tst::throws<cloud::error>([&] { (void)storage_only_aws.plan(spec); },
+                              "AWS job planning still requires a Batch queue");
 
     environment.set("CLOUD_REGION", "us");
     environment.set("CLOUD_ZONE", "shared-zone");
     environment.set("CLOUD_GCP_PROJECT", "test-project");
+    environment.set("CLOUD_COMPUTE_TEMPLATE", "worker");
+    environment.set("CLOUD_GCP_INSTANCE_TEMPLATE", "gcp-worker-template");
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("cheapest"); },
                               "cheapest routing requires at least two providers");
     environment.set("CLOUD_GCP_REGION", "europe-west4");
@@ -1202,7 +1244,9 @@ void environment_factory_tests() {
                    gcp_config.project == "test-project" && gcp_config.region == "us" &&
                    gcp_config.zone == "shared-zone" &&
                    cloud::detail::configured_region(gcp_config, "gcp") == "europe-west4" &&
-                   cloud::detail::configured_zone(gcp_config, "gcp") == "europe-west4-a",
+                   cloud::detail::configured_zone(gcp_config, "gcp") == "europe-west4-a" &&
+                   gcp_config.instance_templates.at("worker").gcp_instance_template ==
+                       "gcp-worker-template",
                "GCP environment mapping");
     const auto gcp_plan = cloud::client::from_environment("gcp").plan(spec);
     tst::check(gcp_plan.provider == "gcp" && gcp_plan.region == "europe-west4" &&
@@ -1216,6 +1260,13 @@ void environment_factory_tests() {
     environment.set("CLOUD_AWS_LOG_GROUP", "/aws/batch/cloud-test");
     environment.set("CLOUD_AWS_REGION", "eu-west-1");
     environment.set("CLOUD_AWS_ZONE", "eu-west-1a");
+    environment.set("CLOUD_AWS_FARGATE_JOB_QUEUE", "fargate-queue");
+    environment.set("CLOUD_AWS_EXECUTION_ROLE_ARN", "arn:aws:iam::123:role/execution");
+    environment.set("CLOUD_AWS_JOB_ROLE_ARN", "arn:aws:iam::123:role/job");
+    environment.set("CLOUD_AWS_S3_FILES_BUCKET", "inputs");
+    environment.set("CLOUD_AWS_S3_FILES_FILE_SYSTEM_ARN",
+                    "arn:aws:s3files:eu-west-1:123:file-system/fs-1");
+    environment.set("CLOUD_AWS_LAUNCH_TEMPLATE_ID", "lt-123");
 
     const cloud::config aws_config = cloud::detail::config_from_environment("aws");
     tst::check(aws_config.provider && *aws_config.provider == "aws" &&
@@ -1224,6 +1275,10 @@ void environment_factory_tests() {
                    aws_config.aws.machine_type == "m6i.xlarge" &&
                    aws_config.aws.spot_machine_type == "m6i.xlarge" &&
                    aws_config.aws.log_group == "/aws/batch/cloud-test" &&
+                   aws_config.aws.fargate_job_queue == "fargate-queue" &&
+                   aws_config.aws.s3_files.at("inputs").file_system_arn.find("fs-1") !=
+                       std::string::npos &&
+                   aws_config.instance_templates.at("worker").aws.id == "lt-123" &&
                    cloud::detail::configured_region(aws_config, "aws") == "eu-west-1" &&
                    cloud::detail::configured_zone(aws_config, "aws") == "eu-west-1a",
                "AWS environment mapping");
@@ -1250,10 +1305,22 @@ void environment_factory_tests() {
     tst::throws<cloud::error>([] { (void)cloud::client::from_environment("azure"); },
                               "Azure environment rejects an endpoint path");
     environment.set("CLOUD_AZURE_BATCH_ENDPOINT", "https://test.westeurope.batch.azure.com");
+    environment.set("CLOUD_AZURE_STORAGE_ACCOUNT", "teststorage");
+    environment.set("CLOUD_AZURE_STORAGE_SAS", "?sv=test&sig=secret");
+    environment.set("CLOUD_AZURE_SUBSCRIPTION_ID", "subscription");
+    environment.set("CLOUD_AZURE_RESOURCE_GROUP", "workers");
+    environment.set("CLOUD_AZURE_VM_IMAGE_ID", "/subscriptions/example/images/worker");
+    environment.set("CLOUD_AZURE_VM_SUBNET_ID", "/subscriptions/example/subnets/workers");
+    environment.set("CLOUD_AZURE_VM_SIZE", "Standard_D4s_v5");
+    environment.set("CLOUD_AZURE_VM_LOCATION", "westeurope");
 
     const cloud::config azure_config = cloud::detail::config_from_environment("azure");
     tst::check(azure_config.provider && *azure_config.provider == "azure" &&
                    azure_config.azure.batch_endpoint == "https://test.westeurope.batch.azure.com" &&
+                   azure_config.azure.storage_account == "teststorage" &&
+                   azure_config.azure.storage_sas == "sv=test&sig=secret" &&
+                   azure_config.instance_templates.at("worker").azure.machine_type ==
+                       "Standard_D4s_v5" &&
                    azure_config.azure.auth &&
                    cloud::detail::configured_region(azure_config, "azure") == "westeurope",
                "Azure environment mapping");
