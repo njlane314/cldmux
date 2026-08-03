@@ -2,5 +2,6 @@
 
 int main() {
     const auto function = &cloud::detail::aws_storage_stat;
-    return function ? 0 : 1;
+    (void)function;
+    return 0;
 }
