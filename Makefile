@@ -30,11 +30,12 @@ ODR := /tmp/cldmux-odr
 
 .PHONY: check check-readme check-headers check-tool check-amalgamation \
     check-library check-odr check-cli check-empirical check-dispatch \
+    check-example-make \
     check-dispatch-header check-stale-names check-standards check-c++17 \
     check-c++20 check-c++23 amalgamate example empirical dispatch sanitise
 
 check: check-readme check-headers check-tool check-library check-odr check-cli \
-    check-empirical check-dispatch check-stale-names
+    check-empirical check-dispatch check-example-make check-stale-names
 	@! grep -n "$$(printf '\t')" cldmux \
 		$$(find apps include tests tools -type f) example.cpp test.cpp README.md
 
@@ -50,7 +51,7 @@ check-stale-names:
 		grep -Rni 'bu[r]st' apps include tests tools .github || status=$$?; \
 		test "$$status" -eq 1; \
 		status=0; \
-		grep -ni 'bu[r]st' Makefile README.md cldmux example.cpp test.cpp || \
+		grep -ni 'bu[r]st' Makefile example.mk README.md cldmux example.cpp test.cpp || \
 			status=$$?; \
 		test "$$status" -eq 1; \
 		status=0; \
@@ -65,6 +66,9 @@ check-readme:
 	awk '/^```cpp$$/ {code=1; next} code && /^```/ {exit} code {print}' README.md | \
 		$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
 		-I. -x c++ -fsyntax-only -
+
+check-example-make:
+	$(MAKE) -f example.mk check
 
 check-headers:
 	@set -e; for header in $(INTERNAL_HEADERS); do \

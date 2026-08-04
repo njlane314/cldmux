@@ -48,11 +48,29 @@ Build with:
 c++ -std=c++17 -I. example.cpp -lcurl -pthread -o cldmux-run
 ```
 
-The repository has one heavily commented [`example.cpp`](example.cpp). It is a
-provider-neutral command and an author checklist covering routing, pricing,
+The repository has two heavily commented examples. [`example.cpp`](example.cpp)
+is a provider-neutral command and an author checklist covering routing, pricing,
 resources, mounts, storage, raw compute, diagnostics, output, and lifecycle
 choices. It diagnoses and compares by default; only `--submit` permits billable
-work.
+work. [`example.mk`](example.mk) constructs a file-based DAG whose processing
+nodes can run in the same worker image through local Docker or GCP Batch:
+
+```sh
+make -f example.mk help
+make -f example.mk dag
+make -f example.mk -j2 cloud-plan       # offline provider-shape planning
+make -f example.mk -j2 local IMAGE=REGISTRY/WORKER@sha256:DIGEST
+# After exporting the GCP and dispatch variables shown by `help`:
+make -f example.mk -j2 cloud APPROVE_CLOUD=YES PIPELINE_ID=RUN-VERSION \
+    IMAGE=REGISTRY/WORKER@sha256:DIGEST
+```
+
+The Make example deliberately names the one workload component the repository
+does not provide: a digest-pinned image containing `/app/pipeline-worker`. Its
+comments define that worker contract, local and cloud commands, approval gates,
+immutable run IDs, receipts, recovery boundaries, and parallel fan-out/fan-in.
+Host-side bundle construction uses `tar` and `zstd`; local worker execution also
+requires Docker or a compatible container command.
 
 ## ROUTING
 
@@ -276,6 +294,11 @@ elapsed time, result, and recovery state. An interruption leaves `.pending` and
 .pending.EXECUTION_ID`; do not resubmit blindly. Dispatch is not a scheduler,
 credential store, provisioner, archiver, or workflow engine.
 
+[`example.mk`](example.mk) shows how Make can supply the missing workflow layer:
+Make owns the DAG and concurrency, a worker image owns one transformation, and
+dispatch owns each complete cloud artifact transaction. The host controller
+downloads every cloud node before releasing its dependants.
+
 ## EMPIRICAL ROUTING
 
 [`apps/empirical.cpp`](apps/empirical.cpp) is a higher-level application which
@@ -403,6 +426,8 @@ apps/dispatch.cpp            sole cldmux-backed dispatch adapter
 apps/dispatch_main.cpp       quote-and-approve UNIX command
 apps/empirical.cpp           observed-runtime routing application
 cldmux                       generated public header
+example.cpp                  commented library/command example
+example.mk                   commented local/GCP Make DAG example
 include/cldmux/               private generator fragments
 include/cldmux/detail/        private transport, pricing, and submission fragments
 include/cldmux/detail/providers/
@@ -435,7 +460,9 @@ make sanitise
 `make check` compiles every private fragment, tests the generator, verifies the
 generated public header, probes multi-translation-unit use, and builds the
 example, dispatch, and empirical applications. Tests use loopback fakes and
-offline quotes; they need no cloud credentials and cannot incur charges.
+offline quotes; they need no cloud credentials and cannot incur charges. The
+Make example is expanded for both backends without starting Docker or approving
+a cloud submission.
 
 ## LICENCE
 
