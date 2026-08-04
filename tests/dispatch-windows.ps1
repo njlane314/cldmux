@@ -15,6 +15,9 @@ $temporary = Join-Path ([IO.Path]::GetTempPath()) (
 function Invoke-DryRun {
     param([Parameter(Mandatory = $true)][string]$Output)
 
+    # Windows PowerShell 5.1 represents redirected native stderr as
+    # non-terminating error records; explicit exit-code checks own this path.
+    $ErrorActionPreference = 'Continue'
     $arguments = @(
         '--id=windows-0042'
         '--policy=gcp'
@@ -29,7 +32,8 @@ function Invoke-DryRun {
         'echo hello'
     )
     $lines = @(& $binaryPath @arguments 2>&1 | ForEach-Object { "$_" })
-    [PSCustomObject]@{ ExitCode = $LASTEXITCODE; Text = $lines -join "`n" }
+    $exitCode = $LASTEXITCODE
+    [PSCustomObject]@{ ExitCode = $exitCode; Text = $lines -join "`n" }
 }
 
 try {
