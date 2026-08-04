@@ -268,7 +268,8 @@ dispatch-linux: check-amalgamated-bytes apps/dispatch.cpp apps/dispatch.hpp cldm
 		$(LINUX_CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. apps/dispatch.cpp \
 		$(LINUX_CURL_LIBS) $(LINUX_THREAD_FLAGS) -o "$(LINUX_DISPATCH)"
 	@strip_tool="$(LINUX_STRIP)"; \
-		test -n "$$strip_tool" || strip_tool="$$( $(LINUX_CXX) -print-prog-name=strip)"; \
+		test -n "$$strip_tool" || \
+			strip_tool="$$( $(LINUX_CXX) $(LINUX_TARGET_FLAGS) -print-prog-name=strip)"; \
 		"$$strip_tool" $(LINUX_STRIP_FLAGS) "$(LINUX_DISPATCH)"
 	@chmod 700 "$(LINUX_DISPATCH)"
 
@@ -295,7 +296,8 @@ dispatch-windows: check-amalgamated-bytes apps/dispatch.cpp apps/dispatch.hpp cl
 		$(WINDOWS_CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. apps/dispatch.cpp \
 		$(WINDOWS_CURL_LIBS) $(WINDOWS_THREAD_FLAGS) -o "$(WINDOWS_DISPATCH)"
 	@strip_tool="$(WINDOWS_STRIP)"; \
-		test -n "$$strip_tool" || strip_tool="$$( $(WINDOWS_CXX) -print-prog-name=strip)"; \
+		test -n "$$strip_tool" || \
+			strip_tool="$$( $(WINDOWS_CXX) $(WINDOWS_TARGET_FLAGS) -print-prog-name=strip)"; \
 		"$$strip_tool" $(WINDOWS_STRIP_FLAGS) "$(WINDOWS_DISPATCH)"
 	@chmod 700 "$(WINDOWS_DISPATCH)"
 
@@ -304,33 +306,32 @@ check-release-macos: check-amalgamated-bytes | prepare-build
 		printf '%s\n' 'error: check-release-macos requires macOS' >&2; exit 2; \
 	}
 	@build_dir="$${BUILD_DIR:-build}"; \
-		case "$$build_dir" in /*) output="$$build_dir/release-check/macos" ;; \
-			*) output="$$PWD/$$build_dir/release-check/macos" ;; \
-		esac; \
-		bash scripts/release-macos.sh check 0.0.0 "$$output"
+		BUILD_DIR="$$build_dir" bash scripts/release-macos.sh check 0.0.0 \
+		"$$build_dir/release-check/macos"
 
 release-macos: check-amalgamated-bytes | prepare-build
 	@test "$(HOST_PLATFORM)" = macos || { \
 		printf '%s\n' 'error: release-macos requires macOS' >&2; exit 2; \
 	}
 	@: "$${RELEASE_VERSION:?set RELEASE_VERSION in the environment}"; \
-		release_dir="$${RELEASE_DIR:-build/release}"; \
-		case "$$release_dir" in /*) output="$$release_dir/macos/$$RELEASE_VERSION" ;; \
-			*) output="$$PWD/$$release_dir/macos/$$RELEASE_VERSION" ;; \
-		esac; \
-		bash scripts/release-macos.sh release "$$RELEASE_VERSION" "$$output"
+		build_dir="$${BUILD_DIR:-build}"; \
+		release_dir="$${RELEASE_DIR:-$$build_dir/release}"; \
+		BUILD_DIR="$$build_dir" bash scripts/release-macos.sh release \
+		"$$RELEASE_VERSION" "$$release_dir/macos/$$RELEASE_VERSION"
 
 check-dispatch-header:
 	@! grep -nE '^[[:space:]]*#include[[:space:]].*cldmux|cldmux::' apps/dispatch.hpp
 	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. \
 		-fsyntax-only tests/compile/dispatch.cpp
+	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
+		-DDISPATCH_NO_MAIN -I. -fsyntax-only apps/dispatch.cpp
 
 check-dispatch: check-dispatch-header dispatch | prepare-build
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DDISPATCH_TESTING \
 		-I. apps/dispatch.cpp tests/dispatch.cpp $(CURL_LIBS) -pthread \
 		-o $(DISPATCH_TEST)
 	$(DISPATCH_TEST)
-	sh tests/dispatch.sh $(DISPATCH)
+	@if test "$(HOST_PLATFORM)" != windows; then sh tests/dispatch.sh $(DISPATCH); fi
 
 check-cli: example
 	@output="$$(env -i PATH="$(PATH)" CLDMUX_GCP_PROJECT=test-project \

@@ -4,21 +4,30 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Dotted package version, for example 1.2.0
+        description: Dotted package version matching CLDMUX_VERSION
         required: true
         type: string
 
 permissions:
   contents: read
 
+concurrency:
+  group: macos-release-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
   authorize:
     name: Validate release request
     runs-on: ubuntu-24.04
     timeout-minutes: 2
-    permissions: {}
     steps:
-      - name: Require main and a package version
+      - name: Check out requested source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+
+      - name: Require main and the source package version
         env:
           REQUESTED_REF: ${{ github.ref }}
           REQUESTED_VERSION: ${{ inputs.version }}
@@ -30,6 +39,13 @@ jobs:
           }
           [[ "$REQUESTED_VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}([.-][0-9A-Za-z]+)*$ ]] || {
             printf 'error: invalid release version: %s\n' "$REQUESTED_VERSION" >&2
+            exit 2
+          }
+          source_version="$(sed -n 's/^#define CLDMUX_VERSION "\([^"]*\)"$/\1/p' \
+            include/cldmux/detail/config.hpp)"
+          [[ -n "$source_version" && "$REQUESTED_VERSION" == "$source_version" ]] || {
+            printf 'error: requested version %s does not match source version %s\n' \
+              "$REQUESTED_VERSION" "${source_version:-unavailable}" >&2
             exit 2
           }
 
@@ -44,6 +60,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
+          persist-credentials: false
 
       - name: Install ephemeral Apple credentials
         env:
@@ -62,6 +79,17 @@ jobs:
           notary_key="$RUNNER_TEMP/notary-key.p8"
           keychain_password="$(openssl rand -hex 32)"
           echo "::add-mask::$keychain_password"
+
+          [[ -n "$APPLICATION_IDENTITY" && "$APPLICATION_IDENTITY" != *$'\n'* && \
+            "$APPLICATION_IDENTITY" != *$'\r'* ]] || {
+            printf 'error: invalid application identity\n' >&2
+            exit 2
+          }
+          [[ -n "$INSTALLER_IDENTITY" && "$INSTALLER_IDENTITY" != *$'\n'* && \
+            "$INSTALLER_IDENTITY" != *$'\r'* ]] || {
+            printf 'error: invalid installer identity\n' >&2
+            exit 2
+          }
 
           printf '%s' "$DEVELOPER_ID_P12" | /usr/bin/base64 -D >"$certificate"
           printf '%s' "$NOTARY_KEY_P8" | /usr/bin/base64 -D >"$notary_key"
@@ -88,6 +116,7 @@ jobs:
       - name: Build, sign, notarize, and staple
         env:
           RELEASE_VERSION: ${{ inputs.version }}
+          SOURCE_COMMIT: ${{ github.sha }}
         run: |
           make release-macos
 
@@ -113,6 +142,8 @@ jobs:
             build/release/macos/${{ inputs.version }}/*.pkg.sha256
             build/release/macos/${{ inputs.version }}/*.tar.gz
             build/release/macos/${{ inputs.version }}/*.tar.gz.sha256
+            build/release/macos/${{ inputs.version }}/LICENSE
+            build/release/macos/${{ inputs.version }}/SOURCE_COMMIT
             build/release/macos/${{ inputs.version }}/notarization*.json
           if-no-files-found: error
           retention-days: 14

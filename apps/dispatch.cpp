@@ -14,7 +14,7 @@
 
 #include <algorithm>
 #include <array>
-#if !defined(DISPATCH_TESTING)
+#if !defined(DISPATCH_TESTING) && !defined(DISPATCH_NO_MAIN)
 #include <charconv>
 #endif
 #include <chrono>
@@ -23,7 +23,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
-#if !defined(DISPATCH_TESTING)
+#if !defined(DISPATCH_TESTING) && !defined(DISPATCH_NO_MAIN)
 #include <iostream>
 #include <locale>
 #endif
@@ -1013,7 +1013,7 @@ void persist_receipt(receipt value, const std::filesystem::path& path) {
 
 } // namespace dispatch
 
-#if !defined(DISPATCH_TESTING)
+#if !defined(DISPATCH_TESTING) && !defined(DISPATCH_NO_MAIN)
 namespace {
 
 struct options {

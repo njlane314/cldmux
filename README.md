@@ -268,7 +268,9 @@ high. An earlier plan is never a reservation; `run()` prices again.
 
 [`apps/dispatch.hpp`](apps/dispatch.hpp) is a provider-neutral, two-phase adapter.
 `prepare()` validates, quotes, and pins without allocating compute. Passing its
-move-only result to `execute()` is the caller's approval.
+move-only result to `execute()` is the caller's approval. Link
+`apps/dispatch.cpp` with `DISPATCH_NO_MAIN` when embedding that adapter without
+the bundled command-line entry point.
 
 ```sh
 make dispatch
@@ -315,15 +317,18 @@ make dispatch-binaries # all three targets
 A native target uses `CXX`, `curl-config`, and the current platform's libcurl.
 A foreign target requires its target toolchain and libcurl settings through
 `MACOS_*`, `LINUX_*`, or `WINDOWS_*`: set `*_CXX`, optional `*_TARGET_FLAGS`,
-and target-specific `*_CURL_CXXFLAGS` and `*_CURL_LIBS`. Foreign targets leave
-the curl settings empty instead of accidentally linking the host library. Each
-target also checks the compiler triple and predefined OS macro before compiling.
+target-specific `*_CURL_CXXFLAGS` and `*_CURL_LIBS`, and `*_STRIP` when the
+compiler cannot locate a target-aware strip tool. Foreign targets leave the curl
+settings empty instead of accidentally linking the host library. Each target
+also checks the compiler triple and predefined OS macro before compiling.
 `dispatch-binaries` therefore needs all three target toolchains, target libcurl
 installations, and a macOS SDK. Each fixed output path holds one configured
 architecture/ABI at a time and is overwritten when rebuilt for another one.
 Platform binaries use hidden visibility and are stripped after linking. Ordinary
 tests, examples, and sanitizer executables remain diagnosable but live beneath
 the mode-`0700` `build/check` directory rather than a shared temporary directory.
+If an older checkout created `build` with broader permissions, remove it or use
+a new relative `BUILD_DIR`; the Makefile will not silently change its mode.
 The fixed platform targets are development artifacts; `release-macos` is the
 credentialed distribution path.
 
@@ -340,27 +345,33 @@ public identity/profile names to the fail-closed release target:
 ```sh
 xcrun notarytool store-credentials cldmux-notary \
     --key /secure/AuthKey_KEYID.p8 --key-id KEYID --issuer ISSUER_UUID
-RELEASE_VERSION=1.2.0 \
+RELEASE_VERSION=0.5.0 \
 MACOS_SIGN_IDENTITY='Developer ID Application: NAME (TEAMID)' \
 MACOS_INSTALLER_IDENTITY='Developer ID Installer: NAME (TEAMID)' \
 MACOS_NOTARY_PROFILE=cldmux-notary \
     make release-macos
 ```
 
-The target refuses missing or ad-hoc identities. It Developer-ID-signs the final
-universal executable with the hardened runtime and secure timestamp, builds a
-signed flat installer, waits for Apple notarization, staples and validates the
-ticket, runs Gatekeeper assessment, and writes the package, signed binary,
-permission-preserving binary tarball, notarization records, and SHA-256 files under
+The release version must match `CLDMUX_VERSION`, the source tree must be clean,
+and production bytes are built from the recorded commit snapshot. The default
+deployment floor is macOS 13.0 (`MACOS_MIN_VERSION` can raise it). The target
+refuses missing or ad-hoc identities. It Developer-ID-signs the
+final universal executable with the hardened runtime and secure timestamp,
+builds a signed flat installer, waits for Apple notarization, staples and
+validates the ticket, runs Gatekeeper assessment, and writes the package, signed
+binary, permission-preserving binary tarball, MIT licence, source commit,
+notarization records, and SHA-256 files under
 `build/release/macos/RELEASE_VERSION/`. Do not pass Apple passwords or private
 keys as Make variables.
 
 Before enabling the manual `macOS Release` workflow, create a `release`
 environment in GitHub, restrict it explicitly to `main`, add a required reviewer,
 and store every `APPLE_*` value as an environment secret. The repository does not
-currently create or protect that environment for you. The workflow validates the
-branch and version before entering it, uses an ephemeral Keychain, then deletes
-the imported keys before upload. The environment requires a base64-encoded
+currently create or protect that environment for you. Before approval, the
+reviewer should verify that CI and CodeQL passed for the workflow's exact commit.
+The workflow validates the branch and source version before entering the
+environment, uses an ephemeral Keychain, then deletes the imported keys before
+upload. The environment requires a base64-encoded
 combined Developer ID PKCS#12 and App Store Connect team key, their passwords and
 IDs, plus the two certificate identity names. It uploads the accepted installer,
 notarization records, and a tarball that preserves the signed binary's executable
@@ -518,7 +529,9 @@ Make example is expanded for both backends without starting Docker or approving
 a cloud submission. The separate least-privilege CodeQL workflow manually builds
 the C++17 surface with the extended security query suite; macOS CI also verifies
 the universal merge/strip/final-sign order, and Linux CI verifies a stripped
-distribution binary.
+distribution binary. Native MinGW UCRT64 CI compiles and runs the dispatch core,
+exercises Windows-native path/no-clobber behaviour, and verifies that the PE
+command is stripped without an MSYS runtime dependency.
 
 ## LICENCE
 

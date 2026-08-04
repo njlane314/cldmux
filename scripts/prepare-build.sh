@@ -66,6 +66,9 @@ ensure_private_dir() {
 
 validate_relative BUILD_DIR "$build_dir"
 validate_relative CHECK_DIR "$check_dir"
+case "/$build_dir/" in
+*/.[gG][iI][tT]/*) fail "BUILD_DIR must not be inside .git" ;;
+esac
 [[ $check_dir == "$build_dir/"* ]] || fail "CHECK_DIR must be inside BUILD_DIR"
 
 umask 077
