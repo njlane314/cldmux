@@ -116,5 +116,6 @@ jobs:
           objdump -p "$binary" >build/check/windows-imports.txt
           ! grep -qi 'DLL Name: msys-2[.]0[.]dll' build/check/windows-imports.txt
           "$binary" --help >/dev/null
-          pwsh.exe -NoProfile -File "$(cygpath -w tests/dispatch-windows.ps1)" \
+          powershell.exe -NoProfile -ExecutionPolicy Bypass \
+            -File "$(cygpath -w tests/dispatch-windows.ps1)" \
             -Binary "$(cygpath -w "$binary")"
