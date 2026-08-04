@@ -1,0 +1,5 @@
+- description: C++ security-extended queries with source suppressions
+- import: codeql-suites/cpp-security-extended.qls
+  from: codeql/cpp-queries
+- query: AlertSuppression.ql
+  from: codeql/cpp-queries

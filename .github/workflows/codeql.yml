@@ -32,7 +32,7 @@ jobs:
         with:
           languages: c-cpp
           build-mode: manual
-          queries: security-extended
+          queries: ./.github/codeql/cpp-security-extended.qls
 
       - name: Build analyzed C++ sources
         run: make check CXX=g++ CXX_STANDARD=c++17
