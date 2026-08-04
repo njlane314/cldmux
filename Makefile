@@ -1,12 +1,86 @@
 CXX ?= c++
 CXX_STANDARD ?= c++17
 CXXFLAGS ?= -Wall -Wextra -Wpedantic -Wconversion -Wsign-conversion -Wshadow -Werror
-CURL_CXXFLAGS := $(shell curl-config --cflags)
-CURL_LIBS := $(shell curl-config --libs)
+CURL_CONFIG ?= curl-config
+CURL_CXXFLAGS ?= $(shell $(CURL_CONFIG) --cflags)
+CURL_LIBS ?= $(shell $(CURL_CONFIG) --libs)
 TST_DIR ?= ../tst
 BUILD_DIR ?= build
+CHECK_DIR ?= $(BUILD_DIR)/check
+BINARY_DIR ?= $(BUILD_DIR)/bin
+RELEASE_DIR ?= $(BUILD_DIR)/release
+BINARY_CXXFLAGS ?= -O2 -DNDEBUG -fvisibility=hidden -fvisibility-inlines-hidden
 
-AMALGAMATOR := $(BUILD_DIR)/amalgamate
+MACOS_STRIP ?= strip
+MACOS_STRIP_FLAGS ?= -S -x
+LINUX_STRIP ?=
+LINUX_STRIP_FLAGS ?= --strip-all
+WINDOWS_STRIP ?=
+WINDOWS_STRIP_FLAGS ?= --strip-all
+
+MACOS_MIN_VERSION ?= 13.0
+MACOS_SIGN_IDENTITY ?=
+MACOS_INSTALLER_IDENTITY ?=
+MACOS_NOTARY_PROFILE ?=
+RELEASE_VERSION ?=
+
+HOST_SYSTEM := $(shell uname -s 2>/dev/null)
+ifeq ($(OS),Windows_NT)
+HOST_PLATFORM := windows
+HOST_EXEEXT := .exe
+else ifeq ($(HOST_SYSTEM),Darwin)
+HOST_PLATFORM := macos
+HOST_EXEEXT :=
+else ifeq ($(HOST_SYSTEM),Linux)
+HOST_PLATFORM := linux
+HOST_EXEEXT :=
+else
+HOST_PLATFORM := unknown
+HOST_EXEEXT :=
+endif
+
+MACOS_TARGET_FLAGS ?=
+MACOS_THREAD_FLAGS ?= -pthread
+LINUX_TARGET_FLAGS ?=
+LINUX_THREAD_FLAGS ?= -pthread
+WINDOWS_TARGET_FLAGS ?=
+WINDOWS_THREAD_FLAGS ?= -pthread
+
+ifeq ($(HOST_PLATFORM),macos)
+MACOS_CXX ?= $(CXX)
+MACOS_CURL_CXXFLAGS ?= $(CURL_CXXFLAGS)
+MACOS_CURL_LIBS ?= $(CURL_LIBS)
+else
+MACOS_CXX ?= clang++
+MACOS_CURL_CXXFLAGS ?=
+MACOS_CURL_LIBS ?=
+endif
+
+ifeq ($(HOST_PLATFORM),linux)
+LINUX_CXX ?= $(CXX)
+LINUX_CURL_CXXFLAGS ?= $(CURL_CXXFLAGS)
+LINUX_CURL_LIBS ?= $(CURL_LIBS)
+else
+LINUX_CXX ?= x86_64-linux-gnu-g++
+LINUX_CURL_CXXFLAGS ?=
+LINUX_CURL_LIBS ?=
+endif
+
+ifeq ($(HOST_PLATFORM),windows)
+WINDOWS_CXX ?= $(CXX)
+WINDOWS_CURL_CXXFLAGS ?= $(CURL_CXXFLAGS)
+WINDOWS_CURL_LIBS ?= $(CURL_LIBS)
+else
+WINDOWS_CXX ?= x86_64-w64-mingw32-g++
+WINDOWS_CURL_CXXFLAGS ?=
+WINDOWS_CURL_LIBS ?=
+endif
+
+MACOS_DISPATCH := $(BINARY_DIR)/macos/cldmux-dispatch
+LINUX_DISPATCH := $(BINARY_DIR)/linux/cldmux-dispatch
+WINDOWS_DISPATCH := $(BINARY_DIR)/windows/cldmux-dispatch.exe
+
+AMALGAMATOR := $(BUILD_DIR)/tools/$(HOST_PLATFORM)/amalgamate$(HOST_EXEEXT)
 AMALGAMATE_ARGS := --root include/cldmux/cldmux.hpp --include-root include --output cldmux
 INTERNAL_HEADERS := $(shell find include/cldmux -type f -name '*.hpp' | sort)
 INTERNAL_HEADER_PROBES := tests/compile/api.cpp tests/compile/client.cpp \
@@ -17,25 +91,26 @@ INTERNAL_HEADER_PROBES := tests/compile/api.cpp tests/compile/client.cpp \
     tests/compile/submission.cpp tests/compile/gcp.cpp tests/compile/aws.cpp \
     tests/compile/azure.cpp
 
-TEST := /tmp/cldmux-test
-TEST_SAN := /tmp/cldmux-test-san
-EXAMPLE := /tmp/cldmux-example
-EMPIRICAL := /tmp/cldmux-empirical
-EMPIRICAL_SAN := /tmp/cldmux-empirical-san
-DISPATCH := /tmp/cldmux-dispatch
-DISPATCH_TEST := /tmp/cldmux-dispatch-test
-DISPATCH_SAN := /tmp/cldmux-dispatch-san
-DISPATCH_TEST_SAN := /tmp/cldmux-dispatch-test-san
-ODR := /tmp/cldmux-odr
+TEST := $(CHECK_DIR)/cldmux-test$(HOST_EXEEXT)
+TEST_SAN := $(CHECK_DIR)/cldmux-test-san$(HOST_EXEEXT)
+EXAMPLE := $(CHECK_DIR)/cldmux-example$(HOST_EXEEXT)
+DISPATCH := $(CHECK_DIR)/cldmux-dispatch$(HOST_EXEEXT)
+DISPATCH_TEST := $(CHECK_DIR)/cldmux-dispatch-test$(HOST_EXEEXT)
+DISPATCH_SAN := $(CHECK_DIR)/cldmux-dispatch-san$(HOST_EXEEXT)
+DISPATCH_TEST_SAN := $(CHECK_DIR)/cldmux-dispatch-test-san$(HOST_EXEEXT)
+ODR_BASE := $(CHECK_DIR)/cldmux-odr
+ODR := $(ODR_BASE)$(HOST_EXEEXT)
 
 .PHONY: check check-readme check-headers check-tool check-amalgamation \
-    check-library check-odr check-cli check-empirical check-dispatch \
-    check-example-make \
+    check-amalgamated-bytes check-library check-odr check-cli check-dispatch \
+    check-example-make check-build-layout check-release-macos prepare-build \
     check-dispatch-header check-stale-names check-standards check-c++17 \
-    check-c++20 check-c++23 amalgamate example empirical dispatch sanitise
+    check-c++20 check-c++23 amalgamate example dispatch dispatch-native \
+    dispatch-macos dispatch-linux dispatch-windows dispatch-binaries \
+    release-macos sanitise
 
 check: check-readme check-headers check-tool check-library check-odr check-cli \
-    check-empirical check-dispatch check-example-make check-stale-names
+    check-dispatch check-example-make check-stale-names check-build-layout
 	@! grep -n "$$(printf '\t')" cldmux \
 		$$(find apps include tests tools -type f) example.cpp test.cpp README.md
 
@@ -58,8 +133,8 @@ check-stale-names:
 		git grep -nE '#include[[:space:]]*[<"]cl[o]ud([/>"])|cl[o]ud::|'\
 'namespace[[:space:]]+cl[o]ud|CLO[U]D_H_VERSION|NJLANE314_CLO[U]D|'\
 '(^|[^A-Z0-9_])CLO[U]D_(REGION|ZONE|GCP_|AWS_|AZURE_|COMPUTE_TEMPLATE)|'\
-'cl[o]ud-(run|empirical|example|dispatch|test|odr|amalgamate)|'\
-'\.cl[o]ud-empirical-history|njlane314/cl[o]ud' -- . || status=$$?; \
+'cl[o]ud-(run|example|dispatch|test|odr|amalgamate)|'\
+'njlane314/cl[o]ud' -- . || status=$$?; \
 		test "$$status" -eq 1
 
 check-readme:
@@ -82,10 +157,15 @@ check-headers:
 			-Iinclude -fsyntax-only "$$source"; \
 	done
 
-$(BUILD_DIR):
-	mkdir -p $(BUILD_DIR)
+prepare-build:
+	@bash scripts/prepare-build.sh "$(HOST_PLATFORM)" "$(BUILD_DIR)" "$(CHECK_DIR)"
 
-$(AMALGAMATOR): tools/amalgamate.cpp | $(BUILD_DIR)
+check-build-layout: | prepare-build
+	@! grep -nE '/(private/)?tmp/cldmux-' Makefile README.md example.mk \
+		scripts/*.sh .github/workflows/*.yml
+
+$(AMALGAMATOR): tools/amalgamate.cpp | prepare-build
+	mkdir -p "$(@D)"
 	$(CXX) $(CXXFLAGS) -std=c++17 -O2 $< -o $@
 
 amalgamate: $(AMALGAMATOR)
@@ -94,47 +174,158 @@ amalgamate: $(AMALGAMATOR)
 check-tool: $(AMALGAMATOR)
 	CXX="$(CXX)" CXXFLAGS="$(CXXFLAGS)" sh tests/amalgamate.sh $(AMALGAMATOR)
 
-check-amalgamation: $(AMALGAMATOR)
+check-amalgamated-bytes: $(AMALGAMATOR)
 	$(AMALGAMATOR) $(AMALGAMATE_ARGS) --check
+
+check-amalgamation: check-amalgamated-bytes
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. \
 		-fsyntax-only tests/compile/public.cpp
 
-check-library: check-amalgamation
+check-library: check-amalgamation | prepare-build
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. \
 		-isystem "$(TST_DIR)" test.cpp $(CURL_LIBS) -pthread -o $(TEST)
 	$(TEST)
 
-check-odr: check-amalgamation
+check-odr: check-amalgamation | prepare-build
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. \
-		-c tests/compile/odr_a.cpp -o $(ODR)-a.o
+		-c tests/compile/odr_a.cpp -o $(ODR_BASE)-a.o
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. \
-		-c tests/compile/odr_b.cpp -o $(ODR)-b.o
+		-c tests/compile/odr_b.cpp -o $(ODR_BASE)-b.o
 	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -c tests/compile/odr_main.cpp \
-		-o $(ODR)-main.o
-	$(CXX) $(ODR)-a.o $(ODR)-b.o $(ODR)-main.o $(CURL_LIBS) -pthread -o $(ODR)
+		-o $(ODR_BASE)-main.o
+	$(CXX) $(ODR_BASE)-a.o $(ODR_BASE)-b.o $(ODR_BASE)-main.o \
+		$(CURL_LIBS) -pthread -o $(ODR)
 	$(ODR)
 
-example: check-amalgamation
+example: check-amalgamation | prepare-build
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. \
 		example.cpp $(CURL_LIBS) -pthread -o $(EXAMPLE)
 
-empirical: check-amalgamation
+dispatch: check-amalgamation | prepare-build
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. \
-		apps/empirical.cpp $(CURL_LIBS) -pthread -o $(EMPIRICAL)
+		apps/dispatch.cpp $(CURL_LIBS) -pthread -o $(DISPATCH)
 
-check-empirical: empirical
-	sh tests/empirical.sh $(EMPIRICAL)
+ifneq ($(filter macos linux windows,$(HOST_PLATFORM)),)
+dispatch-native: dispatch-$(HOST_PLATFORM)
+else
+dispatch-native:
+	@printf '%s\n' 'error: unsupported native platform: $(HOST_SYSTEM)' >&2
+	@exit 2
+endif
 
-dispatch: check-amalgamation
-	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. \
-		apps/dispatch.cpp apps/dispatch_main.cpp $(CURL_LIBS) -pthread -o $(DISPATCH)
+dispatch-binaries: dispatch-macos dispatch-linux dispatch-windows
+
+dispatch-macos: check-amalgamated-bytes apps/dispatch.cpp apps/dispatch.hpp cldmux | prepare-build
+	@command -v "$(firstword $(MACOS_CXX))" >/dev/null 2>&1 || { \
+		printf '%s\n' 'error: macOS compiler not found: $(firstword $(MACOS_CXX))' >&2; \
+		exit 2; \
+	}
+	@target="$$( $(MACOS_CXX) $(MACOS_TARGET_FLAGS) -dumpmachine 2>/dev/null)" || { \
+		printf '%s\n' 'error: cannot query the macOS compiler target' >&2; exit 2; \
+	}; \
+	case "$$target" in \
+		*-apple-darwin*) ;; \
+		*) printf '%s\n' "error: macOS compiler targets $$target" >&2; exit 2 ;; \
+	esac
+	@printf '%s\n' '#if !defined(__APPLE__) || !defined(__MACH__)' \
+		'#error compiler does not target macOS' '#endif' | \
+		$(MACOS_CXX) $(MACOS_TARGET_FLAGS) -x c++ -fsyntax-only -
+	@test -n "$(strip $(MACOS_CURL_LIBS))" || { \
+		printf '%s\n' 'error: set MACOS_CURL_CXXFLAGS and MACOS_CURL_LIBS for the target sysroot' >&2; \
+		exit 2; \
+	}
+	@umask 077; mkdir -p "$(dir $(MACOS_DISPATCH))"
+	$(MACOS_CXX) $(CXXFLAGS) $(BINARY_CXXFLAGS) $(MACOS_TARGET_FLAGS) \
+		$(MACOS_CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. apps/dispatch.cpp \
+		$(MACOS_CURL_LIBS) $(MACOS_THREAD_FLAGS) -o "$(MACOS_DISPATCH)"
+	$(MACOS_STRIP) $(MACOS_STRIP_FLAGS) "$(MACOS_DISPATCH)"
+	@chmod 700 "$(MACOS_DISPATCH)"
+	@if test "$(HOST_PLATFORM)" = macos; then \
+		codesign --force --sign - --options runtime "$(MACOS_DISPATCH)"; \
+		codesign --verify --strict --all-architectures "$(MACOS_DISPATCH)"; \
+	fi
+
+dispatch-linux: check-amalgamated-bytes apps/dispatch.cpp apps/dispatch.hpp cldmux | prepare-build
+	@command -v "$(firstword $(LINUX_CXX))" >/dev/null 2>&1 || { \
+		printf '%s\n' 'error: Linux compiler not found: $(firstword $(LINUX_CXX))' >&2; \
+		exit 2; \
+	}
+	@target="$$( $(LINUX_CXX) $(LINUX_TARGET_FLAGS) -dumpmachine 2>/dev/null)" || { \
+		printf '%s\n' 'error: cannot query the Linux compiler target' >&2; exit 2; \
+	}; \
+	case "$$target" in \
+		*linux*) ;; \
+		*) printf '%s\n' "error: Linux compiler targets $$target" >&2; exit 2 ;; \
+	esac
+	@printf '%s\n' '#if !defined(__linux__)' '#error compiler does not target Linux' '#endif' | \
+		$(LINUX_CXX) $(LINUX_TARGET_FLAGS) -x c++ -fsyntax-only -
+	@test -n "$(strip $(LINUX_CURL_LIBS))" || { \
+		printf '%s\n' 'error: set LINUX_CURL_CXXFLAGS and LINUX_CURL_LIBS for the target sysroot' >&2; \
+		exit 2; \
+	}
+	@umask 077; mkdir -p "$(dir $(LINUX_DISPATCH))"
+	$(LINUX_CXX) $(CXXFLAGS) $(BINARY_CXXFLAGS) $(LINUX_TARGET_FLAGS) \
+		$(LINUX_CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. apps/dispatch.cpp \
+		$(LINUX_CURL_LIBS) $(LINUX_THREAD_FLAGS) -o "$(LINUX_DISPATCH)"
+	@strip_tool="$(LINUX_STRIP)"; \
+		test -n "$$strip_tool" || strip_tool="$$( $(LINUX_CXX) -print-prog-name=strip)"; \
+		"$$strip_tool" $(LINUX_STRIP_FLAGS) "$(LINUX_DISPATCH)"
+	@chmod 700 "$(LINUX_DISPATCH)"
+
+dispatch-windows: check-amalgamated-bytes apps/dispatch.cpp apps/dispatch.hpp cldmux | prepare-build
+	@command -v "$(firstword $(WINDOWS_CXX))" >/dev/null 2>&1 || { \
+		printf '%s\n' 'error: Windows compiler not found: $(firstword $(WINDOWS_CXX))' >&2; \
+		exit 2; \
+	}
+	@target="$$( $(WINDOWS_CXX) $(WINDOWS_TARGET_FLAGS) -dumpmachine 2>/dev/null)" || { \
+		printf '%s\n' 'error: cannot query the Windows compiler target' >&2; exit 2; \
+	}; \
+	case "$$target" in \
+		*mingw*|*-windows-gnu*) ;; \
+		*) printf '%s\n' "error: Windows compiler targets $$target" >&2; exit 2 ;; \
+	esac
+	@printf '%s\n' '#if !defined(_WIN32)' '#error compiler does not target Windows' '#endif' | \
+		$(WINDOWS_CXX) $(WINDOWS_TARGET_FLAGS) -x c++ -fsyntax-only -
+	@test -n "$(strip $(WINDOWS_CURL_LIBS))" || { \
+		printf '%s\n' 'error: set WINDOWS_CURL_CXXFLAGS and WINDOWS_CURL_LIBS for the target sysroot' >&2; \
+		exit 2; \
+	}
+	@umask 077; mkdir -p "$(dir $(WINDOWS_DISPATCH))"
+	$(WINDOWS_CXX) $(CXXFLAGS) $(BINARY_CXXFLAGS) $(WINDOWS_TARGET_FLAGS) \
+		$(WINDOWS_CURL_CXXFLAGS) -std=$(CXX_STANDARD) -I. apps/dispatch.cpp \
+		$(WINDOWS_CURL_LIBS) $(WINDOWS_THREAD_FLAGS) -o "$(WINDOWS_DISPATCH)"
+	@strip_tool="$(WINDOWS_STRIP)"; \
+		test -n "$$strip_tool" || strip_tool="$$( $(WINDOWS_CXX) -print-prog-name=strip)"; \
+		"$$strip_tool" $(WINDOWS_STRIP_FLAGS) "$(WINDOWS_DISPATCH)"
+	@chmod 700 "$(WINDOWS_DISPATCH)"
+
+check-release-macos: check-amalgamated-bytes | prepare-build
+	@test "$(HOST_PLATFORM)" = macos || { \
+		printf '%s\n' 'error: check-release-macos requires macOS' >&2; exit 2; \
+	}
+	@build_dir="$${BUILD_DIR:-build}"; \
+		case "$$build_dir" in /*) output="$$build_dir/release-check/macos" ;; \
+			*) output="$$PWD/$$build_dir/release-check/macos" ;; \
+		esac; \
+		bash scripts/release-macos.sh check 0.0.0 "$$output"
+
+release-macos: check-amalgamated-bytes | prepare-build
+	@test "$(HOST_PLATFORM)" = macos || { \
+		printf '%s\n' 'error: release-macos requires macOS' >&2; exit 2; \
+	}
+	@: "$${RELEASE_VERSION:?set RELEASE_VERSION in the environment}"; \
+		release_dir="$${RELEASE_DIR:-build/release}"; \
+		case "$$release_dir" in /*) output="$$release_dir/macos/$$RELEASE_VERSION" ;; \
+			*) output="$$PWD/$$release_dir/macos/$$RELEASE_VERSION" ;; \
+		esac; \
+		bash scripts/release-macos.sh release "$$RELEASE_VERSION" "$$output"
 
 check-dispatch-header:
 	@! grep -nE '^[[:space:]]*#include[[:space:]].*cldmux|cldmux::' apps/dispatch.hpp
 	$(CXX) $(CXXFLAGS) -std=$(CXX_STANDARD) -I. \
 		-fsyntax-only tests/compile/dispatch.cpp
 
-check-dispatch: check-dispatch-header dispatch
+check-dispatch: check-dispatch-header dispatch | prepare-build
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DDISPATCH_TESTING \
 		-I. apps/dispatch.cpp tests/dispatch.cpp $(CURL_LIBS) -pthread \
 		-o $(DISPATCH_TEST)
@@ -222,19 +413,14 @@ check-c++20:
 check-c++23:
 	$(MAKE) check CXX_STANDARD=c++23
 
-sanitise: check-amalgamation
+sanitise: check-amalgamation | prepare-build
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
 		-fsanitize=address,undefined -fno-omit-frame-pointer -I. \
 		-isystem "$(TST_DIR)" test.cpp $(CURL_LIBS) -pthread -o $(TEST_SAN)
 	$(TEST_SAN)
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
 		-fsanitize=address,undefined -fno-omit-frame-pointer -I. \
-		apps/empirical.cpp $(CURL_LIBS) -pthread -o $(EMPIRICAL_SAN)
-	sh tests/empirical.sh $(EMPIRICAL_SAN)
-	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) \
-		-fsanitize=address,undefined -fno-omit-frame-pointer -I. \
-		apps/dispatch.cpp apps/dispatch_main.cpp $(CURL_LIBS) -pthread \
-		-o $(DISPATCH_SAN)
+		apps/dispatch.cpp $(CURL_LIBS) -pthread -o $(DISPATCH_SAN)
 	sh tests/dispatch.sh $(DISPATCH_SAN)
 	$(CXX) $(CXXFLAGS) $(CURL_CXXFLAGS) -std=$(CXX_STANDARD) -DDISPATCH_TESTING \
 		-fsanitize=address,undefined -fno-omit-frame-pointer -I. \

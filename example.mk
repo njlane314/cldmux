@@ -92,7 +92,7 @@ MEMORY_GB ?= 4
 # Cloud work is deliberately GCP-only here so the example has one exact worker
 # entrypoint contract. cldmux itself remains provider-neutral. The dispatcher is
 # built by the repository Makefile when it is missing.
-DISPATCH ?= /tmp/cldmux-dispatch
+DISPATCH ?= build/check/cldmux-dispatch
 APPROVE_CLOUD ?= NO
 ALLOW_UNPRICED ?= NO
 MAX_HOURLY_USD ?=
@@ -357,7 +357,7 @@ verify-report: $(REPORT)
 
 # Building this target uses the repository's ordinary build rules. Applications
 # may instead install cldmux-dispatch elsewhere and override DISPATCH.
-$(DISPATCH): apps/dispatch.cpp apps/dispatch.hpp apps/dispatch_main.cpp cldmux Makefile
+$(DISPATCH): apps/dispatch.cpp apps/dispatch.hpp cldmux Makefile
 	+$(MAKE) -f Makefile dispatch DISPATCH="$@"
 
 # EXECUTION ADAPTER

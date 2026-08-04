@@ -1,0 +1,118 @@
+name: macOS Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Dotted package version, for example 1.2.0
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  authorize:
+    name: Validate release request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    permissions: {}
+    steps:
+      - name: Require main and a package version
+        env:
+          REQUESTED_REF: ${{ github.ref }}
+          REQUESTED_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          [[ "$REQUESTED_REF" == refs/heads/main ]] || {
+            printf 'error: releases must run from main, not %s\n' "$REQUESTED_REF" >&2
+            exit 2
+          }
+          [[ "$REQUESTED_VERSION" =~ ^[0-9]+(\.[0-9]+){1,3}([.-][0-9A-Za-z]+)*$ ]] || {
+            printf 'error: invalid release version: %s\n' "$REQUESTED_VERSION" >&2
+            exit 2
+          }
+
+  macos:
+    name: Sign and notarize universal package
+    needs: authorize
+    runs-on: macos-15
+    timeout-minutes: 45
+    environment: release
+    steps:
+      - name: Check out source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Install ephemeral Apple credentials
+        env:
+          DEVELOPER_ID_P12: ${{ secrets.APPLE_DEVELOPER_ID_P12 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_P12_PASSWORD }}
+          NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLICATION_IDENTITY: ${{ secrets.APPLE_APPLICATION_IDENTITY }}
+          INSTALLER_IDENTITY: ${{ secrets.APPLE_INSTALLER_IDENTITY }}
+        run: |
+          set -euo pipefail
+          umask 077
+          keychain="$RUNNER_TEMP/cldmux-signing.keychain-db"
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          notary_key="$RUNNER_TEMP/notary-key.p8"
+          keychain_password="$(openssl rand -hex 32)"
+          echo "::add-mask::$keychain_password"
+
+          printf '%s' "$DEVELOPER_ID_P12" | /usr/bin/base64 -D >"$certificate"
+          printf '%s' "$NOTARY_KEY_P8" | /usr/bin/base64 -D >"$notary_key"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$certificate" -k "$keychain" -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -x -f pkcs12 -T /usr/bin/codesign -T /usr/bin/pkgbuild
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s \
+            -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain"
+          security default-keychain -d user -s "$keychain"
+
+          xcrun notarytool store-credentials cldmux-ci \
+            --key "$notary_key" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER_ID" \
+            --keychain "$keychain"
+          {
+            printf 'MACOS_SIGN_IDENTITY=%s\n' "$APPLICATION_IDENTITY"
+            printf 'MACOS_INSTALLER_IDENTITY=%s\n' "$INSTALLER_IDENTITY"
+            printf 'MACOS_NOTARY_PROFILE=cldmux-ci\n'
+            printf 'MACOS_NOTARY_KEYCHAIN=%s\n' "$keychain"
+          } >>"$GITHUB_ENV"
+
+      - name: Build, sign, notarize, and staple
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+        run: |
+          make release-macos
+
+      - name: Remove Apple credentials
+        if: always()
+        run: |
+          set -euo pipefail
+          keychain="$RUNNER_TEMP/cldmux-signing.keychain-db"
+          certificate="$RUNNER_TEMP/developer-id.p12"
+          notary_key="$RUNNER_TEMP/notary-key.p8"
+          rm -f -- "$certificate" "$notary_key"
+          if [[ -e "$keychain" ]]; then
+            security delete-keychain "$keychain"
+          fi
+          [[ ! -e "$keychain" && ! -e "$certificate" && ! -e "$notary_key" ]]
+
+      - name: Upload notarized release
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: cldmux-dispatch-macos-${{ inputs.version }}
+          path: |
+            build/release/macos/${{ inputs.version }}/*.pkg
+            build/release/macos/${{ inputs.version }}/*.pkg.sha256
+            build/release/macos/${{ inputs.version }}/*.tar.gz
+            build/release/macos/${{ inputs.version }}/*.tar.gz.sha256
+            build/release/macos/${{ inputs.version }}/notarization*.json
+          if-no-files-found: error
+          retention-days: 14

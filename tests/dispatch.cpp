@@ -15,6 +15,8 @@ namespace dispatch {
 namespace testing {
 
 std::string sha256_file(const std::filesystem::path& path);
+void replace_file(const std::filesystem::path& temporary,
+                  const std::filesystem::path& destination);
 void persist_receipt(receipt value, const std::filesystem::path& path);
 
 } // namespace testing
@@ -91,6 +93,18 @@ void hash_tests(const std::filesystem::path& directory) {
     check(dispatch::testing::sha256_file(artefact) ==
               "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0",
           "SHA-256 million-a vector");
+}
+
+void replacement_test(const std::filesystem::path& directory) {
+    const auto destination = directory / "destination";
+    const auto replacement = directory / "replacement";
+    write_file(destination, "old");
+    write_file(replacement, "new");
+
+    dispatch::testing::replace_file(replacement, destination);
+
+    check(read_file(destination) == "new", "replacement publishes the new contents");
+    check(!std::filesystem::exists(replacement), "replacement consumes the temporary file");
 }
 
 bool valid_key(std::string_view key) {
@@ -198,6 +212,7 @@ int main() {
     try {
         const temporary_directory temporary;
         hash_tests(temporary.path());
+        replacement_test(temporary.path());
         receipt_tests(temporary.path());
         std::cout << "PASS  dispatch hashes and receipts\n";
         return 0;

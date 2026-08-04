@@ -274,7 +274,7 @@ move-only result to `execute()` is the caller's approval.
 make dispatch
 export DISPATCH_INPUT_ROOT=cloud://dispatch-input
 export DISPATCH_OUTPUT_ROOT=cloud://dispatch-output
-/tmp/cldmux-dispatch --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
+build/check/cldmux-dispatch --id=simulation-0042 --image=IMAGE@sha256:DIGEST \
     --input=case.tar.zst --output=result.tar.zst -- /app/solve
 # Review the KEY=value quote, then repeat with --submit to approve it.
 ```
@@ -299,36 +299,91 @@ Make owns the DAG and concurrency, a worker image owns one transformation, and
 dispatch owns each complete cloud artifact transaction. The host controller
 downloads every cloud node before releasing its dependants.
 
-## EMPIRICAL ROUTING
+## DISPATCH BINARIES
 
-[`apps/empirical.cpp`](apps/empirical.cpp) is a higher-level application which
-learns elapsed time for an author-versioned workload key and scores each named
-candidate with:
-
-```text
-cost proxy = routing quote snapshot × routing runtime / 3600 + known data cost
-```
+The library remains the single `cldmux` header. These targets build the dispatch
+command into fixed platform-specific paths:
 
 ```sh
-c++ -std=c++17 -I. apps/empirical.cpp -lcurl -pthread -o cldmux-empirical
-cldmux-empirical render-v2 --candidates=gcp,aws,azure \
-    --data-cost=gcp:0.01 --data-cost=aws:0.02 --data-cost=azure:0
-cldmux-empirical render-v2 --provider=aws --data-cost=aws:0.02 --submit
+make dispatch-native   # current host only
+make dispatch-macos    # build/bin/macos/cldmux-dispatch
+make dispatch-linux    # build/bin/linux/cldmux-dispatch
+make dispatch-windows  # build/bin/windows/cldmux-dispatch.exe
+make dispatch-binaries # all three targets
 ```
 
-The mean is used only when every candidate reaches the sample threshold;
-otherwise all use `--expected-elapsed`. `--provider` overrides selection and can
-seed observations. Every candidate needs `--data-cost`, including an explicit
-zero. `--hourly-quote` overrides catalogue lookup; see `--help` for all options.
+A native target uses `CXX`, `curl-config`, and the current platform's libcurl.
+A foreign target requires its target toolchain and libcurl settings through
+`MACOS_*`, `LINUX_*`, or `WINDOWS_*`: set `*_CXX`, optional `*_TARGET_FLAGS`,
+and target-specific `*_CURL_CXXFLAGS` and `*_CURL_LIBS`. Foreign targets leave
+the curl settings empty instead of accidentally linking the host library. Each
+target also checks the compiler triple and predefined OS macro before compiling.
+`dispatch-binaries` therefore needs all three target toolchains, target libcurl
+installations, and a macOS SDK. Each fixed output path holds one configured
+architecture/ABI at a time and is overwritten when rebuilt for another one.
+Platform binaries use hidden visibility and are stripped after linking. Ordinary
+tests, examples, and sanitizer executables remain diagnosable but live beneath
+the mode-`0700` `build/check` directory rather than a shared temporary directory.
+The fixed platform targets are development artifacts; `release-macos` is the
+credentialed distribution path.
 
-Dry run is the default. `--submit` measures monotonic time from `run()` through
-`wait()` return, flushing the recovery job ID between them, and appends one
-line of whitespace-separated `KEY=value` fields to the
-single-writer, non-JSON ledger. This includes queueing, retries, log collection,
-and cleanup attempts, while the quote remains the earlier routing snapshot;
-the result is not billable runtime, a quote, or an invoice. Failed terminal
-attempts are retained for audit but excluded from the version-one mean. Change
-the workload key whenever runtime-relevant behaviour changes.
+### macOS release
+
+`make check-release-macos` exercises the production byte order without private
+credentials: compile thin arm64 and x86-64 slices, merge, strip, sign the final
+universal bytes ad hoc, and strictly verify every architecture. That output is a
+release-structure test, not a distributable signature.
+
+For distribution, store notarization credentials in Keychain and pass only
+public identity/profile names to the fail-closed release target:
+
+```sh
+xcrun notarytool store-credentials cldmux-notary \
+    --key /secure/AuthKey_KEYID.p8 --key-id KEYID --issuer ISSUER_UUID
+RELEASE_VERSION=1.2.0 \
+MACOS_SIGN_IDENTITY='Developer ID Application: NAME (TEAMID)' \
+MACOS_INSTALLER_IDENTITY='Developer ID Installer: NAME (TEAMID)' \
+MACOS_NOTARY_PROFILE=cldmux-notary \
+    make release-macos
+```
+
+The target refuses missing or ad-hoc identities. It Developer-ID-signs the final
+universal executable with the hardened runtime and secure timestamp, builds a
+signed flat installer, waits for Apple notarization, staples and validates the
+ticket, runs Gatekeeper assessment, and writes the package, signed binary,
+permission-preserving binary tarball, notarization records, and SHA-256 files under
+`build/release/macos/RELEASE_VERSION/`. Do not pass Apple passwords or private
+keys as Make variables.
+
+Before enabling the manual `macOS Release` workflow, create a `release`
+environment in GitHub, restrict it explicitly to `main`, add a required reviewer,
+and store every `APPLE_*` value as an environment secret. The repository does not
+currently create or protect that environment for you. The workflow validates the
+branch and version before entering it, uses an ephemeral Keychain, then deletes
+the imported keys before upload. The environment requires a base64-encoded
+combined Developer ID PKCS#12 and App Store Connect team key, their passwords and
+IDs, plus the two certificate identity names. It uploads the accepted installer,
+notarization records, and a tarball that preserves the signed binary's executable
+mode, but does not publish a GitHub Release automatically.
+Signing and notarization credentials remain in Keychain and are never compiled
+into either release artifact.
+
+The Windows rule targets MinGW, not `cl.exe`. Run it entirely inside one MSYS2
+UCRT64 or MINGW64 environment so the compiler and curl metadata have the same
+ABI; explicit metadata is also accepted:
+
+```sh
+make dispatch-windows WINDOWS_CXX=x86_64-w64-mingw32-g++ \
+    WINDOWS_CURL_CXXFLAGS="$(pkg-config --cflags libcurl)" \
+    WINDOWS_CURL_LIBS="$(pkg-config --libs libcurl)"
+```
+
+The outputs are executables rather than self-contained installers: deploy the
+dynamic libcurl, TLS, and compiler runtime libraries they use. On Windows,
+place dispatch artefacts and receipts in ACL-protected directories on a
+hard-link-capable filesystem; their no-clobber publication relies on hard
+links. Local Windows paths must be representable by the active code page and
+fit the normal Windows path-length limit.
 
 ## STORAGE AND RAW COMPUTE
 
@@ -422,9 +477,7 @@ include it like a standard-library header:
 
 ```text
 apps/dispatch.hpp            provider-neutral dispatch API
-apps/dispatch.cpp            sole cldmux-backed dispatch adapter
-apps/dispatch_main.cpp       quote-and-approve UNIX command
-apps/empirical.cpp           observed-runtime routing application
+apps/dispatch.cpp            dispatch implementation and portable command
 cldmux                       generated public header
 example.cpp                  commented library/command example
 example.mk                   commented local/GCP Make DAG example
@@ -459,10 +512,13 @@ make sanitise
 
 `make check` compiles every private fragment, tests the generator, verifies the
 generated public header, probes multi-translation-unit use, and builds the
-example, dispatch, and empirical applications. Tests use loopback fakes and
+example and dispatch applications. Tests use loopback fakes and
 offline quotes; they need no cloud credentials and cannot incur charges. The
 Make example is expanded for both backends without starting Docker or approving
-a cloud submission.
+a cloud submission. The separate least-privilege CodeQL workflow manually builds
+the C++17 surface with the extended security query suite; macOS CI also verifies
+the universal merge/strip/final-sign order, and Linux CI verifies a stripped
+distribution binary.
 
 ## LICENCE
 

@@ -226,9 +226,7 @@ int main(int argc, char* argv[]) {
         // caller-modelled active time for one attempt. It is a sensitivity, not
         // a runtime prediction, reservation, or bill. route() then binds every
         // provider-owned action to the visible winner so later storage and
-        // submission cannot switch. apps/empirical.cpp demonstrates a separate
-        // policy which combines routing-time quote snapshots with observed
-        // workload runtimes.
+        // submission cannot switch.
         const cldmux::run_diagnostics report =
             router.diagnose(job, chosen.expected_attempt_runtime);
         cldmux::client client = router.route(report.selected_plan.provider);

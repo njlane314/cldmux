@@ -53,9 +53,8 @@ jobs:
             sanitise: false
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
-      - if: matrix.standard != 'c++17'
-        uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: njlane314/tst
           ref: 5207356c975006aa20c5b70dc61a5e2f553e50ee
@@ -67,6 +66,15 @@ jobs:
           CXX=${{ matrix.cxx }}
           CXX_STANDARD=${{ matrix.standard }}
           TST_DIR=.deps/tst
+      - if: runner.os == 'Linux' && matrix.standard == 'c++17'
+        name: Verify stripped Linux binary
+        run: |
+          make dispatch-linux CXX=${{ matrix.cxx }} CXX_STANDARD=${{ matrix.standard }}
+          file build/bin/linux/cldmux-dispatch | grep -q 'stripped'
+          build/bin/linux/cldmux-dispatch --help >/dev/null
+      - if: runner.os == 'macOS' && matrix.standard == 'c++17'
+        name: Verify universal macOS release structure
+        run: make check-release-macos CXX=${{ matrix.cxx }} CXX_STANDARD=${{ matrix.standard }}
       - if: matrix.sanitise
         run: >-
           make sanitise
