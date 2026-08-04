@@ -181,7 +181,13 @@ void receipt_tests(const std::filesystem::path& directory) {
               first.find("transaction_phase=complete\n") != std::string::npos &&
               first.find("transaction_error=unavailable\n") != std::string::npos,
           "receipt separates execution and transaction state");
-    check(first.find("recovery_file=" + value.recovery_file.string() + "\n") != std::string::npos,
+    std::string escaped_recovery_path;
+    for (const char character : value.recovery_file.string()) {
+        if (character == '\\')
+            escaped_recovery_path.push_back('\\');
+        escaped_recovery_path.push_back(character);
+    }
+    check(first.find("recovery_file=" + escaped_recovery_path + "\n") != std::string::npos,
           "receipt identifies its execution-specific recovery state");
     check(first.find("input_sha256=" + std::string(64, '1') + "\n") != std::string::npos &&
               first.find("output_sha256=" + std::string(64, '2') + "\n") != std::string::npos,
