@@ -1768,10 +1768,10 @@ inline Instance parse_instance(const Json& json) {
     result.machine_type = last_path_segment(field(json, "machineType"));
     result.status = field(json, "status");
     result.creation_timestamp = field(json, "creationTimestamp");
-    for_each_json(json, "networkInterfaces", [&](const Json& interface) {
+    for_each_json(json, "networkInterfaces", [&](const Json& network_interface) {
         if (result.internal_ip.empty())
-            result.internal_ip = field(interface, "networkIP");
-        for_each_json(interface, "accessConfigs", [&](const Json& config) {
+            result.internal_ip = field(network_interface, "networkIP");
+        for_each_json(network_interface, "accessConfigs", [&](const Json& config) {
             if (result.external_ip.empty())
                 result.external_ip = field(config, "natIP");
         });
