@@ -201,6 +201,32 @@ private:
     std::vector<saved_variable> saved_;
 };
 
+void credential_source_tests() {
+    environment_guard environment{"GCE_METADATA_HOST"};
+    tst::check(cldmux::gcp::detail::metadata_host() ==
+                   "http://metadata.google.internal",
+               "metadata uses the fixed GCE default");
+
+    environment.set("GCE_METADATA_HOST", "127.0.0.1:8080");
+    tst::check(cldmux::gcp::detail::metadata_host() == "http://127.0.0.1:8080",
+               "metadata accepts a host and port override");
+
+    environment.set("GCE_METADATA_HOST", "[2001:db8::1]:8080");
+    tst::check(cldmux::gcp::detail::metadata_host() == "http://[2001:db8::1]:8080",
+               "metadata accepts a bracketed IPv6 authority");
+
+    for (const std::string_view value : {"https://metadata.google.internal",
+                                         "metadata.google.internal/token", "user@host",
+                                         "metadata?query", "metadata#fragment", "meta\\data",
+                                         "meta data", ":80", "host:not-a-port", "host:0",
+                                         "host:65536", "2001:db8::1", "[not-v6]", ".host",
+                                         "host..name"}) {
+        environment.set("GCE_METADATA_HOST", value);
+        tst::throws<cldmux::error>([] { (void)cldmux::gcp::detail::metadata_host(); },
+                                  "metadata rejects malformed authority overrides");
+    }
+}
+
 class fake_server {
 public:
     fake_server() {
@@ -3285,6 +3311,7 @@ void command_output_tests() {
 
 int main() {
     return tst::run(
+        TST_CASE("bounds automatic credential sources", credential_source_tests()),
         TST_CASE("plans and validates GCP workloads", planning_tests()),
         TST_CASE("bounds private provider responses", transport_limit_tests()),
         TST_CASE("constructs routers from the environment", environment_factory_tests()),

@@ -1386,12 +1386,80 @@ namespace detail {
 // Callers configure fixed bearer tokens or typed callbacks. For compatibility
 // with gcloud, the automatic chain may also read its generated authorised-user
 // ADC file before trying the metadata server; callers never have to author it.
+inline bool metadata_port(std::string_view value) {
+    if (value.empty())
+        return false;
+    unsigned port = 0;
+    for (const char digit : value) {
+        if (digit < '0' || digit > '9')
+            return false;
+        port = port * 10U + static_cast<unsigned>(digit - '0');
+        if (port > 65'535U)
+            return false;
+    }
+    return port != 0;
+}
+
+inline bool metadata_name(std::string_view value) {
+    if (value.empty() || value.size() > 253 || value.front() == '.' || value.back() == '.')
+        return false;
+    bool dot = false;
+    for (const char character : value) {
+        const bool alpha_numeric =
+            (character >= 'a' && character <= 'z') ||
+            (character >= 'A' && character <= 'Z') ||
+            (character >= '0' && character <= '9');
+        if (!alpha_numeric && character != '-' && character != '_' && character != '.')
+            return false;
+        if (character == '.' && dot)
+            return false;
+        dot = character == '.';
+    }
+    return true;
+}
+
+inline bool metadata_authority(std::string_view value) {
+    if (value.empty())
+        return false;
+    if (value.front() == '[') {
+        const auto closing = value.find(']');
+        if (closing == std::string_view::npos || closing == 1)
+            return false;
+        const auto address = value.substr(1, closing - 1);
+        if (address.find(':') == std::string_view::npos ||
+            !std::all_of(address.begin(), address.end(), [](const char character) {
+                return (character >= '0' && character <= '9') ||
+                       (character >= 'a' && character <= 'f') ||
+                       (character >= 'A' && character <= 'F') || character == ':' ||
+                       character == '.';
+            }))
+            return false;
+        const auto suffix = value.substr(closing + 1);
+        return suffix.empty() || (suffix.front() == ':' && metadata_port(suffix.substr(1)));
+    }
+
+    const auto colon = value.find(':');
+    if (colon == std::string_view::npos)
+        return metadata_name(value);
+    return value.find(':', colon + 1) == std::string_view::npos &&
+           metadata_name(value.substr(0, colon)) && metadata_port(value.substr(colon + 1));
+}
+
 inline std::string metadata_host() {
     std::string host = env("GCE_METADATA_HOST");
     if (host.empty())
         host = "metadata.google.internal";
-    if (starts_with(host, "http://") || starts_with(host, "https://"))
-        return base_url(host);
+
+    // GCE_METADATA_HOST is an authority override, not a URL. Bounding its
+    // grammar prevents a launch-time setting from adding a scheme or path.
+    if (!metadata_authority(host))
+        throw Error("GCE_METADATA_HOST must contain only a host and optional port");
+
+    // All GCE VM types support this host-local HTTP endpoint; HTTPS metadata
+    // additionally requires Shielded-VM client certificates. no_proxy is set
+    // on every request below. The process environment owner also controls the
+    // earlier ADC and explicit bearer-token sources in this same chain.
+    // codeql[cpp/non-https-url]
     return "http://" + host;
 }
 
@@ -1530,8 +1598,12 @@ inline AccessToken automatic_token() {
         return AccessToken{std::move(token), std::chrono::system_clock::time_point::max(), {}};
 
     if (const std::string explicit_path = env("GOOGLE_APPLICATION_CREDENTIALS");
-        !explicit_path.empty())
+        !explicit_path.empty()) {
+        // ADC defines this variable as a caller-selected credential file. It is
+        // not a path beneath an application-owned root or a privilege boundary.
+        // codeql[cpp/path-injection]
         return token_from_adc_file(explicit_path);
+    }
 
     if (const auto path = well_known_adc_path(); path && std::filesystem::exists(*path))
         return token_from_adc_file(*path);

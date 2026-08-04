@@ -771,6 +771,9 @@ void perform(const options& parsed) {
         if (!fs::is_regular_file(parsed.output, error) || error) {
             fail("generated header is missing: " + display_path(parsed.output));
         }
+        // --output intentionally names the file this same-user build tool
+        // compares; the comparison never exposes that file's contents.
+        // codeql[cpp/path-injection]
         if (read_bytes(parsed.output, "generated header") != generated.header) {
             fail("generated header is out of date: " + display_path(parsed.output));
         }
